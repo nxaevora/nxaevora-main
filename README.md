@@ -1,14 +1,15 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+
 <!-- Copyright 2026 the NXAevora contributors -->
 
 <p align="center">
   <img alt="aevora-icon" src="assets/aevora-logo-dark.png" width="300px" />
 <p>
 <p align="center">
-  <img src="https://img.shields.io/badge/platform-windows%20x64%20%7C%20linux%20amd64-blue?style=for-the-badge&logo=archlinux" alt="Badge">
+  <img src="https://img.shields.io/badge/platform-windows%20x64-blue?style=for-the-badge&logo=gitforwindows" alt="Badge">
   <img src="https://img.shields.io/badge/recompile%20type-static%20aot-b84b3a?style=for-the-badge&logo=ebox" alt="Badge">
   <img src="https://img.shields.io/badge/status-alpha-orange?style=for-the-badge&logo=penpot" alt="Badge">
-  <img src="https://img.shields.io/badge/main%20language-c%2B%2B-purple?style=for-the-badge&logo=cplusplus" alt="Badge">
+  <img src="https://img.shields.io/badge/main%20language-c%20%7C%20rust-purple?style=for-the-badge&logo=c" alt="Badge">
   <img src="https://img.shields.io/badge/ui%20framework-tauri-8069ff?style=for-the-badge&logo=tauri" alt="Badge">
   <img src="https://img.shields.io/badge/license-GPL--3.0%20(v3)-lightgrey?style=for-the-badge&logo=unlicense" alt="Badge">
 <p>
@@ -56,14 +57,14 @@ and the CLANG64 environment.
 
 ## Repository layout
 
-| Folder | Content |
-| --- | --- |
-| `third_party/ScarletNX/` | The recompiler and the Switch runtime (submodule) |
-| `recomp/` | Settings and patches for the recompile of this game |
-| `runtime/` | Parts of the runtime that ScarletNX does not have |
-| `launcher/` | The launcher (planned) |
-| `tools/` | Helper scripts for the analysis of the recompiled game |
-| `docs/` | Notes and analysis |
+| Folder                     | Content                                                |
+| -------------------------- | ------------------------------------------------------ |
+| `third_party/ScarletNX/` | The recompiler and the Switch runtime (submodule)      |
+| `recomp/`                | Settings and patches for the recompile of this game    |
+| `runtime/`               | Parts of the runtime that ScarletNX does not have      |
+| `launcher/`              | The launcher (planned)                                 |
+| `tools/`                 | Helper scripts for the analysis of the recompiled game |
+| `docs/`                  | Notes and analysis                                     |
 
 ## Legal
 
