@@ -15,22 +15,26 @@ ScarletNX runtime compiles the code at that moment (the JIT). A fully static bui
 - The base game and update 1.1.1 recompile in a few minutes.
 - The recompiled game boots to the language selection screen and runs without a crash for 45 seconds.
 
-## Phase 1: Understand the misses (in progress)
+## Phase 1: Understand the misses (closed for now)
 
 The update program had 17 different misses in a run of 84 seconds, and the base program had 19 in the boot. Most
 are inside functions. A few are PLT stubs.
 
 - Done: read how ScarletNX decides where a miss can happen (`docs/jit-analysis.md`).
 - Done: verify one miss as a jump-table target. The recompiler does not read the entries of a jump table.
-- Next: scan the jump tables of the main module and of sdk, and compare their case targets with the misses.
-- Next: find the instruction that causes each miss that is not a jump-table target. The runtime does not log it.
+- Done: scan the jump tables of all modules. 49 of the 51 pcs that are not PLT stubs are targets of a table.
+- Open: 2 pcs are not explained (0x8cbe780 in main and 0xd92f310 in sdk), and the cause of the PLT-stub misses is not
+  known. None of them missed again in the runs with the hints.
+
+This phase is closed for now, because the runs so far found no new miss. Open it again when a miss appears that the
+scan does not explain.
 
 Exit condition: every miss of the update program in a boot run has a known cause.
 
-## Phase 2: Remove the misses of the boot (the first goal is reached)
+## Phase 2: Remove the misses of the boot (closed for now)
 
 Result: with the targets of all jump tables as hints (45728 pcs from `tools/jump_table_scan.py`), the opening scene
-at sea ran for 252 seconds with 0 misses. Before, the same scene had 114 misses. Only this scene is tested.
+at sea ran for 252 seconds with 0 misses. Before, the same scene had 114 misses.
 
 - Feed the recorded pcs to the next recompile and check that the boot run has no miss. `scarletnx -r` reads
   `<outdir>/<ID>/<name>.hints` by itself. The runtime names the file after the program that started. The base
@@ -46,31 +50,51 @@ at sea ran for 252 seconds with 0 misses. Before, the same scene had 114 misses.
 
 Exit condition: the boot run to the language selection screen ends with 0 misses.
 
-## Phase 3: Cover the game
+## Phase 3: Cover the game (closed for now)
 
 The user plays a scene. Claude reads the log and `<id>.hints` of the run. Each round adds the new pcs to the hints
 and recompiles again.
+
+This phase is closed for now, because every run after the jump-table hints had 0 misses. Open it again when a miss
+appears in a scene that is not tested yet.
 
 - Scenes to cover: the title screen, the start of the story, the village, the wild areas, battles, menus, the save
   and load flow, and the cutscenes with video.
 - Covered so far, with 0 misses: the opening scene at sea, the first menus with the software keyboard, the write of
   a save, the load of that save, a play of 7 minutes to the entry of the village with a capture, and a play of
-  13 minutes to the point before the Obsidian Fieldlands with a battle against an NPC. Not tested yet: the
-  Obsidian Fieldlands and the other wild areas, battles against wild Pokemon of the later areas, and video.
+  13 minutes to the point before the Obsidian Fieldlands with a battle against an NPC, and a play of 4 minutes in
+  the Obsidian Fieldlands. Not tested yet: long play in the open areas, the other wild areas, battles against wild
+  Pokemon of the later areas, and video.
 - The number of misses for each scene is the measure. It is written down after each round.
 - Findings about the game (crashes, wrong rendering, missing services) go to `docs/`.
 
 Exit condition: a long play session in each scene ends with 0 misses.
 
-## Phase 4: Remove the JIT
+## Phase 4: The JIT stays as a safety net
 
-ScarletNX always keeps the JIT. A miss is compiled and run, and the game goes on. A build without the JIT would stop
-at the first miss, so the list of misses must be empty first.
+Decision: the released build keeps the JIT. A miss in a scene that was not tested is then compiled and run, and the
+game goes on. A build without the JIT would end the game at the first such miss. Because the JIT stays, LLVM stays
+in the runtime and `libLLVM-23.dll` is shipped.
 
-- Decide how to build without the JIT: a setting in ScarletNX, a patch, or a check that fails when the JIT is used.
-- Check that the game still runs when a miss is a hard error.
+A build with the JIT turned off is still useful as a check, and it is optional.
 
-Exit condition: the game plays through the covered scenes with the JIT turned off.
+What the source of ScarletNX shows (`guest_jit.c`, `rtapi.c`, `jit_service.c`):
+
+- No setting turns the JIT off. `jit_init()` always starts it. `jit_threads` can only be 0 (automatic) to 4.
+- A miss is already a hard error when the JIT is not running. `rt_miss` then ends the game with the message "The game
+  reached code at <pc> that the recompiler missed". The runtime has this path for a JIT that cannot start.
+- The smallest change is a setting or a switch that skips `snx_jit_service_new` in `jit_init()`. It is a few lines.
+  It would be kept as a patch in `recomp/patches/` and not as an edit of the submodule.
+- The game program is the same program as `scarletnx.exe`, with the recompiler and the JIT in it, and it imports
+  `libLLVM-23.dll` (154 MB).
+
+The line `jit: ... N misses` of the log shows exactly how often the JIT was needed, so 0 misses in a run means that
+the run did not need it.
+
+Optional step: make the patch that turns the JIT off, and let the user play the covered scenes with it. A miss ends
+the game and names the pc.
+
+Exit condition: the decision above is recorded. The optional check can be done at any time.
 
 ## Phase 5: Quality of the port
 
@@ -109,5 +133,4 @@ Exit condition: a user with a dump and keys goes from a fresh install to a runni
 
 ## Open questions
 
-- Is a build without the JIT possible with a setting, or does it need a change in ScarletNX?
 - Which Arceus versions are supported? The work so far uses 1.1.1.

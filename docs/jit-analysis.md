@@ -140,6 +140,11 @@ earlier runs from `shader_cache/` and made them in the background in 22 s. Durin
 (2.8 s making, 2.1 s of waiting in total). The user reports no visible fault, only a stutter when shaders are made.
 The same two renderer messages as in run H appear. No video decoding was used in this run.
 
+Run J used the same program and the same hints. The user played from the save into the Obsidian Fieldlands. The log
+does not tell the place, so the place is from the user. Result: 252.6 s, 0 misses, no new pcs, no crash. The frame
+rate was 30 fps. There were two stops at the start (1.24 s at 11 s and 0.33 s at 15.6 s). The runtime made 42 new
+pipelines (0.5 s making, 0.3 s of waiting) and 10 shaders. It used 768 MB of GPU memory and loaded 691 MB of textures.
+
 ## Jump-table scan (`tools/jump_table_scan.py`)
 
 The script finds the `br` instructions that use a jump table and reads the table from the module image. Two patterns

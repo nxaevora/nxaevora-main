@@ -24,15 +24,21 @@ NXAevora adds the settings, patches and tools that are specific to this game, an
 
 ## Status
 
-NXAevora is at an early stage. It is not ready to play.
+NXAevora is in alpha. It is not ready for general use.
 
-- The base game and update 1.1.1 recompile in a few minutes.
-- The recompiled game starts, shows the language selection and plays the opening scene at sea at about 30 frames
-  each second. This was tested on one machine, only as far as that scene.
-- The recompiled code is not complete in general. When the game reaches code that the recompiler missed, the
-  ScarletNX runtime compiles it at that moment. We study these misses and remove them. In the opening scene, the
-  misses are gone. Other scenes are not tested. See [ROADMAP.md](ROADMAP.md) and
+- The base game and update 1.1.1 recompile in about 11 minutes.
+- The recompiled game runs at about 30 frames each second from the first start into the Obsidian Fieldlands. This
+  covers the opening scene at sea, the name entry, saving and loading, a capture, the village, a battle against an
+  NPC and the first minutes in the Obsidian Fieldlands. It was tested by the author on one machine with Windows 11
+  and an NVIDIA GPU.
+- The static recompile covers all the code that these scenes reach. The ScarletNX runtime can still compile code at
+  run time (the JIT) when the game reaches code that the recompiler missed. NXAevora keeps this as a safety net.
+  The JIT was not needed in any of the tested scenes after the jump-table fix. See [ROADMAP.md](ROADMAP.md) and
   [docs/jit-analysis.md](docs/jit-analysis.md).
+- Not tested yet: video, long play in the open areas, and battles against wild Pokemon of the later areas.
+- Known problems: a short stutter when the game uses a rendering setup for the first time (it gets less with each
+  run), one shader that is not translated, and one texture that is not drawn. No visible fault from the last two has
+  been seen.
 - The launcher does not exist yet.
 
 ## What you need
