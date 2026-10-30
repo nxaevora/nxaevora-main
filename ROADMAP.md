@@ -27,23 +27,29 @@ are inside functions. A few are PLT stubs.
 
 Exit condition: every miss of the update program in a boot run has a known cause.
 
-## Phase 2: Remove the misses of the boot
+## Phase 2: Remove the misses of the boot (the first goal is reached)
+
+Result: with the targets of all jump tables as hints (45728 pcs from `tools/jump_table_scan.py`), the opening scene
+at sea ran for 252 seconds with 0 misses. Before, the same scene had 114 misses. Only this scene is tested.
 
 - Feed the recorded pcs to the next recompile and check that the boot run has no miss. `scarletnx -r` reads
   `<outdir>/<ID>/<name>.hints` by itself. The runtime names the file after the program that started. The base
   program runs the base game code and the update program runs the update code. The modules have other addresses in
   each, so a hints file is valid only for the program that wrote it. For the update, the user starts the update
   program.
-- Keep the game-specific pcs and settings in `recomp/config`, so that a recompile is reproducible.
-- If the cause is a rule of the recompiler (for example jump tables), decide whether to fix it in ScarletNX or to
-  work around it with configuration. A change in ScarletNX is reported to the upstream project.
+- Done: the scan of the jump tables is part of the recompile procedure (the skill `nx-recompile`). It makes the
+  hints from the game files, so the list is not in git. Other game-specific settings and patches go to
+  `recomp/config`.
+- Open: the cause is a rule of the recompiler (it does not read the entries of a jump table). The hints are a
+  workaround that needs no change in ScarletNX. Decide whether to fix `explore()` in ScarletNX and report it to the
+  upstream project.
 
 Exit condition: the boot run to the language selection screen ends with 0 misses.
 
 ## Phase 3: Cover the game
 
-The user plays a scene and gives the log, `<id>.hints` and `<id>.jitcache`. Each round adds new pcs to the
-configuration and recompiles again.
+The user plays a scene. Claude reads the log and `<id>.hints` of the run. Each round adds the new pcs to the hints
+and recompiles again.
 
 - Scenes to cover: the title screen, the start of the story, the village, the wild areas, battles, menus, the save
   and load flow, and the cutscenes with video.
@@ -93,6 +99,5 @@ Exit condition: a user with a dump and keys goes from a fresh install to a runni
 
 ## Open questions
 
-- Can a pc inside a function be given to the recompiler as a leader through a configuration file?
 - Is a build without the JIT possible with a setting, or does it need a change in ScarletNX?
 - Which Arceus versions are supported? The work so far uses 1.1.1.

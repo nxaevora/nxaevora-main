@@ -3,11 +3,12 @@
 # Copyright 2026 the NXAevora contributors
 """Finds the jump tables of a game's AArch64 modules and lists the targets of their BR instructions.
 
-    tools/jump_table_scan.py <extracted game folder> [--module NAME ...] [--hints FILE] [--check HEXPC ...]
+    tools/jump_table_scan.py <extracted game folder> [--module NAME ...] [--hints FILE [--merge]] [--check HEXPC ...]
 
 The folder holds exefs/ (the layout of the program that you analyze). SNX_SCARLETNX must name scarletnx and the
 MSYS2 tools must be on PATH, as for ScarletNX's tools/symbols.py. --hints writes the targets, one hex pc on each
-line, in the format of a .hints file. --check says which table holds each pc.
+line, in the format of a .hints file. --merge keeps the pcs that the file holds already (the misses that the runtime
+recorded). --check says which table holds each pc.
 
 Two compiler patterns are found: a table of bytes, halves or words that is added to a base address (shifted by the
 entry size), and a signed table that is relative to its own address.
@@ -16,6 +17,7 @@ entry size), and a signed table that is relative to its own address.
 import argparse
 import array
 import os
+import shutil
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'third_party', 'ScarletNX', 'tools'))
@@ -173,11 +175,25 @@ def scan(module):
     return tables
 
 
+def write_hints(path, targets, merge):
+    """Writes the pcs as a hints file. With merge, the pcs of the existing file stay, and it is copied to path.bak."""
+    pcs = set(targets)
+    if merge and os.path.isfile(path):
+        with open(path, encoding='ascii') as old:
+            pcs.update(int(line, 16) for line in old.read().split())
+        shutil.copyfile(path, path + '.bak')
+    with open(path, 'w', encoding='ascii') as out:
+        out.write(''.join('%x\n' % pc for pc in sorted(pcs)))
+    return len(pcs)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('program')
     parser.add_argument('--module', action='append', help='a module to scan (default: all but rtld)')
     parser.add_argument('--hints', help='write the targets to this file')
+    parser.add_argument('--merge', action='store_true',
+                        help='keep the pcs that --hints already holds (a copy goes to FILE.bak)')
     parser.add_argument('--check', nargs='+', help='hex pcs: tell which table holds each')
     args = parser.parse_args()
     if not os.path.isdir(args.program):
@@ -195,8 +211,8 @@ def main():
     all_targets = sorted({x for tables in found.values() for t in tables for x in t['targets']})
     print('%d different targets' % len(all_targets))
     if args.hints:
-        with open(args.hints, 'w', encoding='ascii') as out:
-            out.write(''.join('%x\n' % x for x in all_targets))
+        written = write_hints(args.hints, all_targets, args.merge)
+        print('%d pcs written to %s' % (written, args.hints))
     for text in args.check or []:
         pc = int(text, 16)
         hits = [(name, t) for name, tables in found.items() for t in tables if pc in t['targets']]

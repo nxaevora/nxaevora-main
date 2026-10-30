@@ -93,6 +93,28 @@ entries of such a table. The mechanism of the notes below is therefore confirmed
 - The other pcs are inside functions, and the cause is not known.
 - The earlier finding about the instruction after an exclusive store is withdrawn. It was seen in the wrong code.
 
+## Run E: the jump-table targets as hints
+
+The update was recompiled with 45734 hints: the 45728 targets of the jump-table scan and the 55 pcs of runs B to D
+(6 of them are not targets of a table). The recompile took 666 s (about 3 times longer than before). The code of the
+update grew from 559575040 to 561684480 bytes (0.4 %).
+
+The user ran the same scene as in run D, the opening scene at sea.
+
+| | Run D | Run E |
+| --- | --- | --- |
+| Hints at the start | 19 | 45734 |
+| Length | 256.6 s | 252.2 s |
+| Frames shown | 7425 | 7207 |
+| Misses | 114 | 0 |
+| JIT compiles | 36 functions | none |
+| New pcs in the hints | 36 | 0 |
+| Crash | none | none |
+| Frame rate | 30 fps | 30 fps, steady |
+
+The start was not slower with the large hints file: the game started after 733 ms of preparation. The scene is the
+only one tested. Other scenes can still have misses.
+
 ## Jump-table scan (`tools/jump_table_scan.py`)
 
 The script finds the `br` instructions that use a jump table and reads the table from the module image. Two patterns
@@ -122,8 +144,10 @@ their effect on the size and the speed of the code is not measured.
 
 ## Next steps
 
-1. Recompile the update with the 45728 targets as hints. Let the user run the same scene again. Expect almost no
-   miss. Compare the size of the code.
-2. Find out about the 2 pcs that the scan did not find and about the PLT stubs.
-3. If the experiment works, keep the scan in the recompile procedure, and find out how to give the targets to the
-   recompiler without a hints file that the runtime also writes.
+1. Done: the experiment of run E worked for the opening scene.
+2. Let the user play other scenes (village, wild areas, battle, menus) and read the new misses. Check whether the
+   scan explains them.
+3. Find out about the 2 pcs that the scan did not find (0x8cbe780 and 0xd92f310) and about the PLT stubs.
+4. Done: the scan is part of the recompile procedure. `--merge` adds the targets to the hints file and keeps the pcs
+   that the runtime recorded (see the skill `nx-recompile`). A hints file can hold any pc, so a pc inside a function
+   can be given to the recompiler as a leader this way.

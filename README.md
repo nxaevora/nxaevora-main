@@ -13,8 +13,9 @@ NXAevora is at an early stage. It is not ready to play.
 - The base game and update 1.1.1 recompile in a few minutes.
 - The recompiled game starts, shows the language selection and plays the opening scene at sea at about 30 frames
   each second. This was tested on one machine, only as far as that scene.
-- The recompiled code is not complete yet. When the game reaches code that the recompiler missed, the ScarletNX
-  runtime compiles it at that moment. We study these misses and remove them. See [ROADMAP.md](ROADMAP.md) and
+- The recompiled code is not complete in general. When the game reaches code that the recompiler missed, the
+  ScarletNX runtime compiles it at that moment. We study these misses and remove them. In the opening scene, the
+  misses are gone. Other scenes are not tested. See [ROADMAP.md](ROADMAP.md) and
   [docs/jit-analysis.md](docs/jit-analysis.md).
 - The launcher does not exist yet.
 
