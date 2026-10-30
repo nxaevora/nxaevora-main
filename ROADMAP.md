@@ -53,6 +53,10 @@ and recompiles again.
 
 - Scenes to cover: the title screen, the start of the story, the village, the wild areas, battles, menus, the save
   and load flow, and the cutscenes with video.
+- Covered so far, with 0 misses: the opening scene at sea, the first menus with the software keyboard, the write of
+  a save, the load of that save, a play of 7 minutes to the entry of the village with a capture, and a play of
+  13 minutes to the point before the Obsidian Fieldlands with a battle against an NPC. Not tested yet: the
+  Obsidian Fieldlands and the other wild areas, battles against wild Pokemon of the later areas, and video.
 - The number of misses for each scene is the measure. It is written down after each round.
 - Findings about the game (crashes, wrong rendering, missing services) go to `docs/`.
 
@@ -72,7 +76,13 @@ Exit condition: the game plays through the covered scenes with the JIT turned of
 
 - Rendering: look for wrong or missing effects in the Maxwell to Vulkan path.
 - Speed: the boot run shows about 30 frames each second. Find out whether the game limits it or the runtime does.
-- Shaders: the boot run reports 80 of 1787 shader programs as failed. The cause is not known.
+- Shaders: the boot run reports 80 of 1787 shader programs as failed. The cause is not known. Every run also
+  reports one shader that is not translated because of the instruction `RED`, and one texture of format 0 that is not
+  drawn. The user sees no visible fault from these in the tested scenes.
+- Stutter: the only visible problem so far is a stutter when a pipeline is made for the first time. A run of 420 s
+  made 100 pipelines (3.8 s making, 2.5 s of waiting). The runtime keeps its pipelines in `shader_cache/` and makes
+  them again in the background at the next start. A run of 794 s made 67 new pipelines (2.1 s of waiting). Look for
+  a way to make the pipelines ahead of time.
 - Audio, video, input and save data.
 - Services of the console that Arceus needs and ScarletNX does not have yet (`runtime/hle`).
 

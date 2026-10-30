@@ -115,6 +115,31 @@ The user ran the same scene as in run D, the opening scene at sea.
 The start was not slower with the large hints file: the game started after 733 ms of preparation. The scene is the
 only one tested. Other scenes can still have misses.
 
+Run F used the same program and the same hints. The user used the first menus (name entry with the software
+keyboard) and saved in the game. Result: 256.5 s, 0 misses, no new pcs, no crash. The save files were written
+(`save/user.<id>/main`, 1.29 MB, and `main2`). The frame rate was 30 fps, except for a stop of 6.3 s during the name
+entry.
+
+Run G used the same program and the same hints. The user started the game again and continued from the save.
+Result: 25.4 s, 0 misses, no new pcs, no crash. The save files were not changed. The log shows a different scene
+than in the earlier runs (150 texture uploads of about 56 MB in one frame, 601 compute dispatches where the earlier
+runs had none, 87 shaders translated). The user reports that the game resumed from the saved place. The load of a
+save works in this scene. There was one stop of 1.26 s at 14 s.
+
+Run H used the same program and the same hints. The user played from the save to the entry of the village, with a
+capture on the way. Result: 420 s, 0 misses, no new pcs, no crash. The frame rate was 30 fps. There was one stop of
+1.19 s at 12 s (at the start, as in the earlier runs). At the end, the renderer reported 94 shaders translated,
+100 pipelines made (3.8 s making, 2.5 s of waiting in total), 974 MB of texture uploads and 718 MB of GPU memory in
+use. The log has two messages about the renderer: one shader with the instruction `RED` is not translated, and one
+texture with the format 0 is not drawn.
+
+Run I used the same program and the same hints. The user played on, from the village to the point before the
+Obsidian Fieldlands, with a battle against an NPC. Result: 793.9 s (13 minutes), 0 misses, no new pcs, no crash.
+The frame rate was 30 fps. There was one stop of 1.25 s at 12 s (at the start). The runtime loaded 314 pipelines of
+earlier runs from `shader_cache/` and made them in the background in 22 s. During the run it made 67 new pipelines
+(2.8 s making, 2.1 s of waiting in total). The user reports no visible fault, only a stutter when shaders are made.
+The same two renderer messages as in run H appear. No video decoding was used in this run.
+
 ## Jump-table scan (`tools/jump_table_scan.py`)
 
 The script finds the `br` instructions that use a jump table and reads the table from the module image. Two patterns
