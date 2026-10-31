@@ -1,0 +1,650 @@
+diff --git a/src/nx/CMakeLists.txt b/src/nx/CMakeLists.txt
+index 596100f..655e201 100644
+--- a/src/nx/CMakeLists.txt
++++ b/src/nx/CMakeLists.txt
+@@ -79,7 +79,7 @@ snx_ship_walk(gpu/shipped_pass.c)
+ include("${PROJECT_SOURCE_DIR}/cmake/controls_atlas.cmake")
+ include("${PROJECT_SOURCE_DIR}/cmake/gui_themes.cmake")
+ set(platform runtime/platform/plat.c runtime/platform/plat_sdl.c runtime/platform/unattended.c
+-             runtime/platform/backend/sdl3.c
++             runtime/platform/backend/sdl3.c runtime/platform/backend/imgui_sdl.c
+              runtime/platform/backend/gamepad.c runtime/platform/tracy.c
+              runtime/platform/hud.c runtime/platform/overlay.c runtime/platform/stats.c runtime/platform/touch.c
+              runtime/platform/ui.c runtime/platform/vpad.c runtime/platform/fatal_screen.c
+@@ -104,7 +104,7 @@ snx_shaderdec(snx_shader)
+ snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
+                  gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/compute.c
+                  gpu/vk/pending_pages.c gpu/vk/memory.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/ui.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp gpu/vk/gpuprof.c
+-                 gpu/vk/ftz_probe.c gpu/vk/imgui.c gpu/vk/imgui_glue.cpp gpu/vk/imgui_style.cpp
++                 gpu/vk/ftz_probe.c gpu/vk/imgui.c gpu/vk/imgui_glue.cpp gpu/vk/imgui_style.cpp gpu/vk/imgui_input.c gpu/vk/imgui_events.cpp gpu/vk/imgui_ui.cpp
+                  "${volk_SOURCE_DIR}/volk.c"
+                  "${imgui_SOURCE_DIR}/imgui.cpp" "${imgui_SOURCE_DIR}/imgui_draw.cpp"
+                  "${imgui_SOURCE_DIR}/imgui_tables.cpp" "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
+diff --git a/src/nx/gpu/vk/imgui.c b/src/nx/gpu/vk/imgui.c
+index d4021d0..d8f9a16 100644
+--- a/src/nx/gpu/vk/imgui.c
++++ b/src/nx/gpu/vk/imgui.c
+@@ -82,13 +82,17 @@ void vk_imgui_draw(VkCommandBuffer cb, VkImage sc) {
+     u64 now = plat_ns();
+     float dt = g_last_ns ? (float)((double)(now - g_last_ns) * 1e-9) : 0;
+     VkImageView view;
+-    if (!__atomic_load_n(&g_settings.imgui_test, __ATOMIC_RELAXED)) {
++    ImguiFrame frame;
++    if (!__atomic_load_n(&g_settings.imgui, __ATOMIC_RELAXED)) {
+         g_last_ns = 0;
++        if (imgui_glue_ready()) imgui_glue_unwanted();
+         return;
+     }
+     g_last_ns = now;
+     if (!ready() || !(view = vk_ui_swapchain_view(sc))) return;
+-    if (!imgui_glue_frame((float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, dt)) return;
++    frame = (ImguiFrame){(float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, dt,
++                         __atomic_load_n(&g_settings.imgui_test, __ATOMIC_RELAXED)};
++    if (!imgui_glue_frame(&frame)) return; /* nothing shows: no drain, no pass */
+     vk_rec_sync();
+     image_barrier(cb, sc, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+diff --git a/src/nx/gpu/vk/imgui_events.cpp b/src/nx/gpu/vk/imgui_events.cpp
+new file mode 100644
+index 0000000..1c25879
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_events.cpp
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++#include "nx/gpu/vk/imgui_events.h"
++#include <cfloat>
++#include <SDL3/SDL_keycode.h>
++#include <SDL3/SDL_mouse.h>
++#include "imgui.h"
++#include "nx/gpu/vk/imgui_input.h"
++
++namespace {
++constexpr float NO_MOUSE_BELOW = -1.0e8f; /* a position under this is "no mouse" (imgui_input.h) */
++
++ImGuiKey map_key(int key) {
++    if (key >= SDLK_A && key <= SDLK_Z) return (ImGuiKey)(ImGuiKey_A + (key - SDLK_A));
++    if (key >= SDLK_0 && key <= SDLK_9) return (ImGuiKey)(ImGuiKey_0 + (key - SDLK_0));
++    if (key >= SDLK_F1 && key <= SDLK_F12) return (ImGuiKey)(ImGuiKey_F1 + (key - SDLK_F1));
++    switch (key) {
++        case SDLK_TAB: return ImGuiKey_Tab;
++        case SDLK_LEFT: return ImGuiKey_LeftArrow;
++        case SDLK_RIGHT: return ImGuiKey_RightArrow;
++        case SDLK_UP: return ImGuiKey_UpArrow;
++        case SDLK_DOWN: return ImGuiKey_DownArrow;
++        case SDLK_PAGEUP: return ImGuiKey_PageUp;
++        case SDLK_PAGEDOWN: return ImGuiKey_PageDown;
++        case SDLK_HOME: return ImGuiKey_Home;
++        case SDLK_END: return ImGuiKey_End;
++        case SDLK_INSERT: return ImGuiKey_Insert;
++        case SDLK_DELETE: return ImGuiKey_Delete;
++        case SDLK_BACKSPACE: return ImGuiKey_Backspace;
++        case SDLK_SPACE: return ImGuiKey_Space;
++        case SDLK_RETURN: return ImGuiKey_Enter;
++        case SDLK_ESCAPE: return ImGuiKey_Escape;
++        case SDLK_KP_ENTER: return ImGuiKey_KeypadEnter;
++        default: return ImGuiKey_None;
++    }
++}
++
++int map_button(int sdl_button) {
++    switch (sdl_button) {
++        case SDL_BUTTON_LEFT: return 0;
++        case SDL_BUTTON_RIGHT: return 1;
++        case SDL_BUTTON_MIDDLE: return 2;
++        default: return -1;
++    }
++}
++
++void feed_key(ImGuiIO& io, const ImguiEvent& e) {
++    io.AddKeyEvent(ImGuiMod_Ctrl, (e.mods & SDL_KMOD_CTRL) != 0);
++    io.AddKeyEvent(ImGuiMod_Shift, (e.mods & SDL_KMOD_SHIFT) != 0);
++    io.AddKeyEvent(ImGuiMod_Alt, (e.mods & SDL_KMOD_ALT) != 0);
++    io.AddKeyEvent(ImGuiMod_Super, (e.mods & SDL_KMOD_GUI) != 0);
++    ImGuiKey key = map_key(e.key);
++    if (key != ImGuiKey_None) io.AddKeyEvent(key, e.down != 0);
++}
++} // namespace
++
++void imgui_events_feed(void) {
++    ImGuiIO& io = ImGui::GetIO();
++    ImguiEvent e;
++    while (imgui_input_pop(&e)) {
++        switch (e.type) {
++            case IMGUI_EV_MOUSE_POS:
++                if (e.x < NO_MOUSE_BELOW)
++                    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
++                else
++                    io.AddMousePosEvent(e.x, e.y);
++                break;
++            case IMGUI_EV_MOUSE_BUTTON:
++                if (map_button(e.button) >= 0) io.AddMouseButtonEvent(map_button(e.button), e.down != 0);
++                break;
++            case IMGUI_EV_WHEEL: io.AddMouseWheelEvent(e.x, e.y); break;
++            case IMGUI_EV_KEY: feed_key(io, e); break;
++            case IMGUI_EV_TEXT: io.AddInputCharactersUTF8(e.text); break;
++            case IMGUI_EV_FOCUS: io.AddFocusEvent(false); break;
++        }
++    }
++}
++
++void imgui_events_publish(bool menu_visible) {
++    ImGuiIO& io = ImGui::GetIO();
++    ImguiWants w;
++    w.mouse = io.WantCaptureMouse;
++    w.keyboard = io.WantCaptureKeyboard;
++    w.text = io.WantTextInput;
++    w.release = io.WantCaptureMouse || menu_visible;
++    imgui_input_publish(&w);
++}
+diff --git a/src/nx/gpu/vk/imgui_events.h b/src/nx/gpu/vk/imgui_events.h
+new file mode 100644
+index 0000000..12f69a3
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_events.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The window's input events (imgui_input.h) into the current ImGui context. Under vk_lock, before NewFrame */
++#ifndef SNX_IMGUI_EVENTS_H
++#define SNX_IMGUI_EVENTS_H
++
++/* every queued event into the context's input */
++void imgui_events_feed(void);
++/* what the windows want, from the frame just begun, for the main thread (imgui_input_publish). menu_visible: the menu
++   bar shows, which also lets go of the cursor */
++void imgui_events_publish(bool menu_visible);
++
++#endif
+diff --git a/src/nx/gpu/vk/imgui_glue.cpp b/src/nx/gpu/vk/imgui_glue.cpp
+index b4f80dc..40b5948 100644
+--- a/src/nx/gpu/vk/imgui_glue.cpp
++++ b/src/nx/gpu/vk/imgui_glue.cpp
+@@ -5,27 +5,16 @@
+ #include "nx/gpu/vk/imgui_glue.h"
+ #include "imgui.h"
+ #include "imgui_impl_vulkan.h"
++#include "nx/gpu/vk/imgui_events.h"
++#include "nx/gpu/vk/imgui_input.h"
+ #include "nx/gpu/vk/imgui_style.h"
++#include "nx/gpu/vk/imgui_ui.h"
+ 
+ namespace {
+ constexpr uint32_t TEXTURE_SLOTS = 16; /* sampler descriptors: the font atlas and a few more images */
+ bool g_ready;
+ ImGuiContext* g_ctx;
+ 
+-void test_window(float dt) {
+-    ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);
+-    ImGui::Begin("Dear ImGui test");
+-    ImGui::Text("Backend check: Roboto and Noto Sans JP");
+-    ImGui::Text("\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE8\xA1\xA8\xE7\xA4\xBA\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88"); /* Japanese text, UTF-8 */
+-    ImGui::Text("%.1f FPS, %.2f ms", ImGui::GetIO().Framerate, dt * 1000.0f);
+-    static bool checked = true;
+-    static float value = 0.6f;
+-    ImGui::Checkbox("Theme check", &checked); /* the accent shows on the mark, the grab and the button */
+-    ImGui::SliderFloat("Value", &value, 0.0f, 1.0f);
+-    ImGui::Button("Button");
+-    ImGui::End();
+-}
+-
+ bool add_fonts(const ImguiGlueInit* in) {
+     ImGuiIO& io = ImGui::GetIO();
+     if (!in->latin_font) return true;
+@@ -88,16 +77,23 @@ extern "C" void imgui_glue_shutdown(void) {
+ 
+ extern "C" int imgui_glue_ready(void) { return g_ready; }
+ 
+-extern "C" int imgui_glue_frame(float w, float h, float dt) {
++extern "C" int imgui_glue_frame(const ImguiFrame* f) {
+     if (!g_ready) return 0;
+     ImGuiIO& io = ImGui::GetIO();
+-    io.DisplaySize = ImVec2(w, h);
+-    io.DeltaTime = dt > 0 ? dt : 1.0f / 60;
++    io.DisplaySize = ImVec2(f->w, f->h);
++    io.DeltaTime = f->dt > 0 ? f->dt : 1.0f / 60;
++    imgui_events_feed();
+     ImGui_ImplVulkan_NewFrame();
+     ImGui::NewFrame();
+-    test_window(dt);
++    bool menu = imgui_ui_draw(f->dt, f->open_test != 0);
++    imgui_events_publish(menu);
+     ImGui::Render();
+-    return 1;
++    return ImGui::GetDrawData()->TotalVtxCount > 0;
++}
++
++extern "C" void imgui_glue_unwanted(void) {
++    ImguiWants none = {};
++    imgui_input_publish(&none);
+ }
+ 
+ extern "C" void imgui_glue_record(VkCommandBuffer cb) {
+diff --git a/src/nx/gpu/vk/imgui_glue.h b/src/nx/gpu/vk/imgui_glue.h
+index cf611e8..e4bcbbb 100644
+--- a/src/nx/gpu/vk/imgui_glue.h
++++ b/src/nx/gpu/vk/imgui_glue.h
+@@ -29,8 +29,14 @@ typedef struct {
+ int imgui_glue_init(const ImguiGlueInit* in); /* 1 when ready */
+ void imgui_glue_shutdown(void);               /* the device is idle */
+ int imgui_glue_ready(void);
+-/* the windows of one frame for a picture w x h, dt seconds after the last one: 1 when there is a frame to record */
+-int imgui_glue_frame(float w, float h, float dt);
++/* one frame for a picture w x h, dt seconds after the last one. open_test is the test window's first state. Returns 1
++   when there is something to draw */
++typedef struct {
++    float w, h, dt;
++    int open_test;
++} ImguiFrame;
++int imgui_glue_frame(const ImguiFrame* f);
++void imgui_glue_unwanted(void); /* the windows are off: they want no input */
+ /* the frame's draw data into cb, inside a rendering scope on the picture. A new texture is uploaded first, on the
+    queue, which the caller keeps idle for it (vk_rec_sync) */
+ void imgui_glue_record(VkCommandBuffer cb);
+diff --git a/src/nx/gpu/vk/imgui_input.c b/src/nx/gpu/vk/imgui_input.c
+new file mode 100644
+index 0000000..51f6da1
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_input.c
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++#include "nx/gpu/vk/imgui_input.h"
++#include "common/filesystem/host.h"
++
++enum { QUEUE_MAX = 256 }; /* a frame of input: a mouse reports a few hundred a second, a frame is 33 ms or less */
++static ImguiEvent g_queue[QUEUE_MAX];
++static int g_head, g_count;
++static PMutex g_lock = PMUTEX_INIT;
++static int g_wants_mouse, g_wants_keyboard, g_wants_text, g_wants_release;
++
++void imgui_input_push(const ImguiEvent* e) {
++    pm_lock(&g_lock);
++    if (g_count < QUEUE_MAX) {
++        g_queue[(g_head + g_count) % QUEUE_MAX] = *e;
++        ++g_count;
++    }
++    pm_unlock(&g_lock);
++}
++
++int imgui_input_pop(ImguiEvent* e) {
++    int have = 0;
++    pm_lock(&g_lock);
++    if (g_count) {
++        *e = g_queue[g_head];
++        g_head = (g_head + 1) % QUEUE_MAX;
++        --g_count;
++        have = 1;
++    }
++    pm_unlock(&g_lock);
++    return have;
++}
++
++void imgui_input_publish(const ImguiWants* w) {
++    __atomic_store_n(&g_wants_mouse, w->mouse, __ATOMIC_RELAXED);
++    __atomic_store_n(&g_wants_keyboard, w->keyboard, __ATOMIC_RELAXED);
++    __atomic_store_n(&g_wants_text, w->text, __ATOMIC_RELAXED);
++    __atomic_store_n(&g_wants_release, w->release, __ATOMIC_RELAXED);
++}
++
++ImguiWants imgui_input_wants(void) {
++    ImguiWants w = {__atomic_load_n(&g_wants_mouse, __ATOMIC_RELAXED), __atomic_load_n(&g_wants_keyboard, __ATOMIC_RELAXED),
++                    __atomic_load_n(&g_wants_text, __ATOMIC_RELAXED), __atomic_load_n(&g_wants_release, __ATOMIC_RELAXED)};
++    return w;
++}
+diff --git a/src/nx/gpu/vk/imgui_input.h b/src/nx/gpu/vk/imgui_input.h
+new file mode 100644
+index 0000000..3c18c44
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_input.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The input of the ImGui windows. The main thread polls the window's events (runtime/platform/backend/imgui_sdl.c)
++   and pushes them here. The ImGui context belongs to whoever holds vk_lock, which pops them at the start of its frame.
++   The other way, the frame publishes what the windows want, and the main thread reads it with no lock. The queue has
++   its own mutex, which is a leaf: nothing else is taken while it is held */
++#ifndef SNX_IMGUI_INPUT_H
++#define SNX_IMGUI_INPUT_H
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum { IMGUI_EV_MOUSE_POS, IMGUI_EV_MOUSE_BUTTON, IMGUI_EV_WHEEL, IMGUI_EV_KEY, IMGUI_EV_TEXT, IMGUI_EV_FOCUS };
++enum { IMGUI_TEXT_MAX = 32 };
++/* an SDL button number (1 left, 2 middle, 3 right) in button; a key as the SDL keycode and the SDL modifier mask */
++typedef struct {
++    int type;
++    float x, y; /* a position in pixels of the picture, or the wheel's steps. -1e9 for no mouse */
++    int button, down, key, mods;
++    char text[IMGUI_TEXT_MAX];
++} ImguiEvent;
++
++void imgui_input_push(const ImguiEvent* e); /* any thread; a full queue drops the event */
++int imgui_input_pop(ImguiEvent* e);         /* the context's owner: 1 with the oldest event, 0 when empty */
++
++/* what the windows want, set by the frame and read by the main thread */
++typedef struct {
++    int mouse;    /* the cursor is over a window, or a widget holds the mouse: the game does not get it */
++    int keyboard; /* a widget has the keyboard: the game does not get keys */
++    int text;     /* a text field is active: the window's text input is on */
++    int release;  /* the game's mouse look lets go of the cursor */
++} ImguiWants;
++void imgui_input_publish(const ImguiWants* w);
++ImguiWants imgui_input_wants(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/nx/gpu/vk/imgui_ui.cpp b/src/nx/gpu/vk/imgui_ui.cpp
+new file mode 100644
+index 0000000..4acbdcd
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_ui.cpp
+@@ -0,0 +1,85 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++#include "nx/gpu/vk/imgui_ui.h"
++#include <cfloat>
++#include "imgui.h"
++
++namespace {
++constexpr float BAR_TRIGGER_PX = 24.0f; /* the cursor this close to the top of the picture shows the bar */
++bool g_bar_shown;
++bool g_show_test;
++int g_open_test_was = -1;
++
++bool menu_open_anywhere() {
++    return ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
++}
++
++/* shows from the top edge, and stays while the cursor is on the bar or a menu is open */
++bool bar_wanted() {
++    const ImGuiIO& io = ImGui::GetIO();
++    bool at_top = io.MousePos.x > -FLT_MAX / 2 && io.MousePos.y >= 0 && io.MousePos.y < BAR_TRIGGER_PX;
++    bool on_bar = g_bar_shown && io.MousePos.x > -FLT_MAX / 2 && io.MousePos.y >= 0 && io.MousePos.y < ImGui::GetFrameHeight();
++    return at_top || on_bar || menu_open_anywhere();
++}
++
++void unavailable(const char* what) {
++    ImGui::BeginDisabled();
++    ImGui::MenuItem(what);
++    ImGui::EndDisabled();
++}
++
++void menu_bar() {
++    if (ImGui::BeginMenu("About")) {
++        ImGui::TextUnformatted("NXAevora");
++        ImGui::EndMenu();
++    }
++    if (ImGui::BeginMenu("Settings")) {
++        unavailable("Not available yet");
++        ImGui::EndMenu();
++    }
++    if (ImGui::BeginMenu("Mods")) {
++        unavailable("Not available yet");
++        ImGui::EndMenu();
++    }
++    if (ImGui::BeginMenu("Cheats")) {
++        unavailable("Not available yet");
++        ImGui::EndMenu();
++    }
++    if (ImGui::BeginMenu("Debug")) {
++        ImGui::MenuItem("Test window", nullptr, &g_show_test);
++        ImGui::EndMenu();
++    }
++}
++
++void test_window(float dt) {
++    ImGui::SetNextWindowPos(ImVec2(40, 60), ImGuiCond_FirstUseEver);
++    if (!ImGui::Begin("Dear ImGui test", &g_show_test)) {
++        ImGui::End();
++        return;
++    }
++    static bool checked = true;
++    static float value = 0.6f;
++    ImGui::Text("Backend check: Roboto and Noto Sans JP");
++    ImGui::Text("\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE8\xA1\xA8\xE7\xA4\xBA\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88"); /* Japanese text, UTF-8 */
++    ImGui::Text("%.1f FPS, %.2f ms", ImGui::GetIO().Framerate, dt * 1000.0f);
++    ImGui::Checkbox("Theme check", &checked);
++    ImGui::SliderFloat("Value", &value, 0.0f, 1.0f);
++    ImGui::Button("Button");
++    ImGui::End();
++}
++} // namespace
++
++bool imgui_ui_draw(float dt, bool open_test) {
++    if ((int)open_test != g_open_test_was) {
++        g_open_test_was = open_test;
++        g_show_test = open_test;
++    }
++    g_bar_shown = false;
++    if (bar_wanted() && ImGui::BeginMainMenuBar()) {
++        g_bar_shown = true;
++        menu_bar();
++        ImGui::EndMainMenuBar();
++    }
++    if (g_show_test) test_window(dt);
++    return g_bar_shown;
++}
+diff --git a/src/nx/gpu/vk/imgui_ui.h b/src/nx/gpu/vk/imgui_ui.h
+new file mode 100644
+index 0000000..1f8a5fc
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_ui.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The windows of the game: a menu bar that shows when the cursor is at the top of the picture, and what its menus
++   open. Called between NewFrame and Render */
++#ifndef SNX_IMGUI_UI_H
++#define SNX_IMGUI_UI_H
++
++/* dt: the last frame's seconds. open_test: the test window's first state, from the .ini. Returns whether the menu bar
++   shows this frame */
++bool imgui_ui_draw(float dt, bool open_test);
++
++#endif
+diff --git a/src/nx/runtime/platform/backend/imgui_sdl.c b/src/nx/runtime/platform/backend/imgui_sdl.c
+new file mode 100644
+index 0000000..3998807
+--- /dev/null
++++ b/src/nx/runtime/platform/backend/imgui_sdl.c
+@@ -0,0 +1,102 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++#include "nx/runtime/platform/backend/imgui_sdl.h"
++#include <string.h>
++#include "nx/gpu/vk/imgui_input.h"
++
++enum { NO_MOUSE = -1000000000 };
++static int g_grabbed; /* the buttons whose press the windows took: bit n for SDL button n */
++static int g_was_captured = 1;
++static int g_text_on; /* this file started the window's text input */
++
++static void push_pos(float x, float y) {
++    ImguiEvent ev = {.type = IMGUI_EV_MOUSE_POS, .x = x, .y = y};
++    imgui_input_push(&ev);
++}
++
++/* the windows see no mouse while the mouse look holds the cursor, and the cursor's place once it is let go */
++static void follow_capture(int captured, float density) {
++    float x, y;
++    if (captured == g_was_captured) return;
++    g_was_captured = captured;
++    if (captured) {
++        push_pos(NO_MOUSE, NO_MOUSE);
++        return;
++    }
++    SDL_GetMouseState(&x, &y);
++    push_pos(x * density, y * density);
++}
++
++static int button_event(const SDL_Event* e, ImguiWants w) {
++    int bit = 1 << e->button.button, down = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN, taken;
++    ImguiEvent ev = {.type = IMGUI_EV_MOUSE_BUTTON, .button = e->button.button, .down = down};
++    if (e->button.which == SDL_TOUCH_MOUSEID) return 0;
++    imgui_input_push(&ev);
++    if (down) {
++        taken = w.mouse;
++        if (taken) g_grabbed |= bit;
++        return taken;
++    }
++    taken = (g_grabbed & bit) != 0; /* the release of a press that the windows took */
++    g_grabbed &= ~bit;
++    return taken;
++}
++
++static int mouse_event(const SDL_Event* e, float density, ImguiWants w) {
++    ImguiEvent ev = {.type = IMGUI_EV_WHEEL};
++    switch (e->type) {
++        case SDL_EVENT_MOUSE_MOTION:
++            if (e->motion.which == SDL_TOUCH_MOUSEID) return 0;
++            push_pos(e->motion.x * density, e->motion.y * density);
++            return w.mouse;
++        case SDL_EVENT_MOUSE_WHEEL:
++            ev.x = e->wheel.x;
++            ev.y = e->wheel.y;
++            imgui_input_push(&ev);
++            return w.mouse;
++        default: return button_event(e, w);
++    }
++}
++
++static int key_event(const SDL_Event* e, ImguiWants w) {
++    int down = e->type == SDL_EVENT_KEY_DOWN;
++    ImguiEvent ev = {.type = IMGUI_EV_KEY, .key = (int)e->key.key, .mods = (int)e->key.mod, .down = down};
++    imgui_input_push(&ev);
++    return down && w.keyboard;
++}
++
++int imgui_sdl_event(const SDL_Event* e, float density, int captured) {
++    ImguiWants w = imgui_input_wants();
++    ImguiEvent ev = {0};
++    follow_capture(captured, density);
++    switch (e->type) {
++        case SDL_EVENT_MOUSE_MOTION:
++        case SDL_EVENT_MOUSE_BUTTON_DOWN:
++        case SDL_EVENT_MOUSE_BUTTON_UP:
++        case SDL_EVENT_MOUSE_WHEEL: return captured ? 0 : mouse_event(e, density, w);
++        case SDL_EVENT_KEY_DOWN:
++        case SDL_EVENT_KEY_UP: return key_event(e, w);
++        case SDL_EVENT_TEXT_INPUT:
++            if (!w.text) return 0;
++            ev.type = IMGUI_EV_TEXT;
++            strncpy(ev.text, e->text.text, IMGUI_TEXT_MAX - 1);
++            imgui_input_push(&ev);
++            return 1;
++        case SDL_EVENT_WINDOW_FOCUS_LOST:
++            g_grabbed = 0;
++            ev.type = IMGUI_EV_FOCUS;
++            imgui_input_push(&ev);
++            return 0;
++    }
++    return 0;
++}
++
++void imgui_sdl_text_input(SDL_Window* win, int keyboard_box) {
++    int want = imgui_input_wants().text && !keyboard_box;
++    if (want == g_text_on) return;
++    g_text_on = want;
++    if (want)
++        SDL_StartTextInput(win);
++    else
++        SDL_StopTextInput(win);
++}
+diff --git a/src/nx/runtime/platform/backend/imgui_sdl.h b/src/nx/runtime/platform/backend/imgui_sdl.h
+new file mode 100644
+index 0000000..f93d084
+--- /dev/null
++++ b/src/nx/runtime/platform/backend/imgui_sdl.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The window's events for the ImGui windows (gpu/vk/imgui_input.h). Main thread only */
++#ifndef SNX_IMGUI_SDL_H
++#define SNX_IMGUI_SDL_H
++#include <SDL3/SDL.h>
++
++/* An event, given to the windows. 1 when they take it, so the game and the old menu do not get it. density is the
++   pixels of the picture for each point of the window, captured whether the mouse look holds the cursor (the windows
++   then see no mouse). A key-up is never taken: a key the game saw go down must come up */
++int imgui_sdl_event(const SDL_Event* e, float density, int captured);
++/* turns the window's text input on while a text field is active, unless the game's keyboard box has it (keyboard_box) */
++void imgui_sdl_text_input(SDL_Window* win, int keyboard_box);
++#endif
+diff --git a/src/nx/runtime/platform/backend/sdl3.c b/src/nx/runtime/platform/backend/sdl3.c
+index 1139ff1..0193404 100644
+--- a/src/nx/runtime/platform/backend/sdl3.c
++++ b/src/nx/runtime/platform/backend/sdl3.c
+@@ -13,6 +13,9 @@
+ #include "nx/hle/kernel/kernel.h"
+ #include "nx/memory/mem.h" /* g_mem: the guest words of the native mouse look */
+ #include "nx/runtime/platform/backend.h"
++#include "nx/runtime/platform/backend/imgui_sdl.h"
++#include "nx/runtime/platform/prepare_screen.h"
++#include "nx/gpu/vk/imgui_input.h"
+ #include "nx/runtime/platform/log.h"
+ #include "nx/runtime/platform/plat.h"
+ #include "nx/runtime/platform/tracy.h"
+@@ -1474,6 +1477,11 @@ static void keyboard_sync(void) {
+     }
+     if (answer >= 0) am_keyboard_answered(ticket, answer, text);
+ }
++/* the picture's pixels for each point of the window: the windows work in pixels, SDL's mouse in points */
++static float imgui_density(void) {
++    float d = SDL_GetWindowPixelDensity(g_win);
++    return d > 0 ? d : 1.0f;
++}
+ void video_poll(void) {
+     SDL_Event e;
+     char* left = __atomic_load_n(&g_fatal_left, __ATOMIC_ACQUIRE);
+@@ -1486,6 +1494,7 @@ void video_poll(void) {
+        gives the box's line) is in this poll's state */
+     int menu_had = overlay_shown() || vpad_editing() || overlay_keyboard_shown();
+     while (!g_opt_headless && SDL_PollEvent(&e)) {
++        if (!overlay_shown() && !prepare_screen_shown() && imgui_sdl_event(&e, imgui_density(), g_mouse_captured)) continue;
+         if (press_event(&e)) continue;
+         if (overlay_event(&e)) continue;
+         switch (e.type) {
+@@ -1569,7 +1578,10 @@ void video_poll(void) {
+     /* the scripted presses act like keys, stick keys included. Bits 16..23 (the stick directions as buttons) can be
+        scripted too, but the stick keys (40..47) are no npad buttons */
+     static u64 script_was; /* the scripted buttons of the last poll: a Home press opens or closes the menu */
+-    if (!g_opt_headless) mouse_capture_update(overlay_shown() || vpad_editing() || overlay_keyboard_shown());
++    if (!g_opt_headless) {
++        imgui_sdl_text_input(g_win, overlay_keyboard_shown());
++        mouse_capture_update(overlay_shown() || vpad_editing() || overlay_keyboard_shown() || imgui_input_wants().release);
++    }
+     u64 s = unattended_buttons(), k = keys_held | s | g_mouse_buttons;
+     if (s & ~script_was & SNX_SCRIPT_HOME) {
+         ui_lock();
+diff --git a/src/nx/runtime/settings.txt b/src/nx/runtime/settings.txt
+index 6b780ec..339f158 100644
+--- a/src/nx/runtime/settings.txt
++++ b/src/nx/runtime/settings.txt
+@@ -814,12 +814,20 @@ setting Verify macros
+     startup
+     words Off|On
+     help 1 = runs each native and compiled macro against the interpreter too, and logs where they differ
++setting Imgui
++    key imgui
++    int 0 1
++    default 1
++    words Off|On
++    help 1 = the windows of Dear ImGui: a menu bar at the top of the picture, shown when the cursor is there (hold Alt
++    help to free the cursor from the mouse look). 0 = none, and they take no input
+ setting Imgui test
+     key imgui_test
+     int 0 1
+     default 0
+     words Off|On
+-    help 1 = draws a Dear ImGui test window over the game, to check the backend and the fonts (fonts/ in the data folder)
++    help 1 = the Dear ImGui test window is open at the start (also in the menu bar's Debug menu), to check the backend
++    help and the fonts (fonts/ in the data folder)
+ setting RenderDoc captures
+     key renderdoc
+     text 1024
