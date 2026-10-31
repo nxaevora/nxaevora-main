@@ -107,8 +107,9 @@ Exit condition: the decision above is recorded. The optional check can be done a
   80 counted the same program once for each archive. Six wait for their first draw, because their translation reads a
   constant buffer. Four hit the data of a jump table that follows the program (checked in the files). The last one has the instruction `RED`, and the
   count of skipped draws grew by one in each frame. Patch `0002` adds the form, and a run of 157 s then showed 0
-  skipped draws. One texture of
-  format 0 is also not drawn. The user sees no visible fault from these in the tested scenes. A run of 681 s with the bag, the box, the clothes,
+  skipped draws. The one texture of
+  format 0 is an empty header that the game binds to the slot of a compute program. The slot reads zeros through a
+  null view and no draw is dropped. The user sees no visible fault from these in the tested scenes. A run of 681 s with the bag, the box, the clothes,
   the battle introduction and a large part of the open areas had no shader that failed at its first draw, no skipped
   draw and 0 JIT misses.
 - Stutter: the only visible problem so far is a stutter when a pipeline is made for the first time. A run of 420 s

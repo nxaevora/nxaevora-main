@@ -131,6 +131,36 @@ names come from `maxwell_opcodes.def`.
   areas. So the 10 programs translated at their first draw, and the check is **closed**: the failure before the start
   is the missing constant buffer of that pass, and it costs nothing in play.
 
+## The texture of format 0
+
+The line `unsupported texture format 0, header word 0 00000000 (not drawn)` comes once in each run (about 6.5 s to 10.5 s
+after the start, in the first frames after the loading screen). Checked in the five logs of 2026-10-31 and in the
+source (ScarletNX `render.c`, `texture.c`, `format.c`).
+
+- The texture is not a texture of an unknown format. The header is empty: word 0 is 0, so the format is 0, and the
+  address is 0. `tex_from_tic` returns no texture for a header without an address (`if (!gva) return NULL`), so the slot
+  has no surface.
+- The message comes from `vk_tex_num` (`render.c:828`): with no surface it asks the raw header's format, to tell if the
+  sampler reads floats or integers. The format 0 is not in the table of `tic_format`, so it warns, once, and says
+  float. The words "not drawn" in the message are misleading. The draw is not dropped.
+- What the draw gets: a null view (`vk_null_view`, `render.c:1744`), which reads zeros, "as a missing texture does".
+  The count of skipped draws is 0 in all the windows of all the runs, so no draw is dropped for this.
+- In all five runs the line follows the same compute program at once: `vulkan: compute fa569ec6aa40d973 ready: block
+  32x1x1, 10 global buffers, 1 textures`, then the line, then the first indexed draw (`mme: macro 30`). So the empty
+  header is most probably the one texture of that compute program at its first dispatch. This is an inference from
+  the order of the log lines. The log does not name the slot.
+- Reading: the game binds an empty header to a slot that it does not use yet (a texture that the game writes later, for
+  example the result of an earlier frame). The null view reads zeros, as a header with no address does on the console
+  (this is not verified on the console, only from how the other emulators and this runtime treat it). The user sees no
+  fault in any scene (the runs of 157 s and 681 s, the bag, the box, the clothes, the battle introduction and the open
+  areas).
+- Not known: if the empty header comes back in later frames. The line is printed once for each format, so the log does
+  not count it. If a later change shows a wrong picture that this compute program feeds, add a counter at
+  `vk_tex_num` that logs the handle, the stage and the draw's shader hash.
+
+Decision: no change in the runtime. The wording of the message could be better, but a change to the submodule for a
+log line has no gain.
+
 ## What is open
 
 1. Find the draw that was skipped each frame, to see what it draws (the skips are 0 now, so this has little value).
