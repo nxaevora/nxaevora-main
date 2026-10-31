@@ -1,0 +1,258 @@
+diff --git a/src/nx/gpu/vk/imgui.c b/src/nx/gpu/vk/imgui.c
+index 45ff143..f7d7ed3 100644
+--- a/src/nx/gpu/vk/imgui.c
++++ b/src/nx/gpu/vk/imgui.c
+@@ -45,8 +45,8 @@ static int ready(void) {
+     int have_latin, have_jp;
+     ImguiGlueInit in;
+     overlay_keyboard_external_set(windows_running);
+-    if (imgui_glue_ready()) return 1;
+     if (g_failed) return 0;
++    if (imgui_glue_ready()) return 1;
+     have_latin = font_path(latin, LATIN_FONT);
+     have_jp = have_latin && font_path(japanese, JAPANESE_FONT);
+     in = (ImguiGlueInit){.instance = g_vk.instance,
+@@ -150,6 +150,12 @@ void vk_imgui_draw(VkCommandBuffer cb, VkImage sc, u32 game_w, u32 game_h) {
+     frame.fps_limit = limit;
+     frame.gpu_name = g_vk.props.deviceName;
+     drawn = imgui_glue_frame(&frame);
++    if (imgui_glue_vk_failed()) { /* the backend stays until the swapchain goes: frames may still use it */
++        g_failed = 1;
++        LOG("imgui: the Vulkan backend reported an error, the windows are off\n");
++        imgui_glue_unwanted();
++        return;
++    }
+     imgui_input_alive_set(now);
+     keyboard_answer(&frame.kb);
+     if (!drawn) return; /* nothing shows: no drain, no pass */
+diff --git a/src/nx/gpu/vk/imgui_glue.cpp b/src/nx/gpu/vk/imgui_glue.cpp
+index 9780cec..89e2ce3 100644
+--- a/src/nx/gpu/vk/imgui_glue.cpp
++++ b/src/nx/gpu/vk/imgui_glue.cpp
+@@ -13,8 +13,13 @@
+ namespace {
+ constexpr uint32_t TEXTURE_SLOTS = 16; /* sampler descriptors: the font atlas and a few more images */
+ bool g_ready;
++bool g_vk_failed; /* the backend got an error result: set on the frame's thread, under vk_lock */
+ ImGuiContext* g_ctx;
+ 
++void check_vk_result(VkResult r) {
++    if (r < 0) g_vk_failed = true;
++}
++
+ bool add_fonts(const ImguiGlueInit* in) {
+     ImGuiIO& io = ImGui::GetIO();
+     if (!in->latin_font) return true;
+@@ -56,6 +61,7 @@ extern "C" int imgui_glue_init(const ImguiGlueInit* in) {
+     vi.MinImageCount = 2;
+     vi.ImageCount = in->image_count < 2 ? 2 : in->image_count;
+     vi.UseDynamicRendering = true;
++    vi.CheckVkResultFn = check_vk_result;
+     vi.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+     vi.PipelineInfoMain.PipelineRenderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+     vi.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
+@@ -65,6 +71,7 @@ extern "C" int imgui_glue_init(const ImguiGlueInit* in) {
+         g_ctx = nullptr;
+         return 0;
+     }
++    g_vk_failed = false;
+     g_ready = true;
+     return 1;
+ }
+@@ -80,6 +87,8 @@ extern "C" void imgui_glue_shutdown(void) {
+ 
+ extern "C" int imgui_glue_ready(void) { return g_ready; }
+ 
++extern "C" int imgui_glue_vk_failed(void) { return g_vk_failed; }
++
+ extern "C" int imgui_glue_frame(ImguiFrame* f) {
+     if (!g_ready) return 0;
+     ImGuiIO& io = ImGui::GetIO();
+diff --git a/src/nx/gpu/vk/imgui_glue.h b/src/nx/gpu/vk/imgui_glue.h
+index 1a1791d..e259c75 100644
+--- a/src/nx/gpu/vk/imgui_glue.h
++++ b/src/nx/gpu/vk/imgui_glue.h
+@@ -29,6 +29,7 @@ typedef struct {
+ int imgui_glue_init(const ImguiGlueInit* in); /* 1 when ready */
+ void imgui_glue_shutdown(void);               /* the device is idle */
+ int imgui_glue_ready(void);
++int imgui_glue_vk_failed(void); /* the backend got a Vulkan error since init: the caller shuts it down */
+ /* one frame for a picture w x h, dt seconds after the last one. open_test is the test window's first state. Returns 1
+    when there is something to draw */
+ /* the game's keyboard box, as the window shows it (overlay.h's OverlayKeyboardView) and what the window answers. The
+diff --git a/src/nx/gpu/vk/imgui_input.c b/src/nx/gpu/vk/imgui_input.c
+index d099f12..818092a 100644
+--- a/src/nx/gpu/vk/imgui_input.c
++++ b/src/nx/gpu/vk/imgui_input.c
+@@ -3,18 +3,40 @@
+ #include "nx/gpu/vk/imgui_input.h"
+ #include "common/filesystem/host.h"
+ 
+-enum { QUEUE_MAX = 256 }; /* a frame of input: a mouse reports a few hundred a second, a frame is 33 ms or less */
++enum { QUEUE_MAX = 4096 }; /* the frame pops them: a stalled frame (a loading interval) keeps what the player pressed */
+ static ImguiEvent g_queue[QUEUE_MAX];
+ static int g_head, g_count;
+ static PMutex g_lock = PMUTEX_INIT;
+ static int g_wants_mouse, g_wants_keyboard, g_wants_text, g_wants_release, g_ime_x, g_ime_y, g_ime_h;
+ 
++static ImguiEvent* at(int i) { return &g_queue[(g_head + i) % QUEUE_MAX]; }
++
++/* a position or a wheel step can be merged or lost, a button, a key, a text or a focus change cannot */
++static int is_motion(const ImguiEvent* e) { return e->type == IMGUI_EV_MOUSE_POS || e->type == IMGUI_EV_WHEEL; }
++
++/* makes room by removing the oldest motion event: 1 when there is room now */
++static int evict_motion(void) {
++    for (int i = 0; i < g_count; ++i) {
++        if (!is_motion(at(i))) continue;
++        for (int j = i; j + 1 < g_count; ++j) *at(j) = *at(j + 1);
++        --g_count;
++        return 1;
++    }
++    return 0;
++}
++
+ void imgui_input_push(const ImguiEvent* e) {
+     pm_lock(&g_lock);
+-    if (g_count < QUEUE_MAX) {
+-        g_queue[(g_head + g_count) % QUEUE_MAX] = *e;
++    ImguiEvent* tail = g_count ? at(g_count - 1) : NULL;
++    if (tail && e->type == IMGUI_EV_MOUSE_POS && tail->type == IMGUI_EV_MOUSE_POS) {
++        *tail = *e; /* only the last place matters */
++    } else if (tail && e->type == IMGUI_EV_WHEEL && tail->type == IMGUI_EV_WHEEL) {
++        tail->x += e->x;
++        tail->y += e->y;
++    } else if (g_count < QUEUE_MAX || evict_motion()) {
++        *at(g_count) = *e;
+         ++g_count;
+-    }
++    } /* else the queue holds only transitions: the frame has not run for thousands of them */
+     pm_unlock(&g_lock);
+ }
+ 
+diff --git a/src/nx/gpu/vk/imgui_input.h b/src/nx/gpu/vk/imgui_input.h
+index e8c4c5e..ae2baba 100644
+--- a/src/nx/gpu/vk/imgui_input.h
++++ b/src/nx/gpu/vk/imgui_input.h
+@@ -22,7 +22,7 @@ typedef struct {
+     char text[IMGUI_TEXT_MAX];
+ } ImguiEvent;
+ 
+-void imgui_input_push(const ImguiEvent* e); /* any thread; a full queue drops the event */
++void imgui_input_push(const ImguiEvent* e); /* any thread; motion is merged and goes first when full, the rest stays */
+ int imgui_input_pop(ImguiEvent* e);         /* the context's owner: 1 with the oldest event, 0 when empty */
+ 
+ /* what the windows want, set by the frame and read by the main thread */
+diff --git a/src/nx/runtime/platform/backend/imgui_sdl.c b/src/nx/runtime/platform/backend/imgui_sdl.c
+index fdaa8f1..4d8a8ae 100644
+--- a/src/nx/runtime/platform/backend/imgui_sdl.c
++++ b/src/nx/runtime/platform/backend/imgui_sdl.c
+@@ -58,6 +58,12 @@ static void push_text(const char* text) {
+     }
+ }
+ 
++static void focus_lost(void) {
++    ImguiEvent ev = {.type = IMGUI_EV_FOCUS};
++    g_grabbed = 0;
++    imgui_input_push(&ev);
++}
++
+ static int mouse_event(const SDL_Event* e, float density, ImguiWants w) {
+     ImguiEvent ev = {.type = IMGUI_EV_WHEEL};
+     switch (e->type) {
+@@ -81,10 +87,24 @@ static int key_event(const SDL_Event* e, ImguiWants w) {
+     return down && w.keyboard;
+ }
+ 
+-int imgui_sdl_event(const SDL_Event* e, float density, int captured) {
++/* the old menu or the loading screen has the controls: the windows get the ends of what they began (a release, a lost
++   focus) and nothing new */
++static void pass_ends(const SDL_Event* e) {
++    ImguiWants none = {0};
++    switch (e->type) {
++        case SDL_EVENT_KEY_UP: key_event(e, none); break;
++        case SDL_EVENT_MOUSE_BUTTON_UP: button_event(e, none); break;
++        case SDL_EVENT_WINDOW_FOCUS_LOST: focus_lost(); break;
++    }
++}
++
++int imgui_sdl_event(const SDL_Event* e, float density, int captured, int owned) {
+     ImguiWants w = imgui_input_wants();
+-    ImguiEvent ev = {0};
+     follow_capture(captured, density);
++    if (!owned) {
++        pass_ends(e);
++        return 0;
++    }
+     switch (e->type) {
+         case SDL_EVENT_MOUSE_MOTION:
+         case SDL_EVENT_MOUSE_BUTTON_DOWN:
+@@ -97,9 +117,7 @@ int imgui_sdl_event(const SDL_Event* e, float density, int captured) {
+             push_text(e->text.text);
+             return 1;
+         case SDL_EVENT_WINDOW_FOCUS_LOST:
+-            g_grabbed = 0;
+-            ev.type = IMGUI_EV_FOCUS;
+-            imgui_input_push(&ev);
++            focus_lost();
+             return 0;
+     }
+     return 0;
+diff --git a/src/nx/runtime/platform/backend/imgui_sdl.h b/src/nx/runtime/platform/backend/imgui_sdl.h
+index c7ca69d..9be0857 100644
+--- a/src/nx/runtime/platform/backend/imgui_sdl.h
++++ b/src/nx/runtime/platform/backend/imgui_sdl.h
+@@ -7,8 +7,9 @@
+ 
+ /* An event, given to the windows. 1 when they take it, so the game and the old menu do not get it. density is the
+    pixels of the picture for each point of the window, captured whether the mouse look holds the cursor (the windows
+-   then see no mouse). A key-up is never taken: a key the game saw go down must come up */
+-int imgui_sdl_event(const SDL_Event* e, float density, int captured);
++   then see no mouse). owned is 0 while the old menu or the loading screen has the controls: the windows then get only
++   releases and a lost focus, and take nothing. A key-up is never taken: a key the game saw go down must come up */
++int imgui_sdl_event(const SDL_Event* e, float density, int captured, int owned);
+ /* turns the window's text input on while a text field is active, unless the game's keyboard box has it (keyboard_box) */
+ void imgui_sdl_text_input(SDL_Window* win, int keyboard_box, float density);
+ #endif
+diff --git a/src/nx/runtime/platform/backend/sdl3.c b/src/nx/runtime/platform/backend/sdl3.c
+index 59e6e18..bfae7d9 100644
+--- a/src/nx/runtime/platform/backend/sdl3.c
++++ b/src/nx/runtime/platform/backend/sdl3.c
+@@ -1483,6 +1483,12 @@ static float imgui_density(void) {
+     float d = SDL_GetWindowPixelDensity(g_win);
+     return d > 0 ? d : 1.0f;
+ }
++/* the physical state of Alt, before the windows can take the event: a window that took the press must not leave the
++   mouse look to grab the cursor again */
++static void alt_track(const SDL_Event* e) {
++    if (e->type != SDL_EVENT_KEY_DOWN && e->type != SDL_EVENT_KEY_UP) return;
++    if (e->key.key == SDLK_LALT || e->key.key == SDLK_RALT) g_alt_held = e->type == SDL_EVENT_KEY_DOWN;
++}
+ void video_poll(void) {
+     SDL_Event e;
+     char* left = __atomic_load_n(&g_fatal_left, __ATOMIC_ACQUIRE);
+@@ -1495,7 +1501,8 @@ void video_poll(void) {
+        gives the box's line) is in this poll's state */
+     int menu_had = overlay_shown() || vpad_editing() || overlay_keyboard_shown();
+     while (!g_opt_headless && SDL_PollEvent(&e)) {
+-        if (!overlay_shown() && !prepare_screen_shown() && imgui_sdl_event(&e, imgui_density(), g_mouse_captured)) continue;
++        alt_track(&e);
++        if (imgui_sdl_event(&e, imgui_density(), g_mouse_captured, !overlay_shown() && !prepare_screen_shown())) continue;
+         if (press_event(&e)) continue;
+         if (overlay_event(&e)) continue;
+         switch (e.type) {
+@@ -1534,7 +1541,6 @@ void video_poll(void) {
+                 wsafe_set();
+                 break;
+             case SDL_EVENT_KEY_DOWN:
+-                if (e.key.key == SDLK_LALT || e.key.key == SDLK_RALT) g_alt_held = 1;
+                 if (keymap(e.key.scancode) && g_settings.mouse_look) g_use_mouse = 1;
+                 if (e.key.key == SDLK_ESCAPE) { /* a fresh press: the repeats of the Esc that closed the menu don't */
+                     if (!e.key.repeat) g_quit = 1;
+@@ -1551,7 +1557,6 @@ void video_poll(void) {
+                 if (!e.key.repeat) keys_held |= keymap(e.key.scancode);
+                 break;
+             case SDL_EVENT_KEY_UP:
+-                if (e.key.key == SDLK_LALT || e.key.key == SDLK_RALT) g_alt_held = 0;
+                 keys_held &= ~keymap(e.key.scancode);
+                 break;
+             case SDL_EVENT_WINDOW_FOCUS_LOST:
