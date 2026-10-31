@@ -201,3 +201,9 @@ Sources to find in step 1 (a value that no source gives shows as `?`, as the sta
   Mouse section (`main.c`'s `group_icon`, from patch 0001 and older than this step), and `native_recompiler` and
   `llvm_module` fail on the build of a module in this environment. None of them touches this change, but the three
   were not compared with a build without it.
+- Step 8: done, the user ran it and the name input worked.
+- Step 9 (old menu off): built, not yet run. Patch `0019-imgui-replaces-menu.patch`. While the windows run, F2, Back, the
+  controller's Home and the on-screen controls' menu button do not open the old menu (`overlay_menu_opens`). The setting
+  `legacy_menu=1` opens it anyway, because its gamepad button map and save state pages have no window yet. These two
+  pages, the on-screen controls' edit mode and the stats corner are the first things for the Settings window. The scripted
+  Home press (unattended runs) still opens it.
