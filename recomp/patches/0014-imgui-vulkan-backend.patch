@@ -1,0 +1,371 @@
+diff --git a/src/nx/CMakeLists.txt b/src/nx/CMakeLists.txt
+index bf8cc17..82a9d35 100644
+--- a/src/nx/CMakeLists.txt
++++ b/src/nx/CMakeLists.txt
+@@ -104,8 +104,13 @@ snx_shaderdec(snx_shader)
+ snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
+                  gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/compute.c
+                  gpu/vk/pending_pages.c gpu/vk/memory.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/ui.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp gpu/vk/gpuprof.c
+-                 gpu/vk/ftz_probe.c
+-                 "${volk_SOURCE_DIR}/volk.c")
++                 gpu/vk/ftz_probe.c gpu/vk/imgui.c gpu/vk/imgui_glue.cpp
++                 "${volk_SOURCE_DIR}/volk.c"
++                 "${imgui_SOURCE_DIR}/imgui.cpp" "${imgui_SOURCE_DIR}/imgui_draw.cpp"
++                 "${imgui_SOURCE_DIR}/imgui_tables.cpp" "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
++                 "${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp")
++# Dear ImGui's own files, with the Vulkan backend that loads its functions through volk (gpu/vk/imgui_glue.cpp)
++target_include_directories(snx_vk PRIVATE "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
+ # the ASTC decoder's, the block linear deswizzle and swizzle's, the texture conversions', the VIC composition's and
+ # the render enable predicates' SPIR-V, compiled from their GLSL at build time (cmake/glsl.cmake). The VIC shader is
+ # built twice: for word aligned rows, and for the rest
+@@ -126,6 +131,10 @@ set(components core kernel hle video gpu platform shader vk)
+ # third-party code (vma.cpp is VMA's implementation), cmake/dependencies.cmake
+ set_source_files_properties("${volk_SOURCE_DIR}/volk.c" gpu/vk/vma.cpp PROPERTIES COMPILE_OPTIONS
+                             "${snx_third_party_flags}")
++set_source_files_properties("${imgui_SOURCE_DIR}/imgui.cpp" "${imgui_SOURCE_DIR}/imgui_draw.cpp"
++                            "${imgui_SOURCE_DIR}/imgui_tables.cpp" "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
++                            "${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp" PROPERTIES COMPILE_OPTIONS
++                            "${snx_third_party_flags}" COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_USE_VOLK)
+ 
+ if(ANDROID)
+     # the menu runs the program (src/multicall's libscarletnx.so) as libscarletnx-run.so, an executable named for the
+diff --git a/src/nx/gpu/vk/device.c b/src/nx/gpu/vk/device.c
+index d01e022..3fe3bbc 100644
+--- a/src/nx/gpu/vk/device.c
++++ b/src/nx/gpu/vk/device.c
+@@ -592,6 +592,7 @@ static void swapchain_retire(void) {
+     for (u32 i = 0; i < nretired; i++) vkDestroySemaphore(g_vk.dev, retired[i], NULL);
+     nretired = 0;
+     for (u32 i = 0; i < g_vk.sc_count; i++) retired[nretired++] = g_vk.sc_done[i];
++    vk_imgui_swapchain_gone();
+     vk_ui_swapchain_gone();
+     vkDestroySwapchainKHR(g_vk.dev, g_vk.swapchain, NULL);
+     g_vk.swapchain = VK_NULL_HANDLE;
+diff --git a/src/nx/gpu/vk/imgui.c b/src/nx/gpu/vk/imgui.c
+new file mode 100644
+index 0000000..d4021d0
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui.c
+@@ -0,0 +1,116 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* Dear ImGui's windows over the presented image, after the on-screen controls and the game's menu (ui.c).
++   The frame's command buffer is recorded on the recording thread (record.c), and ImGui's backend calls Vulkan
++   directly. So the ring is drained first (vk_rec_sync, under vk_lock), then ImGui and the two barriers around it
++   record straight into the command buffer, and the commands queued after it follow in order. A frame is drawn only
++   while a window shows, so the drain costs nothing otherwise. */
++#include <stdio.h>
++#include "nx/gpu/vk/vk.h"
++#include "nx/gpu/vk/imgui_glue.h"
++#include "nx/runtime/main.h"
++#include "nx/runtime/options.h"
++#include "nx/runtime/platform/log.h"
++#include "nx/runtime/platform/plat.h"
++
++enum { FONT_PX = 18, FONT_PATH_MAX = 1100 };
++static const char LATIN_FONT[] = "fonts/Roboto-Variable.ttf";
++static const char JAPANESE_FONT[] = "fonts/NotoSansJP-Regular.otf";
++
++static u64 g_last_ns;
++static int g_failed; /* the backend did not start: not tried again until the swapchain is made again */
++
++static int font_path(char* out, const char* name) {
++    FILE* f;
++    snprintf(out, FONT_PATH_MAX, "%s%s", g_datadir, name);
++    f = fopen(out, "rb");
++    if (!f) return 0;
++    fclose(f);
++    return 1;
++}
++
++static int ready(void) {
++    char latin[FONT_PATH_MAX], japanese[FONT_PATH_MAX];
++    int have_latin, have_jp;
++    ImguiGlueInit in;
++    if (imgui_glue_ready()) return 1;
++    if (g_failed) return 0;
++    have_latin = font_path(latin, LATIN_FONT);
++    have_jp = have_latin && font_path(japanese, JAPANESE_FONT);
++    in = (ImguiGlueInit){.instance = g_vk.instance,
++                         .phys = g_vk.phys,
++                         .dev = g_vk.dev,
++                         .family = g_vk.gfx_family,
++                         .queue = g_vk.gfx,
++                         .image_count = g_vk.sc_count > VK_FRAMES ? g_vk.sc_count : VK_FRAMES,
++                         .format = g_vk.sc_format,
++                         .latin_font = have_latin ? latin : NULL,
++                         .japanese_font = have_jp ? japanese : NULL,
++                         .font_px = FONT_PX};
++    if (!have_latin) LOG("imgui: %s is missing in the data folder, the built-in font is used\n", LATIN_FONT);
++    g_failed = !imgui_glue_init(&in);
++    if (g_failed) LOG("imgui: the Vulkan backend did not start\n");
++    return !g_failed;
++}
++
++/* a barrier straight into cb, in order with the commands that the drain has recorded */
++static void image_barrier(VkCommandBuffer cb, VkImage img, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
++                          VkImageLayout from, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
++                          VkImageLayout to) {
++    VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
++                               .srcStageMask = src_stage,
++                               .srcAccessMask = src_access,
++                               .dstStageMask = dst_stage,
++                               .dstAccessMask = dst_access,
++                               .oldLayout = from,
++                               .newLayout = to,
++                               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                               .image = img,
++                               .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
++    VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
++                          .pImageMemoryBarriers = &b};
++    vkCmdPipelineBarrier2(cb, &d);
++}
++
++void vk_imgui_swapchain_gone(void) {
++    imgui_glue_shutdown();
++    g_failed = 0;
++}
++
++void vk_imgui_draw(VkCommandBuffer cb, VkImage sc) {
++    u64 now = plat_ns();
++    float dt = g_last_ns ? (float)((double)(now - g_last_ns) * 1e-9) : 0;
++    VkImageView view;
++    if (!__atomic_load_n(&g_settings.imgui_test, __ATOMIC_RELAXED)) {
++        g_last_ns = 0;
++        return;
++    }
++    g_last_ns = now;
++    if (!ready() || !(view = vk_ui_swapchain_view(sc))) return;
++    if (!imgui_glue_frame((float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, dt)) return;
++    vk_rec_sync();
++    image_barrier(cb, sc, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
++                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
++                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    {
++        VkRenderingAttachmentInfo at = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++                                        .imageView = view,
++                                        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
++                                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
++        VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++                              .renderArea = {{0, 0}, g_vk.sc_extent},
++                              .layerCount = 1,
++                              .colorAttachmentCount = 1,
++                              .pColorAttachments = &at};
++        vkCmdBeginRendering(cb, &ri);
++        imgui_glue_record(cb);
++        vkCmdEndRendering(cb);
++    }
++    vk_render_forget_state(); /* ImGui bound its own pipeline and buffers */
++    image_barrier(cb, sc, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
++                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
++                  VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++}
+diff --git a/src/nx/gpu/vk/imgui_glue.cpp b/src/nx/gpu/vk/imgui_glue.cpp
+new file mode 100644
+index 0000000..5397fd2
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_glue.cpp
+@@ -0,0 +1,97 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The ImGui context, its fonts and its Vulkan backend (imgui_glue.h) */
++#define IMGUI_IMPL_VULKAN_USE_VOLK
++#include "nx/gpu/vk/imgui_glue.h"
++#include "imgui.h"
++#include "imgui_impl_vulkan.h"
++
++namespace {
++constexpr uint32_t TEXTURE_SLOTS = 16; /* sampler descriptors: the font atlas and a few more images */
++bool g_ready;
++ImGuiContext* g_ctx;
++
++void test_window(float dt) {
++    ImGui::SetNextWindowPos(ImVec2(40, 40), ImGuiCond_FirstUseEver);
++    ImGui::Begin("Dear ImGui test");
++    ImGui::Text("Backend check: Roboto and Noto Sans JP");
++    ImGui::Text("\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE8\xA1\xA8\xE7\xA4\xBA\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88"); /* Japanese text, UTF-8 */
++    ImGui::Text("%.1f FPS, %.2f ms", ImGui::GetIO().Framerate, dt * 1000.0f);
++    ImGui::End();
++}
++
++bool add_fonts(const ImguiGlueInit* in) {
++    ImGuiIO& io = ImGui::GetIO();
++    if (!in->latin_font) return true;
++    if (!io.Fonts->AddFontFromFileTTF(in->latin_font, in->font_px)) return false;
++    if (in->japanese_font) {
++        ImFontConfig merge;
++        merge.MergeMode = true;
++        if (!io.Fonts->AddFontFromFileTTF(in->japanese_font, in->font_px, &merge)) return false;
++    }
++    return true;
++}
++} // namespace
++
++extern "C" int imgui_glue_init(const ImguiGlueInit* in) {
++    if (g_ready) return 1;
++    IMGUI_CHECKVERSION();
++    g_ctx = ImGui::CreateContext();
++    ImGuiIO& io = ImGui::GetIO();
++    io.IniFilename = nullptr;
++    io.LogFilename = nullptr;
++    if (!add_fonts(in)) { /* a font that cannot be read leaves the built-in one */
++        ImGui::DestroyContext(g_ctx);
++        g_ctx = ImGui::CreateContext();
++        ImGui::GetIO().IniFilename = nullptr;
++        ImGui::GetIO().LogFilename = nullptr;
++    }
++    ImGui_ImplVulkan_InitInfo vi = {};
++    vi.ApiVersion = VK_API_VERSION_1_3;
++    vi.Instance = in->instance;
++    vi.PhysicalDevice = in->phys;
++    vi.Device = in->dev;
++    vi.QueueFamily = in->family;
++    vi.Queue = in->queue;
++    vi.DescriptorPoolSize = TEXTURE_SLOTS;
++    vi.MinImageCount = 2;
++    vi.ImageCount = in->image_count < 2 ? 2 : in->image_count;
++    vi.UseDynamicRendering = true;
++    vi.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
++    vi.PipelineInfoMain.PipelineRenderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
++    vi.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
++    vi.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &in->format;
++    if (!ImGui_ImplVulkan_Init(&vi)) {
++        ImGui::DestroyContext(g_ctx);
++        g_ctx = nullptr;
++        return 0;
++    }
++    g_ready = true;
++    return 1;
++}
++
++extern "C" void imgui_glue_shutdown(void) {
++    if (!g_ready) return;
++    ImGui_ImplVulkan_Shutdown();
++    ImGui::DestroyContext(g_ctx);
++    g_ctx = nullptr;
++    g_ready = false;
++}
++
++extern "C" int imgui_glue_ready(void) { return g_ready; }
++
++extern "C" int imgui_glue_frame(float w, float h, float dt) {
++    if (!g_ready) return 0;
++    ImGuiIO& io = ImGui::GetIO();
++    io.DisplaySize = ImVec2(w, h);
++    io.DeltaTime = dt > 0 ? dt : 1.0f / 60;
++    ImGui_ImplVulkan_NewFrame();
++    ImGui::NewFrame();
++    test_window(dt);
++    ImGui::Render();
++    return 1;
++}
++
++extern "C" void imgui_glue_record(VkCommandBuffer cb) {
++    if (g_ready) ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
++}
+diff --git a/src/nx/gpu/vk/imgui_glue.h b/src/nx/gpu/vk/imgui_glue.h
+new file mode 100644
+index 0000000..cf611e8
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_glue.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* Dear ImGui's windows over the game. imgui_glue.cpp is the only C++ here: it holds the ImGui context and its Vulkan
++   backend, and takes and gives plain Vulkan handles. imgui.c decides when a frame is drawn and records it (the lock
++   and the recording thread are described there). Every function is called under vk_lock, so the context has one
++   user at a time */
++#ifndef SNX_IMGUI_GLUE_H
++#define SNX_IMGUI_GLUE_H
++#include <stdint.h>
++#include "volk.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct {
++    VkInstance instance;
++    VkPhysicalDevice phys;
++    VkDevice dev;
++    uint32_t family;
++    VkQueue queue;
++    uint32_t image_count; /* the buffers of the backend: at least the frames in flight */
++    VkFormat format;      /* of the images drawn on */
++    const char* latin_font;    /* a TTF file, NULL for ImGui's own font */
++    const char* japanese_font; /* merged into the first, NULL for none */
++    float font_px;
++} ImguiGlueInit;
++
++int imgui_glue_init(const ImguiGlueInit* in); /* 1 when ready */
++void imgui_glue_shutdown(void);               /* the device is idle */
++int imgui_glue_ready(void);
++/* the windows of one frame for a picture w x h, dt seconds after the last one: 1 when there is a frame to record */
++int imgui_glue_frame(float w, float h, float dt);
++/* the frame's draw data into cb, inside a rendering scope on the picture. A new texture is uploaded first, on the
++   queue, which the caller keeps idle for it (vk_rec_sync) */
++void imgui_glue_record(VkCommandBuffer cb);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/nx/gpu/vk/renderer.c b/src/nx/gpu/vk/renderer.c
+index 513cf03..16cc5c7 100644
+--- a/src/nx/gpu/vk/renderer.c
++++ b/src/nx/gpu/vk/renderer.c
+@@ -445,6 +445,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
+                 int safe[4] = {(int)cx, (int)cy, (int)cw, (int)ch};
+                 vk_ui_draw(cb, sc, safe);
+             }
++            vk_imgui_draw(cb, sc);
+             vk_barrier(cb, sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+diff --git a/src/nx/gpu/vk/ui.c b/src/nx/gpu/vk/ui.c
+index b5f58c1..1b61e8b 100644
+--- a/src/nx/gpu/vk/ui.c
++++ b/src/nx/gpu/vk/ui.c
+@@ -306,6 +306,7 @@ static VkImageView sc_view(VkImage sc) {
+         }
+     return VK_NULL_HANDLE;
+ }
++VkImageView vk_ui_swapchain_view(VkImage sc) { return sc_view(sc); }
+ void vk_ui_swapchain_gone(void) {
+     u32 i;
+     for (i = 0; i < VK_SC_MAX; ++i) {
+diff --git a/src/nx/gpu/vk/vk.h b/src/nx/gpu/vk/vk.h
+index 4a7216d..54e167a 100644
+--- a/src/nx/gpu/vk/vk.h
++++ b/src/nx/gpu/vk/vk.h
+@@ -1019,6 +1019,10 @@ void vk_render_end(void); /* ends the dynamic rendering pass, if one is open */
+    safe is the picture's part clear of the system's bars (gpu/vk/ui.c) */
+ void vk_ui_draw(VkCommandBuffer cb, VkImage sc, const int safe[4]);
+ void vk_ui_swapchain_gone(void); /* its images' views go before the swapchain does */
++VkImageView vk_ui_swapchain_view(VkImage sc); /* the view of a swapchain image that ui.c made (gpu/vk/imgui.c draws on it) */
++/* gpu/vk/imgui.c: Dear ImGui's windows over the image, under vk_lock; its backend ends with the swapchain */
++void vk_imgui_draw(VkCommandBuffer cb, VkImage sc);
++void vk_imgui_swapchain_gone(void);
+ void vk_render_clear(GpuChannel* ch, u32 v);
+ VkViewport vk_render_viewport(const u32* r);
+ VkViewport vk_render_viewport_at(const u32* r, u32 index);
+diff --git a/src/nx/runtime/settings.txt b/src/nx/runtime/settings.txt
+index 5b573ac..6b780ec 100644
+--- a/src/nx/runtime/settings.txt
++++ b/src/nx/runtime/settings.txt
+@@ -814,6 +814,12 @@ setting Verify macros
+     startup
+     words Off|On
+     help 1 = runs each native and compiled macro against the interpreter too, and logs where they differ
++setting Imgui test
++    key imgui_test
++    int 0 1
++    default 0
++    words Off|On
++    help 1 = draws a Dear ImGui test window over the game, to check the backend and the fonts (fonts/ in the data folder)
+ setting RenderDoc captures
+     key renderdoc
+     text 1024
