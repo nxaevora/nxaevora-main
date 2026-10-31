@@ -4,7 +4,7 @@
 
 <p align="center">
   <img alt="aevora-icon" src="assets/aevora-logo-dark.png" width="300px" />
-<p>
+</p>
 <p align="center">
   <img src="https://img.shields.io/badge/platform-windows%20x64-blue?style=for-the-badge&logo=gitforwindows" alt="Badge">
   <img src="https://img.shields.io/badge/recompile%20type-static%20aot-b84b3a?style=for-the-badge&logo=ebox" alt="Badge">
@@ -12,12 +12,12 @@
   <img src="https://img.shields.io/badge/main%20language-c%20%7C%20rust-purple?style=for-the-badge&logo=c" alt="Badge">
   <img src="https://img.shields.io/badge/ui%20framework-tauri-8069ff?style=for-the-badge&logo=tauri" alt="Badge">
   <img src="https://img.shields.io/badge/license-GPL--3.0%20(v3)-lightgrey?style=for-the-badge&logo=unlicense" alt="Badge">
-<p>
+</p>
 <p align="center">
 NXAevora is a project to run Pokemon Legends Arceus natively on a Windows PC. The code of the game is translated
 ahead of time from ARM64 to x86-64 with the static recompiler [ScarletNX](https://github.com/scarletnx/ScarletNX).<br>
 NXAevora adds the settings, patches and tools that are specific to this game, and a launcher is planned.
-<p>
+</p>
 
 > [!IMPORTANT]
 > At Aevora, we utilize AI-powered coding (including so-called "vibe coding"). Our development is guided by human review and real-world testing, prioritizing code that is easy for humans to understand and maintain. We do not consider AI-generated code or successful compilation alone to be proof that the game is functioning correctly. If you disagree with the use of AI or do not trust AI-written code, that is your right. I do not disagree with or find those opinions unfair.
@@ -36,9 +36,9 @@ NXAevora is in alpha. It is not ready for general use.
   The JIT was not needed in any of the tested scenes after the jump-table fix. See [ROADMAP.md](ROADMAP.md) and
   [docs/jit-analysis.md](docs/jit-analysis.md).
 - Not tested yet: video, long play in the open areas, and battles against wild Pokemon of the later areas.
-- Known problems: a short stutter when the game uses a rendering setup for the first time (it gets less with each
-  run), one shader that is not translated, and one texture that is not drawn. No visible fault from the last two has
-  been seen.
+- Known problems: a short stop of about one second right after the start, one shader that is not translated, and one
+  texture that is not drawn. No visible fault from the last two has been seen. With `async_pipelines=1` the game
+  does not stutter while you walk, and no late appearing objects were seen.
 - The launcher does not exist yet.
 
 ## What you need

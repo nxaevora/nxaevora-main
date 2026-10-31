@@ -72,3 +72,23 @@ The user reports clearly less stutter.
 - Keep the shader cache. A deleted cache makes the first start slower (3.8 s) and the pipelines are made again. With
   `async_pipelines=1` this costs little, but it brings no gain either.
 - The launcher can show these settings.
+
+## Run L: profiler and GPU profile (90 s, update program, async_pipelines on)
+
+The user loaded the save and walked around. The user saw no stutter.
+
+- CPU profile (80 s, 35 threads, 1.27 million samples): 86.6% of the samples are in `ZwWaitForAlertByThreadId` and
+  8.7% in `ZwWaitForSingleObject`. The threads wait. No game function has more than 0.13% of the samples, and no
+  single place on the CPU is hot.
+- GPU: 1.0 to 1.4 ms a frame in passes at the start, then 5.6 to 6.6 ms. The last pass ends 16 to 22 ms after the
+  first. The GPU is far from the 33 ms of a frame at 30 fps.
+- Frame rate: 30 fps in the windows of 5 s, with two exceptions: 25.8 fps at 6.9 s and 22.3 fps at 17 s.
+- Slow frames: 11 frames over 50 ms in the first 24 s, the slowest 1340 ms (the stop at the start). Later windows
+  have 1, 4 and 2 frames over 50 ms, the slowest 66 ms.
+- Pipelines: 5 pipelines made in 90 s, 11 ms in total, 0 ms waited for. Texture uploads: 239 MB in the first 24 s,
+  then about 15 to 90 MB for each 20 s.
+- JIT: 0 misses.
+
+Reading: the stop at the start is real (1340 ms, around 17 s there is a drop to 22 fps) and it comes with the
+uploads of about 240 MB, but the profile shows no busy CPU thread. The stop looks like a wait on a lock or on file
+reads, not like work. This is not verified. After the start the game runs smoothly.
