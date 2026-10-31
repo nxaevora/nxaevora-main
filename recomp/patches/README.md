@@ -16,17 +16,21 @@ working tree of the submodule before the build, and keep the patch file as the s
 | `0006-stop-dump-sleep-and-gpu.patch` | Makes the `hitch-N.txt` of `0004` fuller. A thread that slept at least once since the last dump gets the registers of its last `svcSleepThread` and what they point to (a dump takes this only from 100 sleeps otherwise), and the file ends with the GPU thread's state and the host threads that wait for a lock. Apply it after `0004`. See `docs/stutter-analysis.md`. |
 | `0007-stop-dump-object-chain.patch` | In the stop's dump of `0006`, the callee-saved registers of the sleeping thread also show what they point at, then what its first pointer points at, then the third level with the names of its twelve first functions (a pointer to an object, the object, its virtual function table). Apply it after `0006`. See `docs/stutter-analysis.md`. |
 | `0008-sleep-time-in-dump.patch` | The dump of a thread that sleeps (`0006`) adds how much `svcSleepThread` time the thread asked for since the last dump and how long its sleeps took, in all and for one call. A sleep that takes much longer than asked shows here. Apply it after `0006`. See `docs/stutter-analysis.md`. |
+| `0009-keyboard-remap.patch` | The keyboard map as a setting. The new setting `keyboard_map` (section Keyboard) lists `Button:Key` words, for example `ZL:Q A:F LStickUp:Up`. A button that the text names loses its default keys. A key that the text names belongs only to the buttons named with it. `None` frees a button. A key name is the SDL name, with `_` for a space. Escape, F1 to F12, Pause and Alt are reserved. A word that cannot be read is logged and the map stays. Apply it after `0001`. See `docs/input-analysis.md`. |
+| `0010-ini-store-256.patch` | The store of the game's `.ini` held 128 keys, and the file already had 129 (the log said `more than 128 keys, renderdoc_frames and those after it are left out`). A key after the 128th was dropped at the read and so erased at the next write of the file. A key that the user added, such as `keyboard_map`, went this way. The limit is now 256. |
 | `camera-unclamp.pchtxt` | A patch of the game code (IPSwitch text). It sets the clamp limits of the input manager to 8.0 and -8.0. A test showed that the camera does not use that clamp, so it has no effect on the camera. It stays as a record. Remove the mod when the camera patch exists. |
 
 The patches `0003` to `0008` are diagnostic tools and are not applied: `0003` is the stick trace, `0004` to `0008` find the
 wait of a stop of the game (`hitch_dump`; apply them in the order of their numbers, `0004` first). The runtime of this project is
-built with `0001` and `0002` only.
+built with `0001`, `0002`, `0009` and `0010` only.
 
 Apply the ScarletNX patch, from `third_party/ScarletNX`:
 
 ```sh
 git apply ../../recomp/patches/0001-native-mouse-input.patch
 git apply ../../recomp/patches/0002-global-red-add-u64.patch
+git apply ../../recomp/patches/0009-keyboard-remap.patch
+git apply ../../recomp/patches/0010-ini-store-256.patch
 git apply ../../recomp/patches/0004-hitch-dump.patch
 git apply ../../recomp/patches/0005-slow-romfs-read.patch
 git apply ../../recomp/patches/0006-stop-dump-sleep-and-gpu.patch

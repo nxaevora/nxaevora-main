@@ -1,0 +1,152 @@
+diff --git a/src/nx/runtime/platform/backend/sdl3.c b/src/nx/runtime/platform/backend/sdl3.c
+index ad75514..cfb3cb1 100644
+--- a/src/nx/runtime/platform/backend/sdl3.c
++++ b/src/nx/runtime/platform/backend/sdl3.c
+@@ -216,6 +216,7 @@ int backend_ini(const char* k, const char* v) {
+     const IniOpt* o = ini_find(g_backend_ini, k);
+     int known;
+     if (!o) o = ini_find(g_mouse_ini, k);
++    if (!o) o = ini_find(g_keyboard_ini, k);
+     /* the in-game menu reads the touch mode, and the renderer the on-screen controls, under ui_lock */
+     ui_lock();
+     if (o) ini_read(o, v);
+@@ -441,7 +442,7 @@ int backend_vk_surface(VkInstance instance, VkSurfaceKHR* surface) {
+ static const char* HELP =
+     "Controller: A, B, X and Y sit where the console has them (gamepad_swap_ab=1 swaps A and B). "
+     "Home opens the game's menu.\n\n"
+-    "Keyboard, by key position on a US layout:\n"
++    "Keyboard, by key position on a US layout (keyboard_map in the .ini changes it):\n"
+     "  Buttons      A: X or Space    B: Z    X: C    Y: V\n"
+     "  Shoulders    L: Q    R: E    ZL: 1    ZR: 3\n"
+     "  Plus, minus  +: Enter    -: Backspace\n"
+@@ -478,7 +479,7 @@ static PadKind gamepad_kind(int type) {
+ /* keys -> HidNpadButton bits; 40..47 are the stick keys, turned into axes in video_poll. By scancode, the key's
+    position: the keycode depends on the layout and on the modifiers, so Shift pressed while 1 was held made its release
+    a different key, and ZL stayed held */
+-static u64 keymap(SDL_Scancode k) {
++static u64 default_keymap(SDL_Scancode k) {
+     switch (k) {
+         case SDL_SCANCODE_X:
+         case SDL_SCANCODE_SPACE: return 1ull << 0; /* A */
+@@ -507,6 +508,91 @@ static u64 keymap(SDL_Scancode k) {
+     }
+     return 0;
+ }
++/* the keyboard's table: default_keymap's, over which the .ini's keyboard_map puts its own. Main thread only */
++static u64 g_keybind[SDL_SCANCODE_COUNT];
++static int g_keybind_ready;
++static void keybind_reset(void) {
++    for (int k = 0; k < SDL_SCANCODE_COUNT; ++k) g_keybind[k] = default_keymap((SDL_Scancode)k);
++    g_keybind_ready = 1;
++}
++static u64 keymap(SDL_Scancode k) {
++    if (!g_keybind_ready) keybind_reset();
++    return k > 0 && k < SDL_SCANCODE_COUNT ? g_keybind[k] : 0;
++}
++
++/* keyboard_map's button names and the keys_held bit each sets (the stick bits are turned into axes in video_poll) */
++static const struct {
++    const char* name;
++    int bit;
++} KEY_BUTTONS[] = {
++    {"A", 0},           {"B", 1},           {"X", 2},           {"Y", 3},           {"L3", 4},
++    {"R3", 5},          {"L", 6},           {"R", 7},           {"ZL", 8},          {"ZR", 9},
++    {"Plus", 10},       {"Minus", 11},      {"Left", 12},       {"Up", 13},         {"Right", 14},
++    {"Down", 15},       {"LStickLeft", 40}, {"LStickUp", 41},   {"LStickRight", 42}, {"LStickDown", 43},
++    {"RStickLeft", 44}, {"RStickUp", 45},   {"RStickRight", 46}, {"RStickDown", 47},
++};
++#define KEY_ENTRIES_MAX 64
++typedef struct {
++    int bit;
++    SDL_Scancode key; /* SDL_SCANCODE_UNKNOWN: the button has no key */
++} KeyEntry;
++
++/* the runtime's own keys: a button on one of them would fire the hotkey too */
++static int key_reserved(SDL_Scancode k) {
++    return k == SDL_SCANCODE_ESCAPE || (k >= SDL_SCANCODE_F1 && k <= SDL_SCANCODE_F12) || k == SDL_SCANCODE_PAUSE ||
++           k == SDL_SCANCODE_LALT || k == SDL_SCANCODE_RALT;
++}
++/* one word, Button:Key: 0, else -1 */
++static int key_entry_read(const char* at, size_t n, KeyEntry* out) {
++    char key[48];
++    size_t colon = 0, len;
++    while (colon < n && at[colon] != ':') ++colon;
++    if (colon == 0 || colon >= n - 1 || n - colon - 1 >= sizeof key) return -1;
++    out->bit = -1;
++    for (size_t i = 0; i < sizeof KEY_BUTTONS / sizeof *KEY_BUTTONS; ++i)
++        if (strlen(KEY_BUTTONS[i].name) == colon && SDL_strncasecmp(KEY_BUTTONS[i].name, at, colon) == 0)
++            out->bit = KEY_BUTTONS[i].bit;
++    if (out->bit < 0) return -1;
++    len = n - colon - 1;
++    for (size_t i = 0; i < len; ++i) key[i] = at[colon + 1 + i] == '_' ? ' ' : at[colon + 1 + i];
++    key[len] = 0;
++    if (SDL_strcasecmp(key, "None") == 0) {
++        out->key = SDL_SCANCODE_UNKNOWN;
++        return 0;
++    }
++    out->key = SDL_GetScancodeFromName(key);
++    return out->key == SDL_SCANCODE_UNKNOWN || key_reserved(out->key) || out->key >= SDL_SCANCODE_COUNT ? -1 : 0;
++}
++/* A button named in the text loses its default keys, and a key named in it belongs to the buttons named with it only.
++   An unreadable word changes nothing and is said */
++void keyboard_map_set(const IniOpt* o, const char* v) {
++    KeyEntry e[KEY_ENTRIES_MAX];
++    int count = 0;
++    u64 named = 0;
++    const char* at = v ? v : "";
++    (void)o;
++    while (*at) {
++        size_t n = strcspn(at, " \t");
++        if (!n) {
++            ++at;
++            continue;
++        }
++        if (count == KEY_ENTRIES_MAX || key_entry_read(at, n, &e[count]) < 0) {
++            LOG("settings: keyboard_map's \"%.*s\" is not a button and a key (A:F): the map stays as it was\n", (int)n,
++                at);
++            return;
++        }
++        ++count;
++        at += n;
++    }
++    keybind_reset();
++    for (int i = 0; i < count; ++i) named |= 1ull << e[i].bit;
++    for (int k = 0; k < SDL_SCANCODE_COUNT; ++k) g_keybind[k] &= ~named;
++    for (int i = 0; i < count; ++i)
++        if (e[i].key) g_keybind[e[i].key] = 0;
++    for (int i = 0; i < count; ++i)
++        if (e[i].key) g_keybind[e[i].key] |= 1ull << e[i].bit;
++}
+ 
+ /* g_fullscreen follows the window: also set from the fullscreen events, for a change the window manager made */
+ static void set_fullscreen(int on) {
+diff --git a/src/nx/runtime/settings.txt b/src/nx/runtime/settings.txt
+index 61cee43..bf64825 100644
+--- a/src/nx/runtime/settings.txt
++++ b/src/nx/runtime/settings.txt
+@@ -423,6 +423,17 @@ setting Mouse overdrive
+     help The most the mouse look may deflect the right stick, in percent of its full travel. Above 100 the game gets a
+     help stick value past its range, which turns the camera faster than a full stick if the game does not limit it
+ 
++# the keyboard (platform/backend/sdl3.c): which key sends which button of the console
++table g_keyboard_ini
++setting Keyboard map
++    key keyboard_map
++    text 256
++    once
++    set keyboard_map_set
++    help A button and the key that sends it, as A:F ZL:Q. Buttons A B X Y L R ZL ZR L3 R3 Plus Minus Left Up Right Down
++    help LStickLeft LStickUp LStickRight LStickDown RStickLeft RStickUp RStickRight RStickDown. Keys by SDL's name, a
++    help space in it written as _ (Left_Shift). None frees a button. A button named here loses its default keys
++
+ table g_vpad_shown_ini
+ setting Control shown
+     key controls_<ID>_shown
+@@ -1007,6 +1018,7 @@ section Graphics: g_graphics_ini
+ section Performance: g_performance_ini
+ section On-screen controls: g_vpad_ini, g_backend_ini, g_vpad_shown_ini/Buttons    backend
+ section Mouse: g_mouse_ini    backend
++section Keyboard: g_keyboard_ini    backend
+ section Controllers: g_gamepad_ini, g_gamepad_map_ini/Button map, g_gamepad_players_ini/Player    backend
+ section Network: g_network_ini
+ section User: g_user_ini

@@ -117,6 +117,22 @@ How it works:
   version, so it should).
 - That the cursor capture does not conflict with the menu overlay and the software keyboard.
 
+## Keyboard map (patch 0009, tested)
+
+The setting `keyboard_map` in `settings.txt` (the `.ini` section Keyboard) holds words `Button:Key`. The buttons are
+A B X Y L R ZL ZR L3 R3 Plus Minus Left Up Right Down and LStick or RStick with Left Up Right Down. The key is the SDL
+name (`SDL_GetScancodeFromName`), with `_` for a space. Rules:
+
+- A button that the text names loses its default keys. More than one word for one button gives more than one key.
+- A key that the text names belongs only to the buttons named with it, so `LStickUp:Up` takes the arrow key from the D-pad.
+- `None` as the key frees the button. Empty text gives the default table.
+- Escape, F1 to F12, Pause and Alt are reserved, because the runtime reads them as hotkeys.
+- A word that cannot be read is logged (`settings: keyboard_map's "..."`) and the map stays as it was.
+
+Tested by the user with `keyboard_map=ZL:Q A:F` in the game's `.ini`: the keys changed as set. The patch `0010` was
+needed, because the `.ini` store held 128 keys and dropped a key past that. Not tested: the in-game menu, and a map that
+frees a button (`None`).
+
 ## Result so far
 
 - The stick-based mouse look works as designed (capture, ZR and ZL on the mouse buttons, switch to the controller by its
