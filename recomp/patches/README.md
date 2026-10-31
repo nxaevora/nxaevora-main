@@ -18,11 +18,14 @@ working tree of the submodule before the build, and keep the patch file as the s
 | `0008-sleep-time-in-dump.patch` | The dump of a thread that sleeps (`0006`) adds how much `svcSleepThread` time the thread asked for since the last dump and how long its sleeps took, in all and for one call. A sleep that takes much longer than asked shows here. Apply it after `0006`. See `docs/stutter-analysis.md`. |
 | `0009-keyboard-remap.patch` | The keyboard map as a setting. The new setting `keyboard_map` (section Keyboard) lists `Button:Key` words, for example `ZL:Q A:F LStickUp:Up`. A button that the text names loses its default keys. A key that the text names belongs only to the buttons named with it. `None` frees a button. A key name is the SDL name, with `_` for a space. Escape, F1 to F12, Pause and Alt are reserved. A word that cannot be read is logged and the map stays. Apply it after `0001`. See `docs/input-analysis.md`. |
 | `0010-ini-store-256.patch` | The store of the game's `.ini` held 128 keys, and the file already had 129 (the log said `more than 128 keys, renderdoc_frames and those after it are left out`). A key after the 128th was dropped at the read and so erased at the next write of the file. A key that the user added, such as `keyboard_map`, went this way. The limit is now 256. |
+| `0011-angle-search.patch` | The angle search, a diagnostic for the camera analysis. Apply it after `0003`. With `trace_stick=2` the right stick is held in steps after `trace_stick_start` seconds (rest, hold, hold, rest, opposite hold). The floats of the writable guest memory that change in the hold at a steady rate, do not change at rest and change the other way in the opposite hold are the candidates for the camera angle. Their words are then watched as in `0003`, and the game functions that write them are logged. It uses about 1 GB of memory for a short time. It is not applied in the normal build. See `docs/camera-analysis.md`. |
+| `0012-native-mouse-guest-words.patch` | The runtime side of the native mouse look. The setting `mouse_native_address` (0 = off) is the guest address of a 64 bit word (two floats: yaw in radians, pitch in units of the camera arc). The mouse motion is added to it as it arrives, in place of the stick, and the game's code patch `native-mouse-look.pchtxt` takes it. Settings `mouse_native_yaw` (1400) and `mouse_native_pitch` (1000), in millionths for each mouse count, and `mouse_invert_x` and `mouse_invert_y` turn the directions. At most 0.5 of each waits for the game. See `docs/camera-analysis.md`. |
+| `native-mouse-look.pchtxt` | A patch of the game code (IPSwitch text, update 1.1.1). The camera's angle setter 0x99437c0 takes the mouse word at 0x9943980 and adds it to the yaw and to the pitch arc position. The code and the word sit in the words that the setter's mode 1 path frees (it jumps into the end of the mode 0 path). Put it in `game/recompiled/<id>/<id>_data/mods/native-mouse-look/exefs/` and recompile. Set `mouse_native_address=160708992` in the game's `.ini`. |
 | `camera-unclamp.pchtxt` | A patch of the game code (IPSwitch text). It sets the clamp limits of the input manager to 8.0 and -8.0. A test showed that the camera does not use that clamp, so it has no effect on the camera. It stays as a record. Remove the mod when the camera patch exists. |
 
 The patches `0003` to `0008` are diagnostic tools and are not applied: `0003` is the stick trace, `0004` to `0008` find the
 wait of a stop of the game (`hitch_dump`; apply them in the order of their numbers, `0004` first). The runtime of this project is
-built with `0001`, `0002`, `0009` and `0010` only.
+built with `0001`, `0002`, `0009`, `0010` and `0012` only.
 
 Apply the ScarletNX patch, from `third_party/ScarletNX`:
 
@@ -31,6 +34,7 @@ git apply ../../recomp/patches/0001-native-mouse-input.patch
 git apply ../../recomp/patches/0002-global-red-add-u64.patch
 git apply ../../recomp/patches/0009-keyboard-remap.patch
 git apply ../../recomp/patches/0010-ini-store-256.patch
+git apply ../../recomp/patches/0012-native-mouse-guest-words.patch
 git apply ../../recomp/patches/0004-hitch-dump.patch
 git apply ../../recomp/patches/0005-slow-romfs-read.patch
 git apply ../../recomp/patches/0006-stop-dump-sleep-and-gpu.patch

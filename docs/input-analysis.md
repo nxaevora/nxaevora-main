@@ -133,7 +133,16 @@ Tested by the user with `keyboard_map=ZL:Q A:F` in the game's `.ini`: the keys c
 needed, because the `.ini` store held 128 keys and dropped a key past that. Not tested: the in-game menu, and a map that
 frees a button (`None`).
 
-## Result so far
+## Native mouse look (done, 2026-10-31)
+
+The stick based mouse look below answered late: a big move of the mouse turned the camera slowly, because the game limits
+the camera's speed. The camera code was found (`docs/camera-analysis.md`) and the mouse now adds its motion to the
+camera's yaw and pitch directly (patch `0012` and the mod `native-mouse-look.pchtxt`, `mouse_native_address=160708992`).
+The user tested it in the field and it works. The settings are `mouse_native_yaw`, `mouse_native_pitch`, `mouse_invert_x`
+and `mouse_invert_y`. With `mouse_native_address=0` the old stick based version runs. Not tested: cutscenes, dialogs,
+menus, battles.
+
+## Result so far (of the stick based version)
 
 - The stick-based mouse look works as designed (capture, ZR and ZL on the mouse buttons, switch to the controller by its
   last input). A fast flick cannot turn the camera faster than a full stick, because the game turns the stick value into a

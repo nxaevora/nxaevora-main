@@ -177,6 +177,98 @@ protection slows the game to a crawl, so each place shows once). The chain:
 The camera is one of the readers of these persistent copies. It is not named yet. The other candidates are the readers of
 the six copies of 993ed00 and the three objects of 99510b4, which this one frame did not show.
 
+## Angle search (2026-10-31, patch 0011, built, run pending)
+
+The search for the readers of the stick copies found many copies and no camera. The new method looks for the result and
+not for the input: the camera angle is a float that follows the stick. `trace_stick=2` (after `0003`) holds the right
+stick x at 20000 in steps and keeps the floats of the writable guest memory by these tests:
+
+1. A snapshot at rest (every float with an absolute value from 0.01 to 400).
+2. The stick held: the float changes (1.5 s), then changes again (1 s), and then by the same amount again (0.7 to 1.3
+   times, same sign). A timer or a random value does not pass.
+3. The stick back: after 1.5 s the float does not change in the next second.
+4. The opposite hold: after 1.5 s the float changes the other way, by 0.5 to 1.5 times the first change.
+
+The survivors are logged (`angle: candidate N at guest ADDRESS, value, change in a step`). Their words (128 at most, 48
+pages) are then watched for 15 s with the stick held, and the game functions that write them are in the summary
+(`trace: write of match N ... by game function F`). The function F is the camera update, or its neighbour. A static
+reading of 0x99ea4b8 (the large reader in the chain) showed 2 float operations only, so it is not the camera.
+
+Run: the game stands in an open place, no menu, no input from the user for about 12 s after the start time.
+Limits: the camera must not be locked to a target (a lock-on or a fixed camera shows no candidate). An angle that is
+kept as a quaternion or a matrix can fail the tests of step 2 (it is not linear). Then try the pitch, or a yaw only
+camera mode.
+
+### Run 1 of the angle search (2026-10-31 19:31, stick x only)
+
+Of 29203075 floats at rest, 3 stayed after the seven steps:
+
+| Candidate | Guest address | Value | Change in a step | Writers in the watch |
+| --- | --- | --- | --- | --- |
+| 0 | 0x90e9c3920 | 0.777 | +0.262 | 0xd9548a0 (no float operation: a copy), host code of the runtime |
+| 1 | 0x13000f9230 | -0.226 | -0.565 | 0x8080038 (766 float operations, a large function with matrices and rsqrt: a physics or sweep step) |
+| 2 | 0x1325e66318 | -14.4 | +2.47 | none in 10 s |
+
+The watch (page protection) slowed the game to 2 to 4 frames a second, so the counts are not per frame. No candidate is
+shown to be the camera. Candidate 2 fits a yaw in radians (141 degrees a second at 0.61 of the stick) but nothing
+wrote it. The run 2 version holds the stick x and y, logs the values of the last candidates at each step, counts the
+candidates within 0x100 bytes of each (the yaw and the pitch of one camera lie together), and dumps the registers at
+the first writes.
+
+### Run 2 (2026-10-31 19:44, stick x and y together)
+
+184 candidates stayed, and they are copies. The groups: about 50 words near 61.14 to 61.21 (change -0.36 to -0.46 a
+second, with a pair at 50.6 and 71.65 beside some of them), 10 words of 0.6778 and 10 of 61.334 (change -0.1728, all
+four-float splats in the region of guest 0x13000f6a10 to 0x13000fa944), 37.04 and 65.63 (change 5.4 to 6.4), and three
+copies of -0.980 (change -1.97, a value that crosses zero). Writers once a frame (31 or 32 times in the 10 s at the
+slowed speed): 0xa9ccd60, 0x99437c0, 0xadf7694, 0x9d87e30, 0x98c56c0. Readers: 0xd901cf8, 0xad793d8, 0xae01d10, 0xad77338,
+0xadfe850, 0xadf5870, 0xad44550. Nothing shows which one is the camera, because the x and y holds ran together.
+
+The run 3 version adds an x only hold and a y only hold at the end (steps 8 to 11) and calls each candidate `yaw` (the x
+hold moves it at least 3 times more than the y hold), `pitch` (the opposite), `both` or `none`. Only the `yaw` and
+`pitch` words are watched (the `both` ones when there are none).
+
+### Run 3 (2026-10-31 19:50): the camera is found
+
+With the x only and y only holds, 66 of 70 candidates were classed. The pitch class holds the many copies of 61.04
+(change -0.46 a second). The yaw class holds -3.742 (change -2.10 radians in the 1 s x hold, about 120 degrees a second
+at 0.61 of the stick) at 3 words, 0x15051d360, 0x15051d590 and 0x15052ad80, which are the offsets +0x360, +0x590 and
++0xdd80 of one object (base 0x15051d000 in that run, it changes from run to run). The writer is 0x99437c0.
+
+The camera controller (all offsets from the object, x19 in the code):
+
+- 0x99437c0 is the angle setter, `void set_angle(Camera* x0, float s0)`. It stores the angle in `[x0+0xdd80]` and
+  `[x0+0x360]`, calls 0x9808f90(x0+0x5b0, d0 = `[x0+0x700]`) to rebuild the orientation, and tail paths on `[x0+0x3e4]`
+  (mode 1 or 2) and `[x0+0x54c]`.
+- 0x994216c is the stick update. It reads the stick pair at `[x0+0x418]`, `[x0+0x41c]` through 0x994104c (dead zone, easing
+  and the ramp accumulators `[x0+0x434]` and `[x0+0x438]`, the auto repeat that was seen before). The yaw step is
+  `s1 = s8 + s11*s12*sign*[x0+0x420]*s0` and the new angle is `[x0+0x360] + s1` (0x9942314). The pitch is a double
+  `[x0+0x700]` in 0 to 1 (the position on the camera's arc): `[x0+0x700] += step`, limited to 0 and 1 (0x99422d8 to
+  0x99422fc). With the stick idle the function jumps to 0x9942230 and tail calls the setter with the angle unchanged,
+  so the setter runs once a frame in any case.
+- 0x993ba64 is the second caller of the setter (an angle from a direction vector).
+
+So a mouse look needs no stick: the mouse delta is added to the angle in the setter. The yaw is added to the angle
+argument, the pitch to the double at +0x700 (limited to 0 and 1).
+
+### The native mouse look (patch `0012`, `recomp/patches/native-mouse-look.pchtxt`)
+
+The code patch (IPSwitch text) puts a branch at the start of the setter (0x99437e8, the `mov v8.16b, v0.16b`) to 18
+words of code. The code takes one 64 bit word at 0x9943980 with an atomic exchange against zero (two floats: the yaw in
+radians, then the pitch in units of the arc), adds the yaw to the angle, and adds the pitch to the double at +0x700 with
+the limits 0 and 1 (`fmin` and `fmax`). The runtime adds the mouse motion to the word as it arrives
+(`mouse_native_address=160708992`, which is 0x9943980; settings `mouse_native_yaw` and `mouse_native_pitch`, in millionths
+for each mouse count), and keeps the stick at rest. It needs a recompile of the game with the mod in
+`<id>_data/mods/native-mouse-look/exefs/`. Not tested yet.
+
+The first version put the code in the zero padding after the end of the text segment (0xb2aa690) and the game stopped
+there: "reached code at b2aa690 that the recompiler missed ... the JIT could not compile it". The recompiler and the JIT
+take code only inside `text_size` of the NSO header (a patch cannot change the header), and the JIT refuses an image
+that lies in the range of the main dispatch table (`snx_jit_add_image`). The text has no hole of 16 bytes (zero or nop), and
+all 816 PLT stubs have callers. The space comes from the setter itself: its mode 1 path (0x99438f0) ends with a copy of the
+end of the mode 0 path (0x9943820 to 0x994386c and the tail). The patch makes mode 1 set `s8` from `w21` and jump to
+0x9943820, which frees the words 0x9943938 to 0x9943990 (88 bytes) for the 72 bytes of code and the 8 bytes of data.
+
 ## Status of the work (paused by the user's decision)
 
 The investigation is closed for now. The stick trace is in its own patch (`recomp/patches/0003-stick-trace.patch`, apply

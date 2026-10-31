@@ -1,0 +1,87 @@
+diff --git a/src/nx/runtime/platform/backend/sdl3.c b/src/nx/runtime/platform/backend/sdl3.c
+--- a/src/nx/runtime/platform/backend/sdl3.c
++++ b/src/nx/runtime/platform/backend/sdl3.c
+@@ -11,6 +11,7 @@
+ #include "nx/hle/services/hid.h"
+ #include "nx/hle/services/services.h" /* am_keyboard_answered: the keyboard's box's answer */
+ #include "nx/hle/kernel/kernel.h"
++#include "nx/memory/mem.h" /* g_mem: the guest words of the native mouse look */
+ #include "nx/runtime/platform/backend.h"
+ #include "nx/runtime/platform/log.h"
+ #include "nx/runtime/platform/plat.h"
+@@ -1191,6 +1192,25 @@
+ static float g_mouse_dx, g_mouse_dy;
+ static double g_mouse_vx, g_mouse_vy;
+ 
++/* The native mouse look (mouse_native_address): the game's code patch (recomp/patches/native-mouse-look.pchtxt) takes the
++   64 bit word at that guest address (8 aligned), a float of yaw in radians and then a float of the camera's pitch
++   arc, and clears it. The motion is added here as it arrives. */
++#define MOUSE_NATIVE_CAP  0.5f   /* what may wait for the game: a game that does not take it gets no jump later */
++#define MOUSE_NATIVE_UNIT 1e-6f  /* the settings are in millionths */
++static void mouse_native_motion(float dx, float dy) {
++    u64* word = (u64*)(g_mem + (u32)g_settings.mouse_native_address);
++    float add[2] = {-dx * (float)g_settings.mouse_native_yaw * MOUSE_NATIVE_UNIT * (g_settings.mouse_invert_x ? -1.0f : 1.0f),
++                    dy * (float)g_settings.mouse_native_pitch * MOUSE_NATIVE_UNIT * (g_settings.mouse_invert_y ? -1.0f : 1.0f)};
++    u64 old = __atomic_load_n(word, __ATOMIC_RELAXED), next;
++    do {
++        float cur[2];
++        int axis;
++        memcpy(cur, &old, sizeof cur);
++        for (axis = 0; axis < 2; ++axis)
++            if (fabsf(cur[axis]) < MOUSE_NATIVE_CAP || cur[axis] * add[axis] < 0) cur[axis] += add[axis];
++        memcpy(&next, cur, sizeof next);
++    } while (!__atomic_compare_exchange_n(word, &old, next, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
++}
+ /* a real mouse event while captured: taken here, 1; else 0 and the touch screen has it */
+ static int mouse_look_event(const SDL_Event* e) {
+     if (e->type == SDL_EVENT_MOUSE_MOTION ? e->motion.which == SDL_TOUCH_MOUSEID : e->button.which == SDL_TOUCH_MOUSEID)
+@@ -1198,8 +1218,12 @@
+     if (g_settings.mouse_look) g_use_mouse = 1;
+     if (!g_mouse_captured) return 0;
+     if (e->type == SDL_EVENT_MOUSE_MOTION) {
+-        g_mouse_dx += e->motion.xrel;
+-        g_mouse_dy += e->motion.yrel;
++        if (g_settings.mouse_native_address)
++            mouse_native_motion(e->motion.xrel, e->motion.yrel);
++        else {
++            g_mouse_dx += e->motion.xrel;
++            g_mouse_dy += e->motion.yrel;
++        }
+     } else {
+         u64 bit = e->button.button == SDL_BUTTON_LEFT ? MOUSE_ZR : e->button.button == SDL_BUTTON_RIGHT ? MOUSE_ZL : 0;
+         if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+diff --git a/src/nx/runtime/settings.txt b/src/nx/runtime/settings.txt
+--- a/src/nx/runtime/settings.txt
++++ b/src/nx/runtime/settings.txt
+@@ -422,6 +422,31 @@
+     step 50
+     help The most the mouse look may deflect the right stick, in percent of its full travel. Above 100 the game gets a
+     help stick value past its range, which turns the camera faster than a full stick if the game does not limit it
++setting Mouse native address
++    key mouse_native_address
++    int 0 INT_MAX
++    default 0
++    help The guest address of a 64 bit word (8 aligned: two floats, yaw and pitch) that a code patch of the game takes the
++    help mouse motion from, in place of the right stick. 0 = off, the mouse drives the right stick. See
++    help recomp/patches/native-mouse-look.pchtxt
++setting Mouse native yaw
++    key mouse_native_yaw
++    int 100 20000
++    default 1400
++    step 100
++    help The yaw for each count of the mouse's motion, in millionths of a radian (1400 is 0.08 degrees)
++setting Mouse invert X
++    key mouse_invert_x
++    int 0 1
++    default 0
++    words Off|On
++    help 1 = the camera turns left when the mouse moves right (the native mouse look only)
++setting Mouse native pitch
++    key mouse_native_pitch
++    int 100 20000
++    default 1000
++    step 100
++    help The pitch for each count of the mouse's motion, in millionths of the camera's pitch arc (Mouse invert Y turns it)
+ 
+ # the keyboard (platform/backend/sdl3.c): which key sends which button of the console
+ table g_keyboard_ini

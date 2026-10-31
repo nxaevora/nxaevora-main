@@ -1,0 +1,326 @@
+diff --git a/src/nx/runtime/gtrace.c b/src/nx/runtime/gtrace.c
+--- a/src/nx/runtime/gtrace.c
++++ b/src/nx/runtime/gtrace.c
+@@ -10,6 +10,8 @@
+ #include "nx/memory/mem.h"
+ #include "nx/runtime/platform/log.h"
+ #include "nx/runtime/platform/plat.h"
++#include <math.h>
++#include <stdlib.h>
+ #include <string.h>
+ 
+ #define GT_STICK_X     14158 /* the held right stick in the pad's range, 0.432 of the travel */
+@@ -26,9 +28,10 @@
+ #define GT_STACK_ABOVE 0x800
+ #define GT_MAX_DUMPS   12 /* the game threads' registers and call chains logged for the first reads */
+ 
+-enum { GT_WAIT, GT_HOLD, GT_WATCH, GT_DONE };
++enum { GT_WAIT, GT_HOLD, GT_WATCH, GT_DONE, GT_ANGLE };
+ static int g_state;
+ static u64 g_t0, g_ts;
++static int g_angle_x, g_angle_y; /* the right stick that the angle search holds now, 0 when it holds none */
+ 
+ #if defined(_WIN32)
+ #include <windows.h>
+@@ -215,7 +218,7 @@
+     InterlockedExchange(&g_lock, 0);
+     if (again && kthread_cur()) stack_watch(kthread_cur());
+     if (!write && (fn == 0xa50d75c || fn == 0x96f41a8) && kthread_cur()) frame_watch(kthread_cur(), fn);
+-    if (fresh && !write && InterlockedIncrement(&dumps) <= GT_MAX_DUMPS) {
++    if (fresh && (!write || g_settings.trace_stick == 2) && InterlockedIncrement(&dumps) <= GT_MAX_DUMPS) {
+         KThread* t = kthread_cur();
+         WARN("trace: first read by game function %llx (+%llx on the host) of match %d\n",
+              (unsigned long long)fn, (unsigned long long)off, match);
+@@ -283,6 +286,141 @@
+     RemoveVectoredExceptionHandler(watch_handler);
+ }
+ 
++/* The angle search (trace_stick=2): finds the floats of the camera angle. The right stick is held in steps. A float
++   that follows the stick is not changing at rest, and it turns when the stick turns: a candidate. The game must stand
++   in an open place with no menu, and the camera must be free. */
++#define GA_STICK        20000 /* the held right stick x, in the pad's range */
++#define GA_STICK_Y      9000  /* and y: both axes move, so the angles of one camera lie near each other */
++#define GA_NEAR_BYTES   0x100 /* the candidates this near count as neighbours */
++#define GA_HISTORY_MAX  400   /* the values of every step are logged while this few candidates are left */
++#define GA_MAX_CAND     (60u << 20)
++#define GA_MIN_ABS      0.01f /* a candidate's first value is in GA_MIN_ABS to GA_MAX_ABS */
++#define GA_MAX_ABS      400.0f
++#define GA_MIN_MOVE     0.001f /* the least change in a step of the hold */
++#define GA_RATE_LOW     0.7f   /* the second step of the hold turns this much of the first, at least, */
++#define GA_RATE_HIGH    1.3f   /* and at most this much */
++#define GA_REVERSE_LOW  0.5f
++#define GA_REVERSE_HIGH 1.5f
++#define GA_REST_TOL     1e-5f  /* the change at rest, in the value or in 1.0 if it is smaller */
++#define GA_LOG_MAX      128
++
++typedef struct {
++    u64 addr;
++    float v; /* the value at the last step */
++    float d; /* the change of the second step of the hold */
++} GaCand;
++static GaCand* g_cand;
++static size_t g_ncand;
++static int g_astep;
++
++/* what is left after step 7, with the change of an x only hold and of a y only hold */
++#define GA_FINAL_MAX  1024
++#define GA_AXIS_RATIO 3.0f /* a float is an x angle (yaw) when the x hold moves it this much more than the y hold */
++typedef struct {
++    u64 addr;
++    float v0, dx, dy;
++} GaFinal;
++static GaFinal g_fin[GA_FINAL_MAX];
++static size_t g_nfin;
++
++/* the stick signs (x, y) and the wait of each step; the step's action runs at its end, and the number is the action's */
++static const struct {
++    int sx, sy;
++    u64 wait_ns;
++} GA_STEPS[] = {
++    {0, 0, 2000000000u},   /* 0: at rest: collect the floats */
++    {1, 1, 1500000000u},   /* 1: the hold begins: keep the floats that changed */
++    {1, 1, 1000000000u},   /* 2: keep the changed floats, and note the change */
++    {1, 1, 1000000000u},   /* 3: the change is the same as in step 2 */
++    {0, 0, 1500000000u},   /* 4: the stick is back: note the value */
++    {0, 0, 1000000000u},   /* 5: the value does not change */
++    {-1, -1, 1500000000u}, /* 6: the opposite hold begins: note the value */
++    {-1, -1, 1000000000u}, /* 7: the change is the opposite of step 2 */
++    {1, 0, 1500000000u},   /* 8: the x only hold begins: note the value */
++    {1, 0, 1000000000u},   /* 9: note the change of the x hold */
++    {0, 1, 1500000000u},   /* 10: the y only hold begins: note the value */
++    {0, 1, 1000000000u},   /* 11: note the change of the y hold */
++};
++#define GA_STEP_COUNT ((int)(sizeof GA_STEPS / sizeof *GA_STEPS))
++
++static int ga_readable(const MEMORY_BASIC_INFORMATION* m) {
++    return m->State == MEM_COMMIT && !(m->Protect & (PAGE_GUARD | PAGE_NOACCESS)) && (m->Protect & PAGE_READWRITE);
++}
++static float ga_float(const u8* a) {
++    float f;
++    memcpy(&f, a, sizeof f);
++    return f;
++}
++static int ga_plausible(float v) {
++    float a = fabsf(v);
++    return a >= GA_MIN_ABS && a <= GA_MAX_ABS; /* false for a NaN */
++}
++/* step 0: every plausible float of the writable guest memory */
++static void ga_collect(void) {
++    MEMORY_BASIC_INFORMATION mbi;
++    u8 *p = g_mem, *end = g_mem + AS_SIZE;
++    g_ncand = 0;
++    while (p < end && VirtualQuery(p, &mbi, sizeof mbi)) {
++        u8* next = (u8*)mbi.BaseAddress + mbi.RegionSize;
++        if (ga_readable(&mbi)) {
++            const u8* w = (const u8*)mbi.BaseAddress;
++            size_t i, n = mbi.RegionSize / sizeof(float);
++            for (i = 0; i < n; i++) {
++                float v = ga_float(w + i * sizeof(float));
++                if (!ga_plausible(v)) continue;
++                if (g_ncand == GA_MAX_CAND) {
++                    WARN("angle: more than %u candidates: the guest memory past guest %llx is left out\n", GA_MAX_CAND,
++                         (unsigned long long)(w + i * sizeof(float) - g_mem));
++                    return;
++                }
++                g_cand[g_ncand].addr = (u64)(w + i * sizeof(float) - g_mem);
++                g_cand[g_ncand].v = v;
++                g_cand[g_ncand].d = 0;
++                g_ncand++;
++            }
++        }
++        p = next;
++    }
++}
++/* 1 when the candidate stays after step (1 to 7) with the float now cur */
++static int ga_keep(int step, GaCand* c, float cur) {
++    float d = cur - c->v;
++    switch (step) {
++        case 1: break;
++        case 2: c->d = d; break;
++        case 3: break;
++        case 4: c->v = cur; return 1;
++        case 5: return fabsf(d) <= GA_REST_TOL * fmaxf(1.0f, fabsf(c->v));
++        case 6: c->v = cur; return 1;
++        case 7: return d * c->d < 0 && fabsf(d) >= GA_REVERSE_LOW * fabsf(c->d) && fabsf(d) <= GA_REVERSE_HIGH * fabsf(c->d);
++        default: return 0;
++    }
++    if (!(fabsf(d) >= GA_MIN_MOVE && fabsf(d) <= GA_MAX_ABS)) return 0;
++    if (step == 3 && !(d * c->d > 0 && fabsf(d) >= GA_RATE_LOW * fabsf(c->d) && fabsf(d) <= GA_RATE_HIGH * fabsf(c->d)))
++        return 0;
++    c->v = cur;
++    return 1;
++}
++/* steps 1 to 7: the candidates that are still in a readable region are read again and kept or dropped */
++static void ga_filter(int step) {
++    MEMORY_BASIC_INFORMATION mbi;
++    u8 *p = g_mem, *end = g_mem + AS_SIZE;
++    size_t in = 0, out = 0;
++    while (p < end && in < g_ncand && VirtualQuery(p, &mbi, sizeof mbi)) {
++        u8* next = (u8*)mbi.BaseAddress + mbi.RegionSize;
++        if (ga_readable(&mbi)) {
++            u64 lo = (u64)((u8*)mbi.BaseAddress - g_mem), hi = lo + mbi.RegionSize;
++            while (in < g_ncand && g_cand[in].addr < lo) in++;
++            while (in < g_ncand && g_cand[in].addr < hi) {
++                GaCand c = g_cand[in++];
++                if (ga_keep(step, &c, ga_float(g_mem + c.addr))) g_cand[out++] = c;
++            }
++        }
++        p = next;
++    }
++    g_ncand = out;
++}
++
+ static void summary(void) {
+     int i;
+     LOG("trace: %d places read or wrote the held stick's words\n", g_nhit);
+@@ -299,6 +437,88 @@
+     }
+ }
+ 
++/* after step 7 the few candidates left are read directly (they were readable a moment ago) and the big array goes */
++static void ga_to_final(void) {
++    size_t i;
++    g_nfin = g_ncand < GA_FINAL_MAX ? g_ncand : GA_FINAL_MAX;
++    if (g_ncand > GA_FINAL_MAX) WARN("angle: %zu candidates, the first %d are kept\n", g_ncand, GA_FINAL_MAX);
++    for (i = 0; i < g_nfin; i++) g_fin[i] = (GaFinal){g_cand[i].addr, g_cand[i].v, 0, 0};
++    free(g_cand);
++    g_cand = NULL;
++}
++/* steps 8 to 11: the value before and the change of the x only and of the y only hold */
++static void ga_axis_step(int step) {
++    size_t i;
++    for (i = 0; i < g_nfin; i++) {
++        float cur = ga_float(g_mem + g_fin[i].addr);
++        if (step == 8 || step == 10)
++            g_fin[i].v0 = cur;
++        else if (step == 9)
++            g_fin[i].dx = cur - g_fin[i].v0;
++        else
++            g_fin[i].dy = cur - g_fin[i].v0;
++    }
++}
++static const char* ga_class(const GaFinal* f) {
++    float ax = fabsf(f->dx), ay = fabsf(f->dy);
++    if (ax >= GA_MIN_MOVE && ax > GA_AXIS_RATIO * ay) return "yaw";
++    if (ay >= GA_MIN_MOVE && ay > GA_AXIS_RATIO * ax) return "pitch";
++    return ax >= GA_MIN_MOVE || ay >= GA_MIN_MOVE ? "both" : "none";
++}
++
++/* a step of the angle search ends: its action runs, and the next step's stick is held. The last step starts the watch of
++   the words of the floats that follow one axis, with the stick held again to the first side */
++static void ga_poll(u64 now) {
++    int i, pass;
++    if (now - g_ts < GA_STEPS[g_astep].wait_ns) return;
++    if (g_astep == 0)
++        ga_collect();
++    else if (g_astep <= 7)
++        ga_filter(g_astep);
++    else
++        ga_axis_step(g_astep);
++    LOG("angle: step %d done, %zu candidates\n", g_astep, g_astep > 7 ? g_nfin : g_ncand);
++    if (g_astep >= 3 && g_astep <= 7 && g_ncand <= GA_HISTORY_MAX)
++        for (i = 0; (size_t)i < g_ncand; i++)
++            LOG("angle: step %d guest %llx value %f\n", g_astep, (unsigned long long)g_cand[i].addr, g_cand[i].v);
++    if (g_astep == 7) ga_to_final();
++    g_astep++;
++    g_ts = now;
++    if (g_astep < GA_STEP_COUNT) {
++        g_angle_x = GA_STEPS[g_astep].sx * GA_STICK;
++        g_angle_y = GA_STEPS[g_astep].sy * GA_STICK_Y;
++        return;
++    }
++    for (i = 0; i < GA_LOG_MAX && (size_t)i < g_nfin; i++) {
++        size_t k;
++        int neighbours = 0;
++        for (k = 0; k < g_nfin; k++)
++            if (k != (size_t)i && g_fin[k].addr + GA_NEAR_BYTES > g_fin[i].addr &&
++                g_fin[i].addr + GA_NEAR_BYTES > g_fin[k].addr)
++                neighbours++;
++        LOG("angle: candidate %d at guest %llx, value %f, x hold %f, y hold %f, %s, %d near\n", i,
++            (unsigned long long)g_fin[i].addr, g_fin[i].v0, g_fin[i].dx, g_fin[i].dy, ga_class(&g_fin[i]), neighbours);
++    }
++    g_nmatch = 0;
++    for (pass = 0; pass < 2 && !g_nmatch; pass++) /* the one axis floats; the others only when there are none */
++        for (i = 0; (size_t)i < g_nfin && g_nmatch < GT_MAX_MATCHES; i++) {
++            const char* c = ga_class(&g_fin[i]);
++            if (pass == 0 ? (!strcmp(c, "yaw") || !strcmp(c, "pitch")) : !strcmp(c, "both"))
++                g_match[g_nmatch++] = g_mem + g_fin[i].addr;
++        }
++    if (!g_nmatch) {
++        LOG("angle: no float follows the stick\n");
++        g_angle_x = g_angle_y = 0;
++        g_state = GT_DONE;
++        return;
++    }
++    g_angle_x = GA_STICK;
++    g_angle_y = GA_STICK_Y;
++    g_state = GT_WATCH; /* before the pages are protected: the handler takes only accesses in this state */
++    watch_start();
++    LOG("angle: watching %d pages for %d seconds\n", g_npage, g_settings.trace_stick_seconds);
++}
++
+ void gtrace_poll(void) {
+     u64 now;
+     int i;
+@@ -311,10 +531,23 @@
+     switch (g_state) {
+         case GT_WAIT:
+             if (now - g_t0 < (u64)g_settings.trace_stick_start * 1000000000u) return;
++            if (g_settings.trace_stick == 2) {
++                g_cand = malloc((size_t)GA_MAX_CAND * sizeof *g_cand);
++                if (!g_cand) {
++                    LOG("angle: no memory for the candidates\n");
++                    g_state = GT_DONE;
++                    return;
++                }
++                LOG("angle: the search begins: do not touch the mouse, the keys or the pad for about 12 seconds\n");
++                g_state = GT_ANGLE;
++                g_ts = now;
++                return;
++            }
+             LOG("trace: holding the right stick at %d %d\n", GT_STICK_X, GT_STICK_Y);
+             g_state = GT_HOLD;
+             g_ts = now;
+             break;
++        case GT_ANGLE: ga_poll(now); break;
+         case GT_HOLD:
+             if (now - g_ts < GT_HOLD_NS) return;
+             scan();
+@@ -333,6 +566,7 @@
+         case GT_WATCH:
+             if (now - g_ts < (u64)g_settings.trace_stick_seconds * 1000000000u) return;
+             g_state = GT_DONE;
++            g_angle_x = g_angle_y = 0;
+             watch_stop();
+             summary();
+             break;
+@@ -349,6 +583,11 @@
+ #endif
+ 
+ int gtrace_stick(i32* x, i32* y) {
++    if (g_state == GT_ANGLE || (g_state == GT_WATCH && g_angle_x)) {
++        *x = g_angle_x;
++        *y = g_angle_y;
++        return 1;
++    }
+     if (g_state != GT_HOLD && g_state != GT_WATCH) return 0;
+     *x = GT_STICK_X;
+     *y = GT_STICK_Y;
+diff --git a/src/nx/runtime/settings.txt b/src/nx/runtime/settings.txt
+--- a/src/nx/runtime/settings.txt
++++ b/src/nx/runtime/settings.txt
+@@ -590,10 +590,12 @@
+     help The log's detail, 0 to 2: 2 logs everything, which slows the game down
+ setting Trace stick
+     key trace_stick
+-    int 0 1
++    int 0 2
+     default 0
+     help A diagnostic for the camera: 1 = after Trace stick start seconds the right stick is held at a known value, the
+-    help game memory is searched for it, and the code that reads and writes those words is logged (Windows only)
++    help game memory is searched for it, and the code that reads and writes those words is logged (Windows only).
++    help 2 = the right stick is held in steps, the floats that follow it (the camera angle) are searched, and the code
++    help that writes them is logged
+ setting Trace stick start
+     key trace_stick_start
+     int 5 3600

@@ -1,0 +1,35 @@
+@nsobid-AEE8F150DDA1B5A838806E1A5EA6827AD9F3C51E
+
+@flag offset_shift 0x100
+
+// Native mouse look. The camera controller's angle setter 0x99437c0 (yaw at +0x360, the pitch arc position t as a
+// double at +0x700) first takes the mouse words that the runtime adds at guest 0x9943980 (a float of yaw in radians,
+// then a float of the arc), adds them to the angle and to t (limited to 0 and 1), and clears the words. The code
+// is in the words that the setter's mode 1 path frees: its end was a copy of the end of the mode 0 path, so it
+// jumps there now (0x9943930 to 0x9943990).
+@enabled
+0193E7E8 54000014
+0193E930 A802271E
+0193E934 BBFFFF17
+0193E938 49020010
+0193E93C 2AFD5FC8
+0193E940 3FFD0BC8
+0193E944 CBFFFF35
+0193E948 4101271E
+0193E94C 0028211E
+0193E950 4DFD60D3
+0193E954 A201271E
+0193E958 42C0221E
+0193E95C 038043FD
+0193E960 6328621E
+0193E964 04106E1E
+0193E968 6358641E
+0193E96C 04E4002F
+0193E970 6348641E
+0193E974 038003FD
+0193E978 081CA04E
+0193E97C 9CFFFF17
+0193E980 00000000
+0193E984 00000000
+0193E988 1F2003D5
+0193E98C 1F2003D5
