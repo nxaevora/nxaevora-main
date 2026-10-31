@@ -210,5 +210,5 @@ Sources to find in step 1 (a value that no source gives shows as `?`, as the sta
 - Review of patches 0013 to 0019 (code reviewer agent, GPT-6.1-Sol): 23 findings. Group 1 (name input) is fixed by patch
   `0020-imgui-keyboard-fixes.patch`: findings 2, 3, 4, 5, 6, 11, 12 and 13. Built and the shader and settings tests pass,
   run by the user. Group 2 (findings 7, 9, 10 and 1) is fixed by patch `0021-imgui-input-fixes.patch`: built, the
-  shader and settings tests pass, not yet run. Left: group 3 (NVML loader, GPU choice, small rules) and two design points (refresh while the game does not
+  shader and settings tests pass, run by the user. Group 3 (findings 16, 17, 14, 19, 20, 21, 22 and 23) is fixed by patch `0022-imgui-hardware-and-cleanups.patch`: built, the shader and settings tests pass, not yet run. Left: two design points (refresh while the game does not
   present, the 0.5 s test of the windows). No test covers the new code yet.
