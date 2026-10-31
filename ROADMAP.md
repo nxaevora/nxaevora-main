@@ -105,8 +105,11 @@ Exit condition: the decision above is recorded. The optional check can be done a
   drawn. The user sees no visible fault from these in the tested scenes.
 - Stutter: the only visible problem so far is a stutter when a pipeline is made for the first time. A run of 420 s
   made 100 pipelines (3.8 s making, 2.5 s of waiting). The runtime keeps its pipelines in `shader_cache/` and makes
-  them again in the background at the next start. A run of 794 s made 67 new pipelines (2.1 s of waiting). Look for
-  a way to make the pipelines ahead of time.
+  them again in the background at the next start. A run of 794 s made 67 new pipelines (2.1 s of waiting). The
+  analysis is in `docs/stutter-analysis.md`: ScarletNX already prepares the shaders ahead of time, and the pipelines
+  for new draw states cannot be made before the game uses them. Most slow frames are not from pipelines. The setting
+  `async_pipelines=1` removed the wait for pipelines (0 ms in 375 s, with an empty cache), and the user reports clearly
+  less stutter. The cause of the other slow frames and of the stop of about 1.2 s at the start is not known.
 - Audio, video, input and save data.
 - Services of the console that Arceus needs and ScarletNX does not have yet (`runtime/hle`).
 
@@ -118,7 +121,8 @@ A launcher made with Tauri (`launcher/`).
 
 - The user chooses the game dump, the update and the keys. The launcher never copies or uploads them.
 - It starts the recompile, shows its progress and starts the game.
-- It lists the settings that matter, for example the language and the resolution.
+- It lists the settings that matter, for example the language and the resolution. It sets `async_pipelines` to 1 by
+  default (see `docs/stutter-analysis.md`).
 - It ships with the runtime DLLs, so that no other tool must be installed.
 
 Exit condition: a user with a dump and keys goes from a fresh install to a running game without a terminal.
@@ -130,6 +134,92 @@ Exit condition: a user with a dump and keys goes from a fresh install to a runni
 - Build the release in CI from a pinned ScarletNX commit.
 - Write the README for users, with the legal notes: the game files are not part of NXAevora and the user must dump
   them from their own console.
+
+## Candidates for native replacement
+
+The CPU code of the game is native after the recompile. The other layers of the ScarletNX runtime still re-create
+the console: they decode its GPU commands, mix its audio, read its input, decode its video, rebuild its memory and
+read its files. A native replacement moves one of these layers to code made for the PC.
+
+These are candidates and not decisions. The current runtime works (30 frames each second and no visible fault in the
+tested scenes), so each replacement must earn its place. Measure first. Every replacement also moves away from the
+upstream project, so a patch must be kept up to date or be proposed upstream.
+
+### Graphics
+
+- Now: the runtime decodes the GPU command stream that the game writes (methods and macros of the console GPU) and
+  draws with Vulkan. A shader is translated from its console binary when the game first uses it. A pipeline is made
+  at the first draw, which causes the stutter that we see.
+- Native: handle the graphics API calls of the game (NVN) directly on Vulkan, and make the shaders and pipelines
+  before the play.
+- Benefits: no command stream to decode, less CPU work. The pipelines can be ready before play, so the stutter goes.
+  Room for PC options such as the resolution.
+- Drawbacks: the API is large, and the game uses it in its own ways, so each call must be written and tested. The
+  stream emulation works now, and a new path can add visual faults. The translation of the shader binaries stays. It
+  is a large patch to keep against upstream.
+- Step 1, small: ScarletNX makes the shaders ahead of time and the pipelines of earlier runs at the start. A pipeline
+  for a new draw state cannot be made before the game uses it. What is left is the setting `async_pipelines` and the
+  other causes of slow frames (see `docs/stutter-analysis.md`).
+
+### Audio
+
+- Now: the runtime re-creates the audio renderer of the console (voices, mixing, effects) and sends the result to
+  the PC through SDL (WASAPI). Music and voices are decoded with FFmpeg.
+- Native: give the voices of the game to a PC mixer.
+- Benefits: possibly less CPU work and latency, and options such as volume for each kind of sound.
+- Drawbacks: the effects of the game (for example reverb) must sound the same, and the result is hard to check
+  without listening. The present path works, and no fault is recorded. Low priority.
+
+### Input
+
+- Now: the pad state of the console is made from the SDL gamepad (an XInput pad is found in the log). ScarletNX has
+  input settings already (not checked in detail).
+- Native: map the PC devices directly, with rebinding in the launcher and support for other devices.
+- Benefits: small work and small risk. The launcher can offer rebinding and profiles.
+- Drawbacks: the gain is small. Functions that the console has and the PC may not have (motion, touch) need a plan.
+
+### Video
+
+- Now: the runtime re-creates the video decoder and the video compositor of the console. It decodes H.264 and VP9
+  with FFmpeg and composes the picture on the GPU. The movies of the game are in the `.usm` format. This path is not
+  tested in our runs.
+- Native: decode with the hardware decoder of the GPU or with FFmpeg directly, and give the frames to the renderer.
+- Benefits: possibly less CPU work through hardware decode.
+- Drawbacks: the current path may already work, and we do not know. The game reads the container with its own code,
+  so only the decoder level can be replaced. Timing between picture and sound can break.
+- Step 1: play a scene with a movie and read the log, before any replacement.
+
+### Memory
+
+- Now: the runtime re-creates the address space of the game. The generated code uses the addresses of the game, the
+  memory calls of the console are emulated, and the pages that the GPU uses are tracked.
+- Native: change the addresses of the game to native pointers and use the PC allocator.
+- Benefits: possibly faster memory access and simpler debugging.
+- Drawbacks: this is the largest and riskiest change. The game keeps addresses in its data. The mapping calls (alias,
+  permissions) must act the same. It reaches into the core of the recompiler. The game already runs at 30 frames
+  each second with no JIT misses, so the gain is not proven. Do not start without a measured problem.
+
+### Files
+
+- Now: the runtime reads the ExeFS and the RomFS in place from the dump (6 GB, 19095 files) and decrypts them at each
+  read. Saves are in the data folder of the game.
+- Native: extract the files to the disk ahead of time (ScarletNX has an extract option) and read them as normal
+  files.
+- Benefits: possibly faster loading, because nothing is decrypted at a read. The dump is not needed to play.
+  The launcher can check the files, and mods are easier.
+- Drawbacks: 6 GB or more of disk space for a second copy of the data. The extraction takes time and must be made
+  again after an update. The copy is for the own use of the user only and must never be shared. The loading time is
+  not measured yet, so the gain is not known.
+
+### Suggested order (not decided)
+
+1. Graphics step 1: try `async_pipelines`, and find the cause of the other slow frames. It addresses the one visible
+   problem.
+2. Files: measure the loading time of both ways. The extract option exists already.
+3. Video: test a scene with a movie.
+4. Input: rebinding in the launcher.
+5. Audio, then the graphics path (NVN), when a measured problem shows the need.
+6. Memory last, and only for a measured problem.
 
 ## Open questions
 
