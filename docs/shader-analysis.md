@@ -22,9 +22,7 @@ repository.
   any draw. If the translation reads a constant buffer, the result is dropped, because a draw checks such reads against
   its own buffers and the pre-pass has none. The message names a jump table, but the code only tests that a constant
   buffer was read. So these programs are not broken. They wait for their first draw.
-- The second group: the words look like pairs of 32-bit offsets that differ by 0x20 and 0x38. That fits the entries of a
-  jump table that the decoder read as instructions. This is a reading of the words and is not verified against the
-  disassembly of the program.
+- The second group is jump table data, read as code (checked, see the next section).
 - The archives that hold them are interface scenes: `bag_top`, `bag_top_over`, `box_top`, `box_search`, `dressup`,
   `blost` and `battle_seq_intro` (also in every language copy). In the four runs none of the 10 hashes comes up again
   after the start. The runs did not draw them, or the draw did not fail. No draw with them is reported.
@@ -92,12 +90,49 @@ working tree of the submodule (not committed, like patch 0001).
 - Not known: what the screen showed. The user must say if a picture changed, because the draw that was skipped before
   is now drawn.
 
+## The 4 programs with offset words (checked against the files)
+
+Method: the extracted RomFS (`game/work/Arceus/romfs`) holds the archives. The Yaz0 layer and the SARC layer were read
+with a script in the scratchpad (nothing of the game was written to disk). The program of `bag_top_00.arc`
+(`bgsh/__ArchiveShader.bnsh`, vertex program, 395 words with its SPH) holds the word `000003b800000380`. The opcode
+names come from `maxwell_opcodes.def`.
+
+- The word is not an instruction. The program ends with `EXIT`, `BRA` (a loop to itself) and `NOP`s. Directly after
+  them are 13 32-bit entries (0x330, 0x358, 0x380, 0x3b8, 0x3f0, 0x430, 0x460, 0x4a0, 0x4d0, 0x500, 0x530, 0x560, 0x5a0)
+  and then one word 0x40000000 and zeros.
+- The program has one `BRX` with the usual switch form: `IMNMX` (the clamp, 12, so 13 entries), `SHL` by 2, `LDC` (the
+  load of the entry), `BRX R13, -816`. The offset -816 is 0x330, so the entry 0 is the instruction after the `BRX`.
+  Each of the 13 entries gives a target that is a real instruction (`FADD`, and `MOV` for the last one). So the 13
+  entries are the jump table, and the table is stored in the program's own data after the code.
+- Why the pass before the start fails: it has no constant buffer to read (`ship_no_read`), so the table is unknown and
+  the length scan (`shader_hash`) has no end for the program. It stops only at the first all-zero word, which is
+  after the table. So the program length includes the table, and the translation meets the table's words:
+  `unknown opcode`. The first group of 6 is the same kind of program. The table in them is not next to the code, so
+  the length is right, but their translation read a constant buffer, and the pass drops such a result (message `a jump
+  table in a constant buffer`).
+- All the hits with `000003b800000380` (the programs in `bag_top`, `bag_top_over`, `blost`, `box_search`, `box_top`,
+  `dressup`) have the same form: the table directly after the padding of the program, a run of 6 non-zero words, then
+  zeros. The other words (`000003f0000003b8`, `0000039800000360`) are the first entries of other tables. One of
+  them is in `bag_top_over` and `dressup` after words that are not a known opcode, so that form was not decoded. The
+  word `0000039800000360` is not in an archive, so it is in the executable (`main.data`), which was not read.
+- Reading: this is not a missing opcode. A draw reads the table from its bound constant buffer, the targets are known,
+  and the scan ends at the `EXIT`. The 10 programs wait for their first draw. This is not proven for the draw: none
+  of the 10 was drawn in the runs. The scenes that draw them (bag, box, clothes, battle introduction) are not tested.
+
+## Run of 681 s (user, 2026-10-31, bag, box, clothes and battle introduction scenes asked for)
+
+- No `not translated` line after the start, and none of the 8 hashes that the earlier logs name comes up after the
+  start. 0 skipped draws in every window, no crash, no Vulkan error, 0 JIT misses, 30 fps (135 windows of 5 s: average
+  29.9, minimum 23). The slowest frame is the stop at the start (1248 ms at 14.8 s).
+- The programs found by the draws grew from 142 to 191 of the 1380 shipped ones. 91 programs were translated at draw
+  time (26 ms in all), and each one succeeded. A program that failed before the start and is drawn is one of them,
+  but the log has no hash for a success, so the run does not show which scenes drew the 10 programs.
+- The user opened the bag, the box, the clothes and the battle introduction, and explored a large part of the open
+  areas. So the 10 programs translated at their first draw, and the check is **closed**: the failure before the start
+  is the missing constant buffer of that pass, and it costs nothing in play.
+
 ## What is open
 
-1. Find the draw that is skipped each frame, to see what it draws. A log of the draw state at the skip would show it.
-2. Check the 4 programs with the offset words against the disassembly, to see if they are jump table data.
-3. Run the scenes of the 10 interface programs (bag, box, clothes, battle introduction) and read the log for draws
-   that fail at the first use.
-
-Item 2 needs only files. Item 1 needs a patch of the runtime log (it may not be needed if the run of patch 0002 shows
-that the skipped draws are gone). Item 3 needs the user to run the game.
+1. Find the draw that was skipped each frame, to see what it draws (the skips are 0 now, so this has little value).
+2. Done: the scenes of the 10 interface programs were run (see the run of 681 s).
+3. Check the form of the program with `000003f0000003b8` and the programs of `main.data`.

@@ -105,10 +105,12 @@ Exit condition: the decision above is recorded. The optional check can be done a
   rate is a game enhancement (later work) and needs the game's own timing to change with it.
 - Shaders: by hash, 11 of the 1379 programs that the game ships fail (see `docs/shader-analysis.md`). The old figure of
   80 counted the same program once for each archive. Six wait for their first draw, because their translation reads a
-  constant buffer. Four seem to hit jump table data (not verified). The last one has the instruction `RED`, and the
+  constant buffer. Four hit the data of a jump table that follows the program (checked in the files). The last one has the instruction `RED`, and the
   count of skipped draws grew by one in each frame. Patch `0002` adds the form, and a run of 157 s then showed 0
   skipped draws. One texture of
-  format 0 is also not drawn. The user sees no visible fault from these in the tested scenes.
+  format 0 is also not drawn. The user sees no visible fault from these in the tested scenes. A run of 681 s with the bag, the box, the clothes,
+  the battle introduction and a large part of the open areas had no shader that failed at its first draw, no skipped
+  draw and 0 JIT misses.
 - Stutter: the only visible problem so far is a stutter when a pipeline is made for the first time. A run of 420 s
   made 100 pipelines (3.8 s making, 2.5 s of waiting). The runtime keeps its pipelines in `shader_cache/` and makes
   them again in the background at the next start. A run of 794 s made 67 new pipelines (2.1 s of waiting). The
