@@ -191,3 +191,13 @@ Sources to find in step 1 (a value that no source gives shows as `?`, as the sta
 - Step 7 change: the display rows show "Game resolution" as width x height (the game's picture as the renderer makes it,
   the console's size times the render scale) in place of the scale. The Debug window can be resized freely (a minimum
   size only), and its graph keeps its height (it stretches in width only).
+- Step 8 (name input): built, not yet run. Patch `0018-imgui-keyboard.patch`. `overlay.c` stays the owner of the
+  state and the answer (so the AM service path and the ticket are unchanged). The window is in `imgui_ui.cpp`
+  (`keyboard_window`), the exchange in `imgui.c` (`keyboard_view`, `keyboard_answer`, under `ui_lock`, taken inside
+  `vk_lock` as `vk_ui_draw` does). The old box is hidden only while the windows run (a hook,
+  `overlay_keyboard_external_set`), so a start failure of ImGui leaves the old box. The IME window is placed from
+  ImGui's `Platform_SetImeDataFn`. Not handled: the composition text (no TEXT_EDITING event is forwarded), so the
+  input method shows it in its own window. Tests: three fail, the rest pass. `gui_sdl_events` fails on a missing icon for the
+  Mouse section (`main.c`'s `group_icon`, from patch 0001 and older than this step), and `native_recompiler` and
+  `llvm_module` fail on the build of a module in this environment. None of them touches this change, but the three
+  were not compared with a build without it.
