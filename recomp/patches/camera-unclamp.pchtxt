@@ -1,0 +1,9 @@
+@nsobid-AEE8F150DDA1B5A838806E1A5EA6827AD9F3C51E
+
+@flag offset_shift 0x100
+
+// The input manager clamps the sum of the sticks of the pads to -1.0 and 1.0 (fmov s8, s9 at the start of the update).
+// The limits become 8.0 and -8.0, so a mouse look past the range of a stick reaches the camera.
+@enabled
+00C9A9D8 0810241E
+00C9A9DC 0910341E
