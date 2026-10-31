@@ -1,0 +1,627 @@
+diff --git a/src/nx/CMakeLists.txt b/src/nx/CMakeLists.txt
+index 655e201..faec4ab 100644
+--- a/src/nx/CMakeLists.txt
++++ b/src/nx/CMakeLists.txt
+@@ -104,7 +104,7 @@ snx_shaderdec(snx_shader)
+ snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
+                  gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/compute.c
+                  gpu/vk/pending_pages.c gpu/vk/memory.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/ui.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp gpu/vk/gpuprof.c
+-                 gpu/vk/ftz_probe.c gpu/vk/imgui.c gpu/vk/imgui_glue.cpp gpu/vk/imgui_style.cpp gpu/vk/imgui_input.c gpu/vk/imgui_events.cpp gpu/vk/imgui_ui.cpp
++                 gpu/vk/ftz_probe.c gpu/vk/imgui.c gpu/vk/imgui_glue.cpp gpu/vk/imgui_style.cpp gpu/vk/imgui_input.c gpu/vk/imgui_events.cpp gpu/vk/imgui_ui.cpp gpu/vk/debug_stats.c
+                  "${volk_SOURCE_DIR}/volk.c"
+                  "${imgui_SOURCE_DIR}/imgui.cpp" "${imgui_SOURCE_DIR}/imgui_draw.cpp"
+                  "${imgui_SOURCE_DIR}/imgui_tables.cpp" "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
+diff --git a/src/nx/gpu/vk/debug_stats.c b/src/nx/gpu/vk/debug_stats.c
+new file mode 100644
+index 0000000..277c9c7
+--- /dev/null
++++ b/src/nx/gpu/vk/debug_stats.c
+@@ -0,0 +1,258 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++#include "nx/gpu/vk/debug_stats.h"
++#include <stddef.h>
++#include <string.h>
++#include "common/filesystem/host.h"
++#include "common/utilities/common.h"
++#include "nx/runtime/platform/log.h"
++#include "nx/runtime/platform/plat.h"
++#include "nx/runtime/platform/tracy.h"
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#endif
++
++enum {
++    AVERAGED_FRAMES = 60, /* the frames the per-frame costs average over */
++    THREAD_STACK = 1 << 18,
++    NVML_TEMPERATURE_GPU = 0,
++    NVML_CLOCK_MEM = 2,
++    NAME_MAX_LEN = 96,
++    MB = 1 << 20
++};
++static const uint64_t POLL_NS = 1000000000;  /* the machine is read once a second */
++static const uint64_t WANT_NS = 3000000000u; /* and for this long after the window last asked */
++
++typedef struct {
++    float ms, prep_ms, cpu_ms, wait_ms, uploads;
++} FrameRecord;
++
++static PMutex g_lock = PMUTEX_INIT;
++static FrameRecord g_ring[DEBUG_STATS_FRAMES];
++static int g_next, g_count;
++static uint64_t g_last_ns, g_cpu_ns, g_wait_ms, g_uploads;
++static DebugStats g_hw; /* only the machine's fields are kept here, under g_lock */
++static uint64_t g_want_until_ns;
++static char g_gpu_name[NAME_MAX_LEN];
++static int g_thread_started;
++
++void debug_stats_frame(uint64_t now_ns, uint64_t prep_ns, uint64_t pipeline_wait_ms, uint64_t texture_uploads) {
++    uint64_t cpu = snx_process_cpu_ns();
++    pm_lock(&g_lock);
++    if (g_last_ns) {
++        FrameRecord r = {.ms = (float)(now_ns - g_last_ns) / 1e6f,
++                         .prep_ms = (float)prep_ns / 1e6f,
++                         .cpu_ms = cpu && g_cpu_ns ? (float)(cpu - g_cpu_ns) / 1e6f : -1,
++                         .wait_ms = (float)(pipeline_wait_ms - g_wait_ms),
++                         .uploads = (float)(texture_uploads - g_uploads)};
++        g_ring[g_next] = r;
++        g_next = (g_next + 1) % DEBUG_STATS_FRAMES;
++        if (g_count < DEBUG_STATS_FRAMES) ++g_count;
++    }
++    g_last_ns = now_ns;
++    g_cpu_ns = cpu;
++    g_wait_ms = pipeline_wait_ms;
++    g_uploads = texture_uploads;
++    pm_unlock(&g_lock);
++}
++
++/* the record j frames back from the newest, j below g_count. Under g_lock */
++static const FrameRecord* back(int j) { return &g_ring[(g_next + DEBUG_STATS_FRAMES - 1 - j) % DEBUG_STATS_FRAMES]; }
++
++/* the mean of the field over the last AVERAGED_FRAMES, -1 when there are none or a record had no value (< 0) */
++static float mean(size_t offset) {
++    int n = g_count < AVERAGED_FRAMES ? g_count : AVERAGED_FRAMES, j, used = 0;
++    double sum = 0;
++    for (j = 0; j < n; ++j) {
++        float v = *(const float*)((const char*)back(j) + offset);
++        if (v < 0) continue;
++        sum += v;
++        ++used;
++    }
++    return used ? (float)(sum / used) : -1;
++}
++
++void debug_stats_get(DebugStats* out) {
++    int j;
++    memset(out, 0, sizeof *out);
++    pm_lock(&g_lock);
++    out->frame_count = g_count;
++    for (j = 0; j < g_count; ++j) out->frame_ms[g_count - 1 - j] = back(j)->ms;
++    out->fps = out->frame_last_ms = out->frame_max_ms = -1;
++    if (g_count >= 2) {
++        double span = 0;
++        float max = 0;
++        for (j = 0; j < g_count; ++j) {
++            span += back(j)->ms;
++            if (back(j)->ms > max) max = back(j)->ms;
++        }
++        out->fps = span > 0 ? (float)(g_count * 1000.0 / span) : -1;
++        out->frame_last_ms = back(0)->ms;
++        out->frame_max_ms = max;
++    }
++    out->prep_ms = mean(offsetof(FrameRecord, prep_ms));
++    out->cpu_ms = mean(offsetof(FrameRecord, cpu_ms));
++    out->pipeline_wait_ms = mean(offsetof(FrameRecord, wait_ms));
++    out->texture_uploads = mean(offsetof(FrameRecord, uploads));
++    out->gpu_load = g_hw.gpu_load;
++    out->gpu_temp = g_hw.gpu_temp;
++    out->gpu_power = g_hw.gpu_power;
++    out->vram_used_mb = g_hw.vram_used_mb;
++    out->vram_total_mb = g_hw.vram_total_mb;
++    out->vram_clock_mhz = g_hw.vram_clock_mhz;
++    out->cpu_load = g_hw.cpu_load;
++    out->cpu_temp = g_hw.cpu_temp;
++    out->cpu_power = g_hw.cpu_power;
++    out->ram_used_mb = g_hw.ram_used_mb;
++    out->ram_total_mb = g_hw.ram_total_mb;
++    out->game_ram_mb = g_hw.game_ram_mb;
++    pm_unlock(&g_lock);
++}
++
++/* ---------------------------------------------------------------- NVIDIA: NVML, loaded at run time. It comes with
++   the driver, so nothing of NVIDIA's is shipped or linked, and a machine without it reports the GPU as unknown */
++typedef int (*NvmlVoidFn)(void);
++typedef struct {
++    unsigned gpu, memory;
++} NvmlUtilization;
++typedef struct {
++    unsigned long long total, free, used;
++} NvmlMemory;
++typedef struct {
++    int (*init)(void);
++    int (*count)(unsigned*);
++    int (*handle)(unsigned, void**);
++    int (*name)(void*, char*, unsigned);
++    int (*utilization)(void*, NvmlUtilization*);
++    int (*temperature)(void*, int, unsigned*);
++    int (*power)(void*, unsigned*);
++    int (*memory)(void*, NvmlMemory*);
++    int (*clock)(void*, int, unsigned*);
++    void* device;
++} Nvml;
++
++static int nvml_load(Nvml* n, const char* gpu_name) {
++#ifdef _WIN32
++    static const char* const NAMES[] = {"nvml.dll", "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll"};
++#else
++    static const char* const NAMES[] = {"libnvidia-ml.so.1"};
++#endif
++    void* lib = NULL;
++    char error[160];
++    unsigned i, count = 0;
++    for (i = 0; i < sizeof NAMES / sizeof *NAMES && !lib; ++i) lib = snx_library_open(NAMES[i], error, sizeof error);
++    if (!lib) return 0;
++#define NVML_FN(member, symbol) \
++    if (!(*(void**)&n->member = snx_library_symbol(lib, symbol))) return 0
++    NVML_FN(init, "nvmlInit_v2");
++    NVML_FN(count, "nvmlDeviceGetCount_v2");
++    NVML_FN(handle, "nvmlDeviceGetHandleByIndex_v2");
++    NVML_FN(name, "nvmlDeviceGetName");
++    NVML_FN(utilization, "nvmlDeviceGetUtilizationRates");
++    NVML_FN(temperature, "nvmlDeviceGetTemperature");
++    NVML_FN(power, "nvmlDeviceGetPowerUsage");
++    NVML_FN(memory, "nvmlDeviceGetMemoryInfo");
++    NVML_FN(clock, "nvmlDeviceGetClockInfo");
++#undef NVML_FN
++    if (n->init() || n->count(&count) || !count) return 0;
++    for (i = 0; i < count; ++i) { /* the device that renders: the one with the Vulkan device's name, else the first */
++        void* dev;
++        char name[NAME_MAX_LEN];
++        if (n->handle(i, &dev)) continue;
++        if (!n->device) n->device = dev;
++        if (!n->name(dev, name, sizeof name) && gpu_name[0] && strstr(gpu_name, name)) {
++            n->device = dev;
++            break;
++        }
++    }
++    return n->device != NULL;
++}
++
++static void nvml_poll(const Nvml* n, DebugStats* s) {
++    NvmlUtilization u;
++    NvmlMemory m;
++    unsigned v;
++    if (!n->device) return;
++    if (!n->utilization(n->device, &u)) s->gpu_load = (int)u.gpu;
++    if (!n->temperature(n->device, NVML_TEMPERATURE_GPU, &v)) s->gpu_temp = (int)v;
++    if (!n->power(n->device, &v)) s->gpu_power = (int)((v + 500) / 1000); /* milliwatts */
++    if (!n->memory(n->device, &m)) {
++        s->vram_used_mb = (int)(m.used / MB);
++        s->vram_total_mb = (int)(m.total / MB);
++    }
++    if (!n->clock(n->device, NVML_CLOCK_MEM, &v)) s->vram_clock_mhz = (int)v;
++}
++
++/* ---------------------------------------------------------------- the machine's processor and memory */
++#ifdef _WIN32
++static uint64_t filetime(FILETIME f) { return (uint64_t)f.dwHighDateTime << 32 | f.dwLowDateTime; }
++
++static void system_poll(DebugStats* s) {
++    static uint64_t idle_was, total_was;
++    FILETIME idle, kernel, user;
++    MEMORYSTATUSEX mem = {.dwLength = sizeof mem};
++    if (GetSystemTimes(&idle, &kernel, &user)) {
++        uint64_t i = filetime(idle), total = filetime(kernel) + filetime(user); /* the kernel's time holds the idle */
++        if (total_was && total > total_was) s->cpu_load = (int)(100 - (i - idle_was) * 100 / (total - total_was));
++        idle_was = i;
++        total_was = total;
++    }
++    if (GlobalMemoryStatusEx(&mem)) {
++        s->ram_total_mb = (int)(mem.ullTotalPhys / MB);
++        s->ram_used_mb = (int)((mem.ullTotalPhys - mem.ullAvailPhys) / MB);
++    }
++}
++#else
++static void system_poll(DebugStats* s) { (void)s; }
++#endif
++
++static DebugStats unknown_machine(void) {
++    DebugStats s;
++    memset(&s, 0, sizeof s);
++    s.gpu_load = s.gpu_temp = s.gpu_power = s.vram_used_mb = s.vram_total_mb = s.vram_clock_mhz = -1;
++    s.cpu_load = s.cpu_temp = s.cpu_power = s.ram_used_mb = s.ram_total_mb = s.game_ram_mb = -1;
++    return s;
++}
++
++static void machine_thread(void* arg) {
++    Nvml nvml;
++    int have_nvml;
++    char name[NAME_MAX_LEN];
++    (void)arg;
++    SNX_THREAD_NAME("Debug stats");
++    pm_lock(&g_lock);
++    memcpy(name, g_gpu_name, sizeof name);
++    pm_unlock(&g_lock);
++    memset(&nvml, 0, sizeof nvml);
++    have_nvml = nvml_load(&nvml, name);
++    if (!have_nvml) LOG("debug: no NVIDIA management library: the GPU's load, temperature and power show as unknown\n");
++    for (;;) {
++        DebugStats s = unknown_machine();
++        uint64_t now = plat_ns();
++        int want;
++        pm_lock(&g_lock);
++        want = now < g_want_until_ns;
++        pm_unlock(&g_lock);
++        if (want) {
++            if (have_nvml) nvml_poll(&nvml, &s);
++            system_poll(&s);
++            s.game_ram_mb = (int)(snx_footprint() / MB);
++            pm_lock(&g_lock);
++            g_hw = s;
++            pm_unlock(&g_lock);
++        }
++        plat_sleep_ns((int64_t)POLL_NS);
++    }
++}
++
++void debug_stats_want_hardware(const char* gpu_name) {
++    pm_lock(&g_lock);
++    g_want_until_ns = plat_ns() + WANT_NS;
++    if (!g_thread_started) {
++        g_hw = unknown_machine();
++        strncpy(g_gpu_name, gpu_name ? gpu_name : "", sizeof g_gpu_name - 1);
++        g_thread_started = plat_thread(machine_thread, NULL, THREAD_STACK) == 0; /* 0 is a thread started */
++    }
++    pm_unlock(&g_lock);
++}
+diff --git a/src/nx/gpu/vk/debug_stats.h b/src/nx/gpu/vk/debug_stats.h
+new file mode 100644
+index 0000000..631a46a
+--- /dev/null
++++ b/src/nx/gpu/vk/debug_stats.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* What the Debug window shows: the game's frame times and the per-frame costs the renderer sees, and the machine's
++   load, temperature, power and memory. The frame numbers come from the present (renderer.c). The machine's come from
++   a thread that polls once a second, and only while the window asks for them (debug_stats_want_hardware). A value
++   that the machine does not tell is -1 */
++#ifndef SNX_DEBUG_STATS_H
++#define SNX_DEBUG_STATS_H
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum { DEBUG_STATS_FRAMES = 120 }; /* the frames the graph keeps */
++
++typedef struct {
++    float frame_ms[DEBUG_STATS_FRAMES]; /* the oldest first */
++    int frame_count;
++    float fps, frame_last_ms, frame_max_ms; /* over the kept frames, -1 with fewer than two */
++    /* means over the last frames, -1 with none */
++    float prep_ms;         /* the time of a present up to the submit: the render thread's cost of showing a frame */
++    float cpu_ms;          /* the process's CPU time, all threads, for each frame */
++    float pipeline_wait_ms; /* the draws' wait for a pipeline that was not ready */
++    float texture_uploads; /* uploads from guest memory for each frame */
++    /* the machine: percent, degrees C, watts, megabytes, megahertz */
++    int gpu_load, gpu_temp, gpu_power;
++    int vram_used_mb, vram_total_mb, vram_clock_mhz;
++    int cpu_load, cpu_temp, cpu_power;
++    int ram_used_mb, ram_total_mb, game_ram_mb;
++} DebugStats;
++
++/* a game's present at now_ns: prep_ns is the time from the start of showing it; the two counters are the renderer's
++   totals so far (vk_pipeline_stats' wait in ms, vk_tex_stats' uploads). Under vk_lock */
++void debug_stats_frame(uint64_t now_ns, uint64_t prep_ns, uint64_t pipeline_wait_ms, uint64_t texture_uploads);
++void debug_stats_get(DebugStats* out); /* any thread */
++/* the window is open: poll the machine for the next few seconds. name is the Vulkan device's name, which picks the
++   NVIDIA device that is the one rendering */
++void debug_stats_want_hardware(const char* gpu_name);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/nx/gpu/vk/imgui.c b/src/nx/gpu/vk/imgui.c
+index d8f9a16..e08f1c2 100644
+--- a/src/nx/gpu/vk/imgui.c
++++ b/src/nx/gpu/vk/imgui.c
+@@ -78,11 +78,12 @@ void vk_imgui_swapchain_gone(void) {
+     g_failed = 0;
+ }
+ 
+-void vk_imgui_draw(VkCommandBuffer cb, VkImage sc) {
++void vk_imgui_draw(VkCommandBuffer cb, VkImage sc, u32 game_w, u32 game_h) {
+     u64 now = plat_ns();
+     float dt = g_last_ns ? (float)((double)(now - g_last_ns) * 1e-9) : 0;
+     VkImageView view;
+     ImguiFrame frame;
++    char limit[16];
+     if (!__atomic_load_n(&g_settings.imgui, __ATOMIC_RELAXED)) {
+         g_last_ns = 0;
+         if (imgui_glue_ready()) imgui_glue_unwanted();
+@@ -90,8 +91,18 @@ void vk_imgui_draw(VkCommandBuffer cb, VkImage sc) {
+     }
+     g_last_ns = now;
+     if (!ready() || !(view = vk_ui_swapchain_view(sc))) return;
+-    frame = (ImguiFrame){(float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, dt,
+-                         __atomic_load_n(&g_settings.imgui_test, __ATOMIC_RELAXED)};
++    fps_limit_text(g_opt_fps, limit, sizeof limit);
++    frame = (ImguiFrame){.w = (float)g_vk.sc_extent.width,
++                         .h = (float)g_vk.sc_extent.height,
++                         .dt = dt,
++                         .open_test = __atomic_load_n(&g_settings.imgui_test, __ATOMIC_RELAXED),
++                         .window_w = g_vk.sc_win_w,
++                         .window_h = g_vk.sc_win_h,
++                         .game_w = (int)game_w,
++                         .game_h = (int)game_h,
++                         .vsync = __atomic_load_n(&g_settings.vsync, __ATOMIC_RELAXED),
++                         .fps_limit = limit,
++                         .gpu_name = g_vk.props.deviceName};
+     if (!imgui_glue_frame(&frame)) return; /* nothing shows: no drain, no pass */
+     vk_rec_sync();
+     image_barrier(cb, sc, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+diff --git a/src/nx/gpu/vk/imgui_glue.cpp b/src/nx/gpu/vk/imgui_glue.cpp
+index 40b5948..9a04d5b 100644
+--- a/src/nx/gpu/vk/imgui_glue.cpp
++++ b/src/nx/gpu/vk/imgui_glue.cpp
+@@ -85,7 +85,7 @@ extern "C" int imgui_glue_frame(const ImguiFrame* f) {
+     imgui_events_feed();
+     ImGui_ImplVulkan_NewFrame();
+     ImGui::NewFrame();
+-    bool menu = imgui_ui_draw(f->dt, f->open_test != 0);
++    bool menu = imgui_ui_draw(f);
+     imgui_events_publish(menu);
+     ImGui::Render();
+     return ImGui::GetDrawData()->TotalVtxCount > 0;
+diff --git a/src/nx/gpu/vk/imgui_glue.h b/src/nx/gpu/vk/imgui_glue.h
+index e4bcbbb..6b9074a 100644
+--- a/src/nx/gpu/vk/imgui_glue.h
++++ b/src/nx/gpu/vk/imgui_glue.h
+@@ -34,6 +34,12 @@ int imgui_glue_ready(void);
+ typedef struct {
+     float w, h, dt;
+     int open_test;
++    /* what the Debug window reports of the display and the game */
++    int window_w, window_h;
++    int game_w, game_h;     /* the game's picture, as the renderer makes it: the console's size times the render scale */
++    int vsync;
++    const char* fps_limit;  /* the setting's text: game, 0 or a number */
++    const char* gpu_name;
+ } ImguiFrame;
+ int imgui_glue_frame(const ImguiFrame* f);
+ void imgui_glue_unwanted(void); /* the windows are off: they want no input */
+diff --git a/src/nx/gpu/vk/imgui_ui.cpp b/src/nx/gpu/vk/imgui_ui.cpp
+index 4acbdcd..3c49367 100644
+--- a/src/nx/gpu/vk/imgui_ui.cpp
++++ b/src/nx/gpu/vk/imgui_ui.cpp
+@@ -2,12 +2,18 @@
+    Copyright 2026 the NXAevora contributors */
+ #include "nx/gpu/vk/imgui_ui.h"
+ #include <cfloat>
++#include <cstdio>
+ #include "imgui.h"
++#include "nx/gpu/vk/debug_stats.h"
+ 
+ namespace {
+ constexpr float BAR_TRIGGER_PX = 24.0f; /* the cursor this close to the top of the picture shows the bar */
+ bool g_bar_shown;
+ bool g_show_test;
++bool g_show_debug;
++constexpr float DEBUG_WIDTH = 380.0f, DEBUG_HEIGHT = 520.0f, DEBUG_MIN_WIDTH = 300.0f, DEBUG_MIN_HEIGHT = 200.0f;
++constexpr float GRAPH_HEIGHT = 56.0f, GRAPH_TOP_MS = 50.0f;
++constexpr float MB_PER_GB = 1024.0f;
+ int g_open_test_was = -1;
+ 
+ bool menu_open_anywhere() {
+@@ -46,6 +52,7 @@ void menu_bar() {
+         ImGui::EndMenu();
+     }
+     if (ImGui::BeginMenu("Debug")) {
++        ImGui::MenuItem("Debug window", nullptr, &g_show_debug);
+         ImGui::MenuItem("Test window", nullptr, &g_show_test);
+         ImGui::EndMenu();
+     }
+@@ -67,12 +74,119 @@ void test_window(float dt) {
+     ImGui::Button("Button");
+     ImGui::End();
+ }
++
++/* a value that the machine did not tell is -1 and shows as ? */
++void number(char* out, size_t n, const char* format, float v, bool tenths = false) {
++    if (v < 0)
++        snprintf(out, n, "?");
++    else if (tenths)
++        snprintf(out, n, format, v);
++    else
++        snprintf(out, n, format, (int)(v + 0.5f));
++}
++
++void row(const char* label, const char* value) {
++    ImGui::TableNextRow();
++    ImGui::TableNextColumn();
++    ImGui::TextUnformatted(label);
++    ImGui::TableNextColumn();
++    ImGui::TextUnformatted(value);
++}
++
++void hardware_lines(const DebugStats& s) {
++    char a[24], b[24], c[24], line[96];
++    number(a, sizeof a, "%d%%", (float)s.gpu_load);
++    number(b, sizeof b, "%d\xC2\xB0" "C", (float)s.gpu_temp);
++    number(c, sizeof c, "%dW", (float)s.gpu_power);
++    snprintf(line, sizeof line, "GPU:   %s   %s   %s", a, b, c);
++    ImGui::TextUnformatted(line);
++    char used[24], total[24], clock[24];
++    number(used, sizeof used, "%.1fGB", s.vram_used_mb < 0 ? -1.0f : s.vram_used_mb / MB_PER_GB, true);
++    number(total, sizeof total, "%.1fGB", s.vram_total_mb < 0 ? -1.0f : s.vram_total_mb / MB_PER_GB, true);
++    number(clock, sizeof clock, "%dMHz", (float)s.vram_clock_mhz);
++    snprintf(line, sizeof line, "VRAM:  %s  /%s  %s", used, total, clock);
++    ImGui::TextUnformatted(line);
++    number(a, sizeof a, "%d%%", (float)s.cpu_load);
++    number(b, sizeof b, "%d\xC2\xB0" "C", (float)s.cpu_temp);
++    number(c, sizeof c, "%dW", (float)s.cpu_power);
++    snprintf(line, sizeof line, "CPU:   %s   %s   %s", a, b, c);
++    ImGui::TextUnformatted(line);
++    char game[24];
++    number(used, sizeof used, "%.1fGB", s.ram_used_mb < 0 ? -1.0f : s.ram_used_mb / MB_PER_GB, true);
++    number(total, sizeof total, "%.1fGB", s.ram_total_mb < 0 ? -1.0f : s.ram_total_mb / MB_PER_GB, true);
++    number(game, sizeof game, "%.1fGB", s.game_ram_mb < 0 ? -1.0f : s.game_ram_mb / MB_PER_GB, true);
++    snprintf(line, sizeof line, "RAM:   %s  /%s  game %s", used, total, game);
++    ImGui::TextUnformatted(line);
++}
++
++void frame_lines(const DebugStats& s) {
++    char fps[24], last[24], max[24], line[96];
++    number(fps, sizeof fps, "%.0fFPS", s.fps, true);
++    number(last, sizeof last, "%.1fms", s.frame_last_ms, true);
++    number(max, sizeof max, "%.1fms", s.frame_max_ms, true);
++    snprintf(line, sizeof line, "%s   %s   max %s", fps, last, max);
++    ImGui::TextUnformatted(line);
++    ImGui::PlotLines("##frames", s.frame_ms, s.frame_count, 0, nullptr, 0.0f, GRAPH_TOP_MS, ImVec2(-1, GRAPH_HEIGHT));
++}
++
++void cost_lines(const DebugStats& s) {
++    char v[32];
++    if (!ImGui::BeginTable("costs", 2, ImGuiTableFlags_SizingStretchProp)) return;
++    number(v, sizeof v, "%.1f ms", s.prep_ms, true);
++    row("CPU frame prep:", v);
++    number(v, sizeof v, "%.1f ms", s.cpu_ms, true);
++    row("CPU busy per frame:", v);
++    number(v, sizeof v, "%.1f ms", s.pipeline_wait_ms, true);
++    row("Pipeline waits:", v);
++    number(v, sizeof v, "%.1f per frame", s.texture_uploads, true);
++    row("Texture uploads:", v);
++    ImGui::EndTable();
++}
++
++void display_lines(const ImguiFrame& f) {
++    char v[48];
++    if (!ImGui::BeginTable("display", 2, ImGuiTableFlags_SizingStretchProp)) return;
++    snprintf(v, sizeof v, "%d x %d", f.window_w, f.window_h);
++    row("Window Size", v);
++    if (f.game_w > 0)
++        snprintf(v, sizeof v, "%d x %d", f.game_w, f.game_h);
++    else
++        snprintf(v, sizeof v, "?");
++    row("Game resolution", v);
++    ImGui::BeginDisabled(); /* no setting behind these two yet */
++    row("Scaling", "-");
++    row("Anti-aliasing", "-");
++    ImGui::EndDisabled();
++    snprintf(v, sizeof v, "%s", f.fps_limit);
++    row("Frame limit", v);
++    row("V-sync", f.vsync ? "On" : "Off");
++    ImGui::EndTable();
++}
++
++void debug_window(const ImguiFrame& f) {
++    DebugStats stats;
++    ImGui::SetNextWindowPos(ImVec2(40, 60), ImGuiCond_FirstUseEver);
++    ImGui::SetNextWindowSize(ImVec2(DEBUG_WIDTH, DEBUG_HEIGHT), ImGuiCond_FirstUseEver);
++    ImGui::SetNextWindowSizeConstraints(ImVec2(DEBUG_MIN_WIDTH, DEBUG_MIN_HEIGHT), ImVec2(FLT_MAX, FLT_MAX));
++    if (!ImGui::Begin("Debug", &g_show_debug)) {
++        ImGui::End();
++        return;
++    }
++    debug_stats_want_hardware(f.gpu_name);
++    debug_stats_get(&stats);
++    hardware_lines(stats);
++    frame_lines(stats);
++    cost_lines(stats);
++    ImGui::Spacing();
++    display_lines(f);
++    ImGui::End();
++}
+ } // namespace
+ 
+-bool imgui_ui_draw(float dt, bool open_test) {
+-    if ((int)open_test != g_open_test_was) {
+-        g_open_test_was = open_test;
+-        g_show_test = open_test;
++bool imgui_ui_draw(const ImguiFrame* f) {
++    if (f->open_test != g_open_test_was) {
++        g_open_test_was = f->open_test;
++        g_show_test = f->open_test != 0;
+     }
+     g_bar_shown = false;
+     if (bar_wanted() && ImGui::BeginMainMenuBar()) {
+@@ -80,6 +194,7 @@ bool imgui_ui_draw(float dt, bool open_test) {
+         menu_bar();
+         ImGui::EndMainMenuBar();
+     }
+-    if (g_show_test) test_window(dt);
++    if (g_show_debug) debug_window(*f);
++    if (g_show_test) test_window(f->dt);
+     return g_bar_shown;
+ }
+diff --git a/src/nx/gpu/vk/imgui_ui.h b/src/nx/gpu/vk/imgui_ui.h
+index 1f8a5fc..07270c4 100644
+--- a/src/nx/gpu/vk/imgui_ui.h
++++ b/src/nx/gpu/vk/imgui_ui.h
+@@ -4,9 +4,9 @@
+    open. Called between NewFrame and Render */
+ #ifndef SNX_IMGUI_UI_H
+ #define SNX_IMGUI_UI_H
++#include "nx/gpu/vk/imgui_glue.h"
+ 
+-/* dt: the last frame's seconds. open_test: the test window's first state, from the .ini. Returns whether the menu bar
+-   shows this frame */
+-bool imgui_ui_draw(float dt, bool open_test);
++/* Returns whether the menu bar shows this frame. f->open_test is the test window's first state, from the .ini */
++bool imgui_ui_draw(const ImguiFrame* f);
+ 
+ #endif
+diff --git a/src/nx/gpu/vk/renderer.c b/src/nx/gpu/vk/renderer.c
+index 16cc5c7..e8590e9 100644
+--- a/src/nx/gpu/vk/renderer.c
++++ b/src/nx/gpu/vk/renderer.c
+@@ -21,6 +21,7 @@
+ #include "nx/runtime/platform/plat.h"
+ #include "nx/runtime/platform/stats.h"
+ #include "nx/gpu/vk/vk.h"
++#include "nx/gpu/vk/debug_stats.h"
+ #include "nx/memory/mem.h"
+ #include "nx/memory/own.h"
+ #include "nx/gpu/vk/pending_pages.h"
+@@ -357,6 +358,7 @@ static void gpu_memory_plots(void) {
+    Under vk_lock */
+ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
+     SNX_ZONE(z_show, "vk show");
++    u64 show_start_ns = plat_ns(); /* the Debug window's cost of showing a frame (debug_stats.h) */
+     /* the size the swapchain was made for, not the extent the surface clamped it to: that can stay different */
+     int ww, wh, srgb = src ? is_srgb(src->f.vk) : g_sc_srgb, shown = backend_window_shown();
+     backend_window_size(&ww, &wh);
+@@ -445,7 +447,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
+                 int safe[4] = {(int)cx, (int)cy, (int)cw, (int)ch};
+                 vk_ui_draw(cb, sc, safe);
+             }
+-            vk_imgui_draw(cb, sc);
++            vk_imgui_draw(cb, sc, fw, fh);
+             vk_barrier(cb, sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+@@ -508,6 +510,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
+         last_present_ns = now_ns;
+         g_vk_present++;
+         stats_frame(now_ns);
++        debug_stats_frame(now_ns, now_ns - show_start_ns, is[3], is[6]);
+         vk_mem_present();
+         if (g_last) vk_surf_touch(g_last); /* what screenshots read stays */
+         vk_tex_frame();
+diff --git a/src/nx/gpu/vk/vk.h b/src/nx/gpu/vk/vk.h
+index 54e167a..7effbe5 100644
+--- a/src/nx/gpu/vk/vk.h
++++ b/src/nx/gpu/vk/vk.h
+@@ -1021,7 +1021,7 @@ void vk_ui_draw(VkCommandBuffer cb, VkImage sc, const int safe[4]);
+ void vk_ui_swapchain_gone(void); /* its images' views go before the swapchain does */
+ VkImageView vk_ui_swapchain_view(VkImage sc); /* the view of a swapchain image that ui.c made (gpu/vk/imgui.c draws on it) */
+ /* gpu/vk/imgui.c: Dear ImGui's windows over the image, under vk_lock; its backend ends with the swapchain */
+-void vk_imgui_draw(VkCommandBuffer cb, VkImage sc);
++void vk_imgui_draw(VkCommandBuffer cb, VkImage sc, u32 game_w, u32 game_h);
+ void vk_imgui_swapchain_gone(void);
+ void vk_render_clear(GpuChannel* ch, u32 v);
+ VkViewport vk_render_viewport(const u32* r);

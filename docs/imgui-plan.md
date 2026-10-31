@@ -16,7 +16,7 @@ ImGui over the game. It is the base for the Tauri launcher: the launcher starts 
 | Japanese font | Noto Sans JP (SIL OFL 1.1), merged into the same font atlas |
 | Theme | ImGui dark theme, every blue color replaced with `#46478B` (hover and active states are lighter and darker steps of it) |
 | Windows | Rounded corners |
-| Alpha | 0.94 on the window background (`WindowBg`). Text and widgets stay opaque. `Style.Alpha` is not used, because it also fades the text |
+| Alpha | 0.94 on the whole window (`Style.Alpha`), text and widgets included. The user chose this after the first build, where 0.94 on `WindowBg` alone showed no see-through |
 | Text input | The game's software keyboard (the player name) is an ImGui window. It replaces the box of `overlay.c` |
 | Entry point | A menu bar with About, Settings, Mods, Cheats and Debug. It shows when the mouse cursor is at the top of the window. No key opens it |
 | Gamepad | ImGui does not use the gamepad. Mouse and keyboard only. The game keeps the gamepad |
@@ -158,3 +158,36 @@ Sources to find in step 1 (a value that no source gives shows as `?`, as the sta
 - Step 2 (dependency): done. Patch `0013-imgui-dependency.patch` pins Dear ImGui 1.93.0 (MIT). The configure of
   ScarletNX downloaded it and checked the SHA-256. Nothing is compiled yet. The credits entry for ImGui, Roboto and
   Noto Sans JP comes with step 3, when the font files are added.
+- Step 3 (fonts): done. `assets/fonts` holds Roboto (variable TTF, 0.5 MB) and Noto Sans JP Regular (subset OTF,
+  4.5 MB) with their OFL texts, source commits and hashes. `docs/CREDITS.md` lists ImGui and both fonts. The atlas
+  size and the load time are checked in step 4, when ImGui builds the atlas.
+- Step 4 (backend): built, not yet run. Patch `0014-imgui-vulkan-backend.patch` compiles ImGui and its Vulkan backend
+  into the renderer. `vk_imgui_draw` (called after `vk_ui_draw` in `show()`) drains the recording ring (`vk_rec_sync`),
+  then ImGui records straight into the frame's command buffer inside its own dynamic rendering scope, and the two
+  barriers around it are recorded directly too. Fonts come from `fonts/` in the data folder. The setting `imgui_test`
+  shows a test window (Roboto, Japanese text, FPS). The SDL3 backend and the input are step 6. The unit tests for the
+  shaders and the settings pass. The run is for the user (see the end of this section).
+- Step 4 (backend): done. The user ran it with `imgui_test=1` and the window and the Japanese text showed correctly.
+- Step 5 (theme): built, not yet run. Patch `0015-imgui-theme.patch` (`gpu/vk/imgui_style.cpp`). Each blue of the dark
+  theme becomes `#46478B` at the same brightness step (the factor is the blue channel over 0.98). A pressed widget is
+  lightened by 0.25. The whole window has alpha 0.94 (`Style.Alpha`, so text and widgets too), and the corners are rounded (window 8, widgets 5, popup 6,
+  scrollbar 9). The test window shows a checkbox, a slider and a button.
+- Step 5 (theme): done. The user chose alpha 0.94 on the whole window.
+- Step 6 (input): built, not yet run. Patch `0016-imgui-input.patch`. The main thread pushes the window's events into a
+  queue (`imgui_input.c`), the frame pops them under `vk_lock` and publishes the wants. ImGui's SDL3 backend is not
+  used, because it calls ImGui from the polling thread, which is not the context's owner. The key to free the cursor
+  is Alt (patch 0001 already frees the mouse look while Alt is held). The menu bar shows at the top edge (24 px), stays
+  while the cursor is on it or a menu is open, and has About, Settings, Mods, Cheats and Debug (the Debug menu opens
+  the test window for now). The windows take the mouse while the cursor is over one and a key while a text field is
+  active. A key-up is never taken. Text input starts while a text field is active, unless the game's keyboard box
+  has it. Open for step 8: who stops the text input when both want it.
+- Step 7 (Debug window): built, not yet run. Patch `0017-imgui-debug-window.patch`. Menu bar, Debug, Debug window.
+  Frame values from the present (`debug_stats.c`): FPS, last and maximum frame time, the graph of 120 frames, the
+  present's time up to the submit, the process CPU time for each frame, the pipeline wait and the texture uploads
+  (means over 60 frames). Machine values from a thread that polls once a second while the window is open: NVIDIA load,
+  temperature, power, video memory and memory clock through NVML (loaded at run time), the processor's load and the
+  memory (Windows). Not done: the processor's temperature and power (no standard API), AMD (ADL) and Intel GPUs, and
+  the editing of the display settings (the window only shows them). Those show as ?.
+- Step 7 change: the display rows show "Game resolution" as width x height (the game's picture as the renderer makes it,
+  the console's size times the render scale) in place of the scale. The Debug window can be resized freely (a minimum
+  size only), and its graph keeps its height (it stretches in width only).
