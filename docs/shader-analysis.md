@@ -68,7 +68,7 @@ What the translator would need (not started):
 What the program does with the 64-bit counter is not known. A 64-bit add in a fragment program is usually a counter or
 a sum over the pixels (for example statistics or exposure).
 
-## Patch 0002: `RED.E.ADD.64` added (built, not yet run)
+## Patch 0002: `RED.E.ADD.64` added (built and run once)
 
 The user decided to add the form. The patch is `recomp/patches/0002-global-red-add-u64.patch` and it changes the
 working tree of the submodule (not committed, like patch 0001).
@@ -84,12 +84,13 @@ working tree of the submodule (not committed, like patch 0001).
 - Checks done: the build, the ten shader tests of `ctest`, and a new regression test. Its output passes `spirv-val`
   with the target `vulkan1.3`. The disassembly shows the two capabilities, the two `Aliased` variables and one
   `OpAtomicIAdd %ulong`.
-- Not done: a run of the game. A build is not a test. Whether the driver accepts the module and whether the skipped
-  draws go to 0 needs the user's run (see below).
-
-How to read the run: the log must not have the line `shader 3aa06ea216ba378c (stage 4) not translated`, and the count
-of skipped draws must stop growing by 600 in each 20 s window. If the log shows a failed pipeline for this program,
-the driver did not accept the aliased 64-bit view.
+- Run result (user, 2026-10-31, update program, two runs of 43 s and 157 s, from the first start into the game): the line
+  `shader 3aa06ea216ba378c ... not translated` is gone, and the count of skipped draws is **0** in every window of
+  20 s (before: 600 in each). There is no crash, no failed pipeline and no Vulkan error in the log. So the driver
+  (NVIDIA, RTX 2060 SUPER) accepts the aliased 64-bit view. The frame rate is 30.1 in the steady windows (31 windows of
+  5 s: average 29.6, minimum 22.4 at the start). 0 JIT misses.
+- Not known: what the screen showed. The user must say if a picture changed, because the draw that was skipped before
+  is now drawn.
 
 ## What is open
 
