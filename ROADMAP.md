@@ -58,13 +58,13 @@ and recompiles again.
 This phase is closed for now, because every run after the jump-table hints had 0 misses. Open it again when a miss
 appears in a scene that is not tested yet.
 
-- Scenes to cover: the title screen, the start of the story, the village, the wild areas, battles, menus, the save
-  and load flow, and the cutscenes with video.
+- Scenes to cover: the title screen, the start of the story, the village, the wild areas, battles, menus, and the save
+  and load flow.
 - Covered so far, with 0 misses: the opening scene at sea, the first menus with the software keyboard, the write of
   a save, the load of that save, a play of 7 minutes to the entry of the village with a capture, and a play of
   13 minutes to the point before the Obsidian Fieldlands with a battle against an NPC, and a play of 4 minutes in
-  the Obsidian Fieldlands. Not tested yet: long play in the open areas, the other wild areas, battles against wild
-  Pokemon of the later areas, and video.
+  the Obsidian Fieldlands. Not tested yet: long play in the open areas, the other wild areas, and battles against wild
+  Pokemon of the later areas.
 - The number of misses for each scene is the measure. It is written down after each round.
 - Findings about the game (crashes, wrong rendering, missing services) go to `docs/`.
 
@@ -110,7 +110,7 @@ Exit condition: the decision above is recorded. The optional check can be done a
   for new draw states cannot be made before the game uses them. Most slow frames are not from pipelines. The setting
   `async_pipelines=1` removed the wait for pipelines (0 ms in 375 s, with an empty cache), and the user reports clearly
   less stutter. The cause of the other slow frames and of the stop of about 1.2 s at the start is not known.
-- Audio, video, input and save data.
+- Audio, input and save data.
 - Services of the console that Arceus needs and ScarletNX does not have yet (`runtime/hle`).
 
 Exit condition: the covered scenes play at the speed and the quality that the user accepts.
@@ -172,22 +172,14 @@ upstream project, so a patch must be kept up to date or be proposed upstream.
 
 ### Input
 
-- Now: the pad state of the console is made from the SDL gamepad (an XInput pad is found in the log). ScarletNX has
-  input settings already (not checked in detail).
-- Native: map the PC devices directly, with rebinding in the launcher and support for other devices.
-- Benefits: small work and small risk. The launcher can offer rebinding and profiles.
-- Drawbacks: the gain is small. Functions that the console has and the PC may not have (motion, touch) need a plan.
-
-### Video
-
-- Now: the runtime re-creates the video decoder and the video compositor of the console. It decodes H.264 and VP9
-  with FFmpeg and composes the picture on the GPU. The movies of the game are in the `.usm` format. This path is not
-  tested in our runs.
-- Native: decode with the hardware decoder of the GPU or with FFmpeg directly, and give the frames to the renderer.
-- Benefits: possibly less CPU work through hardware decode.
-- Drawbacks: the current path may already work, and we do not know. The game reads the container with its own code,
-  so only the decoder level can be replaced. Timing between picture and sound can break.
-- Step 1: play a scene with a movie and read the log, before any replacement.
+- Now: the pad state of the console is made from the SDL gamepad (an XInput pad is found in the log). The keyboard and
+  mouse are mapped to pad buttons and sticks, so the mouse look acts like a stick and feels poor.
+- Native: read the keyboard and mouse directly. The mouse moves the camera by its own delta and does not pass through a
+  stick. The launcher offers rebinding and profiles.
+- Benefits: a camera that is usable with the mouse, and rebinding.
+- Drawbacks: the game reads its camera from the stick values, so a mouse delta must be turned into a stick value (or
+  into a change that the game accepts). Functions that the console has and the PC may not have (motion, touch) need a
+  plan. The work is in `docs/input-analysis.md`.
 
 ### Memory
 
@@ -211,15 +203,19 @@ upstream project, so a patch must be kept up to date or be proposed upstream.
   again after an update. The copy is for the own use of the user only and must never be shared. The loading time is
   not measured yet, so the gain is not known.
 
-### Suggested order (not decided)
+### Decision
 
-1. Graphics step 1: try `async_pipelines`, and find the cause of the other slow frames. It addresses the one visible
-   problem.
-2. Files: measure the loading time of both ways. The extract option exists already.
-3. Video: test a scene with a movie.
-4. Input: rebinding in the launcher.
-5. Audio, then the graphics path (NVN), when a measured problem shows the need.
-6. Memory last, and only for a measured problem.
+A layer is replaced only when a measurement shows a problem. The measurements so far show none for the layers below:
+the CPU waits for most of the time, the GPU uses about 6 ms of a frame of 33 ms, and the user sees no stutter while
+walking (`docs/stutter-analysis.md`).
+
+- Video: no replacement. The movies of the game are cutscenes that the game engine renders itself.
+- Files: no replacement for now. A run with the RomFS extracted still had the stop at the start, so reading the dump in
+  place is not the cause.
+- Graphics (NVN), memory and audio: not started. Open them again only with a measured problem.
+- Input: the one layer that is replaced. The keyboard and mouse must work as native input, because the mouse look of
+  an emulated pad is poor. See `docs/input-analysis.md`.
+- Game enhancements such as the frame rate are later work and are not part of this list.
 
 ## Open questions
 

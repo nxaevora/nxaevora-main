@@ -92,3 +92,20 @@ The user loaded the save and walked around. The user saw no stutter.
 Reading: the stop at the start is real (1340 ms, around 17 s there is a drop to 22 fps) and it comes with the
 uploads of about 240 MB, but the profile shows no busy CPU thread. The stop looks like a wait on a lock or on file
 reads, not like work. This is not verified. After the start the game runs smoothly.
+
+## Run M: RomFS extracted (--extract-container), early game, 274 s
+
+The user ran `scarletnx.exe --extract-container <base> --update <update>`. This made a second game folder in
+`%APPDATA%\scarletnx\recompiled\01001F5010DFA000` (own recompile, own hints, own cache, no save, 12.3 GB of RomFS
+copies). The run began in the opening scene.
+
+- The files came from the extraction: 19095 files in the RomFS, 6 files mapped.
+- A stop of 1318 ms was still there in the first 29 s (6 frames over 50 ms). So reading the dump in place is not the
+  cause of the stop at the start. Not a full proof: the run is not equal to the earlier ones.
+- Differences that spoil the comparison: a cold shader cache (33 shaders translated and 59 pipelines made in 29 s),
+  183 JIT misses (this folder has no jump-table hints), no save.
+- The run read in place at 12:31 (opening scene, 37 s) had no stop: the slowest frame was 85 ms. So the stop does not
+  happen in every run.
+- The freeze of 4804 ms at 47 s is the software keyboard (name entry), not a stutter.
+- Later windows: 30 fps, with slow frames of 200 ms or less. 9 frames over 50 ms at 154 s while 524 textures were
+  uploaded (194 MB).
