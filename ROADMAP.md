@@ -99,10 +99,15 @@ Exit condition: the decision above is recorded. The optional check can be done a
 ## Phase 5: Quality of the port
 
 - Rendering: look for wrong or missing effects in the Maxwell to Vulkan path.
-- Speed: the boot run shows about 30 frames each second. Find out whether the game limits it or the runtime does.
-- Shaders: the boot run reports 80 of 1787 shader programs as failed. The cause is not known. Every run also
-  reports one shader that is not translated because of the instruction `RED`, and one texture of format 0 that is not
-  drawn. The user sees no visible fault from these in the tested scenes.
+- Speed: the game limits the rate, not the runtime. In every run the game sets a swap interval of 2 (`vi: swap interval
+  2`, one change at about 2 s). The setting `fps_limit=game` makes the runtime hold each frame for 2 refreshes of 60 Hz,
+  which is 30 frames each second. The GPU needs about 6 ms of the 33 ms, so the hardware is not the limit. A higher
+  rate is a game enhancement (later work) and needs the game's own timing to change with it.
+- Shaders: by hash, 11 of the 1379 programs that the game ships fail (see `docs/shader-analysis.md`). The old figure of
+  80 counted the same program once for each archive. Six wait for their first draw, because their translation reads a
+  constant buffer. Four seem to hit jump table data (not verified). The last one has the instruction `RED`, and the
+  count of skipped draws grows by one in each frame, so one draw per frame is probably not drawn. One texture of
+  format 0 is also not drawn. The user sees no visible fault from these in the tested scenes.
 - Stutter: the only visible problem so far is a stutter when a pipeline is made for the first time. A run of 420 s
   made 100 pipelines (3.8 s making, 2.5 s of waiting). The runtime keeps its pipelines in `shader_cache/` and makes
   them again in the background at the next start. A run of 794 s made 67 new pipelines (2.1 s of waiting). The
@@ -212,7 +217,12 @@ walking (`docs/stutter-analysis.md`).
 - Video: no replacement. The movies of the game are cutscenes that the game engine renders itself.
 - Files: no replacement for now. A run with the RomFS extracted still had the stop at the start, so reading the dump in
   place is not the cause.
-- Graphics (NVN), memory and audio: not started. Open them again only with a measured problem.
+- Graphics (NVN), memory and audio: not started. Open them again only with a measured problem. Review of this
+  decision: the measurements still show none. The 30 frames each second come from the game's swap interval, so the
+  layers are not the limit. Open graphics and memory again if a higher frame rate is tried and the CPU cost of the GPU
+  command stream decode becomes the limit.
+- Open measurement: the stop of about 1.3 s at the start (a wait, not work, see run L). Find the lock or the read that
+  it waits on.
 - Input: the one layer that is replaced. The keyboard and mouse must work as native input, because the mouse look of
   an emulated pad is poor. See `docs/input-analysis.md`.
 - Game enhancements such as the frame rate are later work and are not part of this list.
