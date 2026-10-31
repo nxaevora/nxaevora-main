@@ -1,0 +1,2039 @@
+diff --git a/cmake/dependencies.cmake b/cmake/dependencies.cmake
+index d3aaebab..5a92fd69 100644
+--- a/cmake/dependencies.cmake
++++ b/cmake/dependencies.cmake
+@@ -215,6 +215,12 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
+                   URL https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator/archive/refs/tags/v3.4.0.tar.gz
+                   URL_HASH SHA256=822aa850c6ce77346ae96a8a1d351d52e77e85929f35363849a0a4e638e0a2a1
+                   DOWNLOAD_ONLY YES)
++    # Dear ImGui (MIT) for the in-game windows of NXAevora: the core, the SDL3 and Vulkan backends and their stb headers,
++    # compiled into the vk components with the sources the project names. Not built yet by this commit
++    CPMAddPackage(NAME imgui VERSION 1.93.0
++                  URL https://github.com/ocornut/imgui/archive/refs/tags/v1.93.0.tar.gz
++                  URL_HASH SHA256=f7bf6bc76e5d79d40d751096663e6c5d18daf08129dd52e7f7b09e4251c8eeee
++                  DOWNLOAD_ONLY YES)
+     # RenderDoc's in-application API, one header (renderdoc, gpu/vk/renderdoc.c), from the release tag
+     CPMAddPackage(NAME renderdoc_app VERSION 1.46
+                   URL https://raw.githubusercontent.com/baldurk/renderdoc/v1.46/renderdoc/api/app/renderdoc_app.h
+diff --git a/src/nx/CMakeLists.txt b/src/nx/CMakeLists.txt
+index 2d0dbb76..da11eac8 100644
+--- a/src/nx/CMakeLists.txt
++++ b/src/nx/CMakeLists.txt
+@@ -79,7 +79,7 @@ snx_ship_walk(gpu/shipped_pass.c)
+ include("${PROJECT_SOURCE_DIR}/cmake/controls_atlas.cmake")
+ include("${PROJECT_SOURCE_DIR}/cmake/gui_themes.cmake")
+ set(platform runtime/platform/plat.c runtime/platform/plat_sdl.c runtime/platform/unattended.c
+-             runtime/platform/backend/sdl3.c
++             runtime/platform/backend/sdl3.c runtime/platform/backend/imgui_sdl.c
+              runtime/platform/backend/gamepad.c runtime/platform/tracy.c
+              runtime/platform/hud.c runtime/platform/overlay.c runtime/platform/stats.c runtime/platform/touch.c
+              runtime/platform/ui.c runtime/platform/vpad.c runtime/platform/fatal_screen.c
+@@ -104,8 +104,15 @@ snx_shaderdec(snx_shader)
+ snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
+                  gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/compute.c
+                  gpu/vk/pending_pages.c gpu/vk/memory.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/ui.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/vma.cpp gpu/vk/gpuprof.c
+-                 gpu/vk/ftz_probe.c
+-                 "${volk_SOURCE_DIR}/volk.c")
++                 gpu/vk/ftz_probe.c gpu/vk/imgui.c gpu/vk/imgui_glue.cpp gpu/vk/imgui_style.cpp gpu/vk/imgui_input.c gpu/vk/imgui_events.cpp gpu/vk/imgui_ui.cpp gpu/vk/debug_stats.c
++                 "${volk_SOURCE_DIR}/volk.c"
++                 "${imgui_SOURCE_DIR}/imgui.cpp" "${imgui_SOURCE_DIR}/imgui_draw.cpp"
++                 "${imgui_SOURCE_DIR}/imgui_tables.cpp" "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
++                 "${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp")
++# Dear ImGui's own files, with the Vulkan backend that loads its functions through volk (gpu/vk/imgui_glue.cpp)
++target_include_directories(snx_vk PRIVATE "${imgui_SOURCE_DIR}" "${imgui_SOURCE_DIR}/backends")
++# ImWchar holds a whole code point: the game counts a character past U+FFFF as two UTF-16 units and must get it whole
++target_compile_definitions(snx_vk PRIVATE IMGUI_USE_WCHAR32)
+ # the ASTC decoder's, the block linear deswizzle and swizzle's, the texture conversions', the VIC composition's and
+ # the render enable predicates' SPIR-V, compiled from their GLSL at build time (cmake/glsl.cmake). The VIC shader is
+ # built twice: for word aligned rows, and for the rest
+@@ -126,6 +133,10 @@ set(components core kernel hle video gpu platform shader vk)
+ # third-party code (vma.cpp is VMA's implementation), cmake/dependencies.cmake
+ set_source_files_properties("${volk_SOURCE_DIR}/volk.c" gpu/vk/vma.cpp PROPERTIES COMPILE_OPTIONS
+                             "${snx_third_party_flags}")
++set_source_files_properties("${imgui_SOURCE_DIR}/imgui.cpp" "${imgui_SOURCE_DIR}/imgui_draw.cpp"
++                            "${imgui_SOURCE_DIR}/imgui_tables.cpp" "${imgui_SOURCE_DIR}/imgui_widgets.cpp"
++                            "${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp" PROPERTIES COMPILE_OPTIONS
++                            "${snx_third_party_flags}" COMPILE_DEFINITIONS IMGUI_IMPL_VULKAN_USE_VOLK)
+ 
+ if(ANDROID)
+     # the menu runs the program (src/multicall's libscarletnx.so) as libscarletnx-run.so, an executable named for the
+diff --git a/src/nx/gpu/vk/debug_stats.c b/src/nx/gpu/vk/debug_stats.c
+new file mode 100644
+index 00000000..6611b576
+--- /dev/null
++++ b/src/nx/gpu/vk/debug_stats.c
+@@ -0,0 +1,314 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++#include "nx/gpu/vk/debug_stats.h"
++#include <stddef.h>
++#include <string.h>
++#include "common/filesystem/host.h"
++#include "common/utilities/ascii.h"
++#include "common/utilities/common.h"
++#include "nx/runtime/platform/log.h"
++#include "nx/runtime/platform/plat.h"
++#include "nx/runtime/platform/tracy.h"
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#endif
++
++enum {
++    AVERAGED_FRAMES = 60, /* the frames the per-frame costs average over */
++    THREAD_STACK = 1 << 18,
++    NVML_TEMPERATURE_GPU = 0,
++    NVML_CLOCK_MEM = 2,
++    UUID_BYTES = 16,
++    UUID_TEXT_MAX = 48, /* "GPU-" and 36 characters, as NVML writes it */
++    MB = 1 << 20
++};
++static const uint64_t POLL_NS = 1000000000;  /* the machine is read once a second */
++
++typedef struct {
++    float ms, prep_ms, cpu_ms, wait_ms, uploads;
++} FrameRecord;
++
++static PMutex g_lock = PMUTEX_INIT;
++static FrameRecord g_ring[DEBUG_STATS_FRAMES];
++static int g_next, g_count;
++static uint64_t g_last_ns, g_cpu_ns, g_wait_ms, g_uploads;
++static DebugStats g_hw; /* only the machine's fields are kept here, under g_lock */
++static int g_demand;       /* the window is open: atomic */
++static int g_thread_tried; /* under g_lock: the thread is started once, and a failure is not tried again */
++static uint8_t g_gpu_uuid[UUID_BYTES];
++
++void debug_stats_frame(uint64_t now_ns, uint64_t prep_ns, uint64_t pipeline_wait_ms, uint64_t texture_uploads) {
++    uint64_t cpu = snx_process_cpu_ns();
++    pm_lock(&g_lock);
++    if (g_last_ns) {
++        FrameRecord r = {.ms = (float)(now_ns - g_last_ns) / 1e6f,
++                         .prep_ms = (float)prep_ns / 1e6f,
++                         .cpu_ms = cpu && g_cpu_ns ? (float)(cpu - g_cpu_ns) / 1e6f : -1,
++                         .wait_ms = (float)(pipeline_wait_ms - g_wait_ms),
++                         .uploads = (float)(texture_uploads - g_uploads)};
++        g_ring[g_next] = r;
++        g_next = (g_next + 1) % DEBUG_STATS_FRAMES;
++        if (g_count < DEBUG_STATS_FRAMES) ++g_count;
++    }
++    g_last_ns = now_ns;
++    g_cpu_ns = cpu;
++    g_wait_ms = pipeline_wait_ms;
++    g_uploads = texture_uploads;
++    pm_unlock(&g_lock);
++}
++
++/* the record j frames back from the newest, j below g_count. Under g_lock */
++static const FrameRecord* back(int j) { return &g_ring[(g_next + DEBUG_STATS_FRAMES - 1 - j) % DEBUG_STATS_FRAMES]; }
++
++/* the mean of the field over the last AVERAGED_FRAMES, -1 when there are none or a record had no value (< 0) */
++static float mean(size_t offset) {
++    int n = g_count < AVERAGED_FRAMES ? g_count : AVERAGED_FRAMES, j, used = 0;
++    double sum = 0;
++    for (j = 0; j < n; ++j) {
++        float v = *(const float*)((const char*)back(j) + offset);
++        if (v < 0) continue;
++        sum += v;
++        ++used;
++    }
++    return used ? (float)(sum / used) : -1;
++}
++
++void debug_stats_get(DebugStats* out) {
++    int j;
++    *out = (DebugStats){0};
++    pm_lock(&g_lock);
++    out->frame_count = g_count;
++    for (j = 0; j < g_count; ++j) out->frame_ms[g_count - 1 - j] = back(j)->ms;
++    out->fps = out->frame_last_ms = out->frame_max_ms = -1;
++    if (g_count >= 2) {
++        double span = 0;
++        float max = 0;
++        for (j = 0; j < g_count; ++j) {
++            span += back(j)->ms;
++            if (back(j)->ms > max) max = back(j)->ms;
++        }
++        out->fps = span > 0 ? (float)(g_count * 1000.0 / span) : -1;
++        out->frame_last_ms = back(0)->ms;
++        out->frame_max_ms = max;
++    }
++    out->prep_ms = mean(offsetof(FrameRecord, prep_ms));
++    out->cpu_ms = mean(offsetof(FrameRecord, cpu_ms));
++    out->pipeline_wait_ms = mean(offsetof(FrameRecord, wait_ms));
++    out->texture_uploads = mean(offsetof(FrameRecord, uploads));
++    out->gpu_load = g_hw.gpu_load;
++    out->gpu_temp = g_hw.gpu_temp;
++    out->gpu_power = g_hw.gpu_power;
++    out->vram_used_mb = g_hw.vram_used_mb;
++    out->vram_total_mb = g_hw.vram_total_mb;
++    out->vram_clock_mhz = g_hw.vram_clock_mhz;
++    out->cpu_load = g_hw.cpu_load;
++    out->cpu_temp = g_hw.cpu_temp;
++    out->cpu_power = g_hw.cpu_power;
++    out->ram_used_mb = g_hw.ram_used_mb;
++    out->ram_total_mb = g_hw.ram_total_mb;
++    out->game_ram_mb = g_hw.game_ram_mb;
++    pm_unlock(&g_lock);
++}
++
++/* ---------------------------------------------------------------- NVIDIA: NVML, loaded at run time. It comes with
++   the driver, so nothing of NVIDIA's is shipped or linked, and a machine without it reports the GPU as unknown.
++   The types have NVML's shapes: an opaque device pointer, and int for its enum results */
++typedef struct NvmlDeviceOpaque* NvmlDevice;
++typedef struct {
++    unsigned gpu, memory;
++} NvmlUtilization;
++typedef struct {
++    unsigned long long total, free, used;
++} NvmlMemory;
++typedef struct {
++    void* library;
++    int initialized;
++    int (*init)(void);
++    int (*shutdown)(void);
++    int (*count)(unsigned*);
++    int (*handle)(unsigned, NvmlDevice*);
++    int (*uuid)(NvmlDevice, char*, unsigned);
++    int (*utilization)(NvmlDevice, NvmlUtilization*);
++    int (*temperature)(NvmlDevice, int, unsigned*);
++    int (*power)(NvmlDevice, unsigned*);
++    int (*memory)(NvmlDevice, NvmlMemory*);
++    int (*clock)(NvmlDevice, int, unsigned*);
++    NvmlDevice device;
++} Nvml;
++
++static void nvml_unload(Nvml* n) {
++    if (n->initialized) n->shutdown();
++    if (n->library) snx_library_close(n->library);
++    *n = (Nvml){0};
++}
++
++/* the symbol into the function pointer at slot, through memcpy: an object pointer and a function pointer don't alias */
++static int nvml_bind(Nvml* n, void* slot, const char* symbol) {
++    void* address = snx_library_symbol(n->library, symbol);
++    if (!address) {
++        LOG("debug: the NVIDIA management library has no %s\n", symbol);
++        return 0;
++    }
++    memcpy(slot, &address, sizeof address);
++    return 1;
++}
++
++/* the text of a Vulkan device UUID the way NVML writes its own: GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx */
++static void uuid_text(const uint8_t uuid[UUID_BYTES], char* out, size_t size) {
++    static const char HEX[] = "0123456789abcdef";
++    size_t at = 4;
++    if (size < UUID_TEXT_MAX) return;
++    memcpy(out, "GPU-", 4);
++    for (int i = 0; i < UUID_BYTES; ++i) {
++        if (i == 4 || i == 6 || i == 8 || i == 10) out[at++] = '-';
++        out[at++] = HEX[uuid[i] >> 4];
++        out[at++] = HEX[uuid[i] & 15];
++    }
++    out[at] = 0;
++}
++
++static int same_uuid(const char* a, const char* b) {
++    for (; *a && *b; ++a, ++b)
++        if (snx_to_lower(*a) != snx_to_lower(*b)) return 0;
++    return *a == *b;
++}
++
++/* opens NVML and picks the device that has the rendering Vulkan device's UUID. 0 with the cause logged and nothing
++   left open: the GPU then shows as unknown */
++static int nvml_load(Nvml* n, const uint8_t vulkan_uuid[UUID_BYTES]) {
++#ifdef _WIN32
++    static const char* const NAMES[] = {"nvml.dll", "C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll"};
++#else
++    static const char* const NAMES[] = {"libnvidia-ml.so.1"};
++#endif
++    char error[160] = "", wanted[UUID_TEXT_MAX];
++    unsigned count = 0;
++    int result;
++    for (size_t i = 0; i < sizeof NAMES / sizeof *NAMES && !n->library; ++i)
++        n->library = snx_library_open(NAMES[i], error, sizeof error);
++    if (!n->library) {
++        LOG("debug: no NVIDIA management library (last try: %s)\n", error);
++        return 0;
++    }
++    if (!nvml_bind(n, &n->init, "nvmlInit_v2") || !nvml_bind(n, &n->shutdown, "nvmlShutdown") ||
++        !nvml_bind(n, &n->count, "nvmlDeviceGetCount_v2") || !nvml_bind(n, &n->handle, "nvmlDeviceGetHandleByIndex_v2") ||
++        !nvml_bind(n, &n->uuid, "nvmlDeviceGetUUID") || !nvml_bind(n, &n->utilization, "nvmlDeviceGetUtilizationRates") ||
++        !nvml_bind(n, &n->temperature, "nvmlDeviceGetTemperature") || !nvml_bind(n, &n->power, "nvmlDeviceGetPowerUsage") ||
++        !nvml_bind(n, &n->memory, "nvmlDeviceGetMemoryInfo") || !nvml_bind(n, &n->clock, "nvmlDeviceGetClockInfo")) {
++        nvml_unload(n);
++        return 0;
++    }
++    if ((result = n->init())) {
++        LOG("debug: nvmlInit_v2 failed with %d\n", result);
++        nvml_unload(n);
++        return 0;
++    }
++    n->initialized = 1;
++    if ((result = n->count(&count))) {
++        LOG("debug: nvmlDeviceGetCount_v2 failed with %d\n", result);
++        nvml_unload(n);
++        return 0;
++    }
++    uuid_text(vulkan_uuid, wanted, sizeof wanted);
++    for (unsigned i = 0; i < count; ++i) {
++        NvmlDevice dev;
++        char text[UUID_TEXT_MAX];
++        if (n->handle(i, &dev) || n->uuid(dev, text, sizeof text)) continue;
++        if (same_uuid(text, wanted)) {
++            n->device = dev;
++            return 1;
++        }
++    }
++    LOG("debug: none of the %u NVML devices has the rendering GPU's UUID (%s): the GPU shows as unknown\n", count, wanted);
++    nvml_unload(n);
++    return 0;
++}
++
++static void nvml_poll(const Nvml* n, DebugStats* s) {
++    NvmlUtilization u;
++    NvmlMemory m;
++    unsigned v;
++    if (!n->utilization(n->device, &u)) s->gpu_load = (int)u.gpu;
++    if (!n->temperature(n->device, NVML_TEMPERATURE_GPU, &v)) s->gpu_temp = (int)v;
++    if (!n->power(n->device, &v)) s->gpu_power = (int)((v + 500) / 1000); /* milliwatts */
++    if (!n->memory(n->device, &m)) {
++        s->vram_used_mb = (int)(m.used / MB);
++        s->vram_total_mb = (int)(m.total / MB);
++    }
++    if (!n->clock(n->device, NVML_CLOCK_MEM, &v)) s->vram_clock_mhz = (int)v;
++}
++
++/* ---------------------------------------------------------------- the machine's processor and memory */
++#ifdef _WIN32
++static uint64_t filetime(FILETIME f) { return (uint64_t)f.dwHighDateTime << 32 | f.dwLowDateTime; }
++
++static void system_poll(DebugStats* s) {
++    static uint64_t idle_was, total_was;
++    FILETIME idle, kernel, user;
++    MEMORYSTATUSEX mem = {.dwLength = sizeof mem};
++    if (GetSystemTimes(&idle, &kernel, &user)) {
++        uint64_t i = filetime(idle), total = filetime(kernel) + filetime(user); /* the kernel's time holds the idle */
++        if (total_was && total > total_was) s->cpu_load = (int)(100 - (i - idle_was) * 100 / (total - total_was));
++        idle_was = i;
++        total_was = total;
++    }
++    if (GlobalMemoryStatusEx(&mem)) {
++        s->ram_total_mb = (int)(mem.ullTotalPhys / MB);
++        s->ram_used_mb = (int)((mem.ullTotalPhys - mem.ullAvailPhys) / MB);
++    }
++}
++#else
++static void system_poll(DebugStats* s) { (void)s; }
++#endif
++
++static DebugStats unknown_machine(void) {
++    DebugStats s = {0};
++    s.gpu_load = s.gpu_temp = s.gpu_power = s.vram_used_mb = s.vram_total_mb = s.vram_clock_mhz = -1;
++    s.cpu_load = s.cpu_temp = s.cpu_power = s.ram_used_mb = s.ram_total_mb = s.game_ram_mb = -1;
++    return s;
++}
++
++static void machine_thread(void* arg) {
++    Nvml nvml = {0};
++    uint8_t uuid[UUID_BYTES];
++    int have_nvml, polled = 0;
++    (void)arg;
++    SNX_THREAD_NAME("Debug stats");
++    pm_lock(&g_lock);
++    memcpy(uuid, g_gpu_uuid, sizeof uuid);
++    pm_unlock(&g_lock);
++    have_nvml = nvml_load(&nvml, uuid);
++    for (;;) {
++        if (__atomic_load_n(&g_demand, __ATOMIC_ACQUIRE)) {
++            DebugStats s = unknown_machine();
++            if (have_nvml) nvml_poll(&nvml, &s);
++            system_poll(&s);
++            s.game_ram_mb = (int)(snx_footprint() / MB);
++            pm_lock(&g_lock);
++            g_hw = s;
++            pm_unlock(&g_lock);
++            polled = 1;
++        } else if (polled) { /* closed: the next open starts from unknown, not from the last reading */
++            pm_lock(&g_lock);
++            g_hw = unknown_machine();
++            pm_unlock(&g_lock);
++            polled = 0;
++        }
++        plat_sleep_ns((int64_t)POLL_NS);
++    }
++}
++
++void debug_stats_hardware_demand(const uint8_t* gpu_uuid) {
++    __atomic_store_n(&g_demand, gpu_uuid != NULL, __ATOMIC_RELEASE);
++    if (!gpu_uuid) return;
++    pm_lock(&g_lock);
++    if (!g_thread_tried) {
++        g_thread_tried = 1;
++        g_hw = unknown_machine();
++        memcpy(g_gpu_uuid, gpu_uuid, sizeof g_gpu_uuid);
++        if (plat_thread(machine_thread, NULL, THREAD_STACK)) /* 0 is a thread started */
++            LOG("debug: the thread that reads the machine did not start: the hardware lines show as unknown\n");
++    }
++    pm_unlock(&g_lock);
++}
+diff --git a/src/nx/gpu/vk/debug_stats.h b/src/nx/gpu/vk/debug_stats.h
+new file mode 100644
+index 00000000..05453427
+--- /dev/null
++++ b/src/nx/gpu/vk/debug_stats.h
+@@ -0,0 +1,44 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* What the Debug window shows: the game's frame times and the per-frame costs the renderer sees, and the machine's
++   load, temperature, power and memory. The frame numbers come from the present (renderer.c). The machine's come from
++   a thread that polls once a second, and only while the window is open (debug_stats_hardware_demand). A value
++   that the machine does not tell is -1 */
++#ifndef SNX_DEBUG_STATS_H
++#define SNX_DEBUG_STATS_H
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum { DEBUG_STATS_FRAMES = 120 }; /* the frames the graph keeps */
++
++typedef struct {
++    float frame_ms[DEBUG_STATS_FRAMES]; /* the oldest first */
++    int frame_count;
++    float fps, frame_last_ms, frame_max_ms; /* over the kept frames, -1 with fewer than two */
++    /* means over the last frames, -1 with none */
++    float prep_ms;         /* the time of a present up to the submit: the render thread's cost of showing a frame */
++    float cpu_ms;          /* the process's CPU time, all threads, for each frame */
++    float pipeline_wait_ms; /* the draws' wait for a pipeline that was not ready */
++    float texture_uploads; /* uploads from guest memory for each frame */
++    /* the machine: percent, degrees C, watts, megabytes, megahertz */
++    int gpu_load, gpu_temp, gpu_power;
++    int vram_used_mb, vram_total_mb, vram_clock_mhz;
++    int cpu_load, cpu_temp, cpu_power;
++    int ram_used_mb, ram_total_mb, game_ram_mb;
++} DebugStats;
++
++/* a game's present at now_ns: prep_ns is the time from the start of showing it; the two counters are the renderer's
++   totals so far (vk_pipeline_stats' wait in ms, vk_tex_stats' uploads). Under vk_lock */
++void debug_stats_frame(uint64_t now_ns, uint64_t prep_ns, uint64_t pipeline_wait_ms, uint64_t texture_uploads);
++void debug_stats_get(DebugStats* out); /* any thread */
++/* the window is open (called at every frame it draws): poll the machine once a second. gpu_uuid is the rendering
++   Vulkan device's UUID (16 bytes), which picks the NVIDIA device. NULL when the window is closed: the polling stops */
++void debug_stats_hardware_demand(const uint8_t* gpu_uuid);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/nx/gpu/vk/device.c b/src/nx/gpu/vk/device.c
+index d81eca3d..9c3a5d61 100644
+--- a/src/nx/gpu/vk/device.c
++++ b/src/nx/gpu/vk/device.c
+@@ -592,6 +592,7 @@ static void swapchain_retire(void) {
+     for (u32 i = 0; i < nretired; i++) vkDestroySemaphore(g_vk.dev, retired[i], NULL);
+     nretired = 0;
+     for (u32 i = 0; i < g_vk.sc_count; i++) retired[nretired++] = g_vk.sc_done[i];
++    vk_imgui_swapchain_gone();
+     vk_ui_swapchain_gone();
+     vkDestroySwapchainKHR(g_vk.dev, g_vk.swapchain, NULL);
+     g_vk.swapchain = VK_NULL_HANDLE;
+diff --git a/src/nx/gpu/vk/imgui.c b/src/nx/gpu/vk/imgui.c
+new file mode 100644
+index 00000000..4e253213
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui.c
+@@ -0,0 +1,201 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* Dear ImGui's windows over the presented image (docs/imgui-plan.md). ImGui's backend calls Vulkan directly, so the
++   recording ring is drained first (vk_rec_sync, under vk_lock), and ImGui records into the frame's command buffer in
++   order with the commands queued after it. A frame is drawn only while a window shows. */
++#include <stdio.h>
++#include <string.h>
++#include "nx/gpu/vk/vk.h"
++#include "nx/gpu/vk/imgui_glue.h"
++#include "nx/runtime/main.h"
++#include "nx/runtime/options.h"
++#include "nx/runtime/platform/log.h"
++#include "nx/runtime/platform/overlay.h"
++#include "nx/runtime/platform/ui.h"
++#include "nx/gpu/vk/imgui_input.h"
++#include "nx/runtime/platform/plat.h"
++
++enum { FONT_PX = 18, FONT_PATH_MAX = 1100 };
++static const char LATIN_FONT[] = "fonts/Roboto-Variable.ttf";
++static const char JAPANESE_FONT[] = "fonts/NotoSansJP-Regular.otf";
++
++static u64 g_last_ns;
++/* the box's texts are the sizes that ImguiKeyboard holds */
++_Static_assert(IMGUI_KB_TEXT == OVERLAY_KB_TEXT, "the keyboard's line");
++_Static_assert(sizeof(((ImguiKeyboard*)0)->header) == sizeof(((OverlayKeyboardView*)0)->header), "the keyboard's header");
++_Static_assert(sizeof(((ImguiKeyboard*)0)->sub) == sizeof(((OverlayKeyboardView*)0)->sub), "the keyboard's sub text");
++_Static_assert(sizeof(((ImguiKeyboard*)0)->guide) == sizeof(((OverlayKeyboardView*)0)->guide), "the keyboard's guide");
++_Static_assert(sizeof(((ImguiKeyboard*)0)->ok) == sizeof(((OverlayKeyboardView*)0)->ok), "the keyboard's OK");
++static int g_failed, g_hook_set;
++static int windows_running(void) { return imgui_input_alive(plat_ns()); } /* the backend did not start: not tried again until the swapchain is made again */
++
++static int font_path(char* out, const char* name) {
++    FILE* f;
++    snprintf(out, FONT_PATH_MAX, "%s%s", g_datadir, name);
++    f = fopen(out, "rb");
++    if (!f) return 0;
++    fclose(f);
++    return 1;
++}
++
++/* the rendering device's UUID, asked once: NVML names the same GPU with it */
++static const unsigned char* gpu_uuid(void) {
++    static unsigned char uuid[VK_UUID_SIZE];
++    static int have;
++    if (!have) {
++        VkPhysicalDeviceIDProperties id = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
++        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &id};
++        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
++        memcpy(uuid, id.deviceUUID, sizeof uuid);
++        have = 1;
++    }
++    return uuid;
++}
++
++static int ready(void) {
++    char latin[FONT_PATH_MAX], japanese[FONT_PATH_MAX];
++    int have_latin, have_jp;
++    ImguiGlueInit in;
++    if (!g_hook_set) { /* the hook is the same for the whole run: set once, before the first window frame */
++        overlay_keyboard_external_set(windows_running);
++        g_hook_set = 1;
++    }
++    if (g_failed) return 0;
++    if (imgui_glue_ready()) return 1;
++    have_latin = font_path(latin, LATIN_FONT);
++    have_jp = have_latin && font_path(japanese, JAPANESE_FONT);
++    in = (ImguiGlueInit){.instance = g_vk.instance,
++                         .phys = g_vk.phys,
++                         .dev = g_vk.dev,
++                         .family = g_vk.gfx_family,
++                         .queue = g_vk.gfx,
++                         .image_count = g_vk.sc_count > VK_FRAMES ? g_vk.sc_count : VK_FRAMES,
++                         .format = g_vk.sc_format,
++                         .latin_font = have_latin ? latin : NULL,
++                         .japanese_font = have_jp ? japanese : NULL,
++                         .font_px = FONT_PX};
++    if (!have_latin) LOG("imgui: %s is missing in the data folder, the built-in font is used\n", LATIN_FONT);
++    g_failed = !imgui_glue_init(&in);
++    if (g_failed) LOG("imgui: the Vulkan backend did not start\n");
++    return !g_failed;
++}
++
++/* a barrier straight into cb, in order with the commands that the drain has recorded */
++static void image_barrier(VkCommandBuffer cb, VkImage img, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
++                          VkImageLayout from, VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access,
++                          VkImageLayout to) {
++    VkImageMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
++                               .srcStageMask = src_stage,
++                               .srcAccessMask = src_access,
++                               .dstStageMask = dst_stage,
++                               .dstAccessMask = dst_access,
++                               .oldLayout = from,
++                               .newLayout = to,
++                               .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                               .image = img,
++                               .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
++    VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1,
++                          .pImageMemoryBarriers = &b};
++    vkCmdPipelineBarrier2(cb, &d);
++}
++
++/* the game's keyboard box into the frame: its state, under ui_lock (vk_lock then ui_lock, as vk_ui_draw takes them) */
++static void keyboard_view(ImguiKeyboard* k) {
++    OverlayKeyboardView v;
++    ui_lock();
++    k->shown = overlay_keyboard_view(&v);
++    ui_unlock();
++    if (!k->shown) return;
++    k->ticket = v.ticket;
++    k->units = v.units;
++    k->min = v.min;
++    k->max = v.max;
++    k->password = v.password;
++    k->numbers = v.numbers;
++    memcpy(k->header, v.header, sizeof k->header);
++    memcpy(k->sub, v.sub, sizeof k->sub);
++    memcpy(k->guide, v.guide, sizeof k->guide);
++    memcpy(k->ok, v.ok, sizeof k->ok);
++    memcpy(k->text, v.text, sizeof k->text);
++    k->pad_answer = v.pad_answer == OVERLAY_KEY_ENTER ? IMGUI_KB_ENTER : v.pad_answer == OVERLAY_KEY_CANCEL ? IMGUI_KB_CANCEL : IMGUI_KB_NONE;
++}
++
++/* what the window answered, for the request that it showed: the line, then the key. The box takes it only while that
++   request is still its own (overlay_keyboard_apply checks the ticket under ui_lock) */
++static void keyboard_answer(const ImguiKeyboard* k) {
++    int key = k->answer == IMGUI_KB_ENTER ? OVERLAY_KEY_ENTER : k->answer == IMGUI_KB_CANCEL ? OVERLAY_KEY_CANCEL : -1;
++    if (!k->shown || (!k->text_changed && key < 0)) return;
++    ui_lock();
++    overlay_keyboard_apply(k->ticket, k->text_changed ? k->text : NULL, key);
++    ui_unlock();
++}
++
++void vk_imgui_swapchain_gone(void) {
++    imgui_glue_shutdown();
++    g_failed = 0;
++}
++
++void vk_imgui_draw(VkCommandBuffer cb, VkImage sc, u32 game_w, u32 game_h) {
++    u64 now = plat_ns();
++    float dt = g_last_ns ? (float)((double)(now - g_last_ns) * 1e-9) : 0;
++    VkImageView view;
++    static ImguiFrame frame; /* the keyboard's texts make it big */
++    char limit[16];
++    int drawn;
++    if (!__atomic_load_n(&g_settings.imgui, __ATOMIC_RELAXED)) {
++        g_last_ns = 0;
++        if (imgui_glue_ready()) imgui_glue_unwanted();
++        return;
++    }
++    g_last_ns = now;
++    if (!ready() || !(view = vk_ui_swapchain_view(sc))) return;
++    fps_limit_text(g_opt_fps, limit, sizeof limit);
++    frame = (ImguiFrame){0};
++    keyboard_view(&frame.kb);
++    frame.w = (float)g_vk.sc_extent.width;
++    frame.h = (float)g_vk.sc_extent.height;
++    frame.dt = dt;
++    frame.open_test = __atomic_load_n(&g_settings.imgui_test, __ATOMIC_RELAXED);
++    frame.window_w = g_vk.sc_win_w;
++    frame.window_h = g_vk.sc_win_h;
++    frame.game_w = (int)game_w;
++    frame.game_h = (int)game_h;
++    frame.vsync = __atomic_load_n(&g_settings.vsync, __ATOMIC_RELAXED);
++    frame.fps_limit = limit;
++    frame.gpu_uuid = gpu_uuid();
++    drawn = imgui_glue_frame(&frame);
++    if (imgui_glue_vk_failed()) { /* the backend stays until the swapchain goes: frames may still use it */
++        g_failed = 1;
++        LOG("imgui: the Vulkan backend reported an error, the windows are off\n");
++        imgui_glue_unwanted();
++        return;
++    }
++    imgui_input_alive_set(now);
++    keyboard_answer(&frame.kb);
++    if (!drawn) return; /* nothing shows: no drain, no pass */
++    vk_rec_sync();
++    image_barrier(cb, sc, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
++                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
++                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++    {
++        VkRenderingAttachmentInfo at = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
++                                        .imageView = view,
++                                        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                                        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
++                                        .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
++        VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
++                              .renderArea = {{0, 0}, g_vk.sc_extent},
++                              .layerCount = 1,
++                              .colorAttachmentCount = 1,
++                              .pColorAttachments = &at};
++        vkCmdBeginRendering(cb, &ri);
++        imgui_glue_record(cb);
++        vkCmdEndRendering(cb);
++    }
++    vk_render_forget_state(); /* ImGui bound its own pipeline and buffers */
++    image_barrier(cb, sc, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
++                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
++                  VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++}
+diff --git a/src/nx/gpu/vk/imgui_events.cpp b/src/nx/gpu/vk/imgui_events.cpp
+new file mode 100644
+index 00000000..0f0d009f
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_events.cpp
+@@ -0,0 +1,100 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++#include "nx/gpu/vk/imgui_events.h"
++#include <cfloat>
++#include <SDL3/SDL_keycode.h>
++#include <SDL3/SDL_mouse.h>
++#include "imgui.h"
++#include "nx/gpu/vk/imgui_input.h"
++
++namespace {
++constexpr float NO_MOUSE_BELOW = -1.0e8f; /* a position under this is "no mouse" (imgui_input.h) */
++ImVec2 g_ime_pos;
++float g_ime_height;
++
++/* called at the end of a frame, when a text field is active: where its cursor is */
++void set_ime_data(ImGuiContext*, ImGuiViewport*, ImGuiPlatformImeData* data) {
++    g_ime_pos = data->InputPos;
++    g_ime_height = data->InputLineHeight;
++}
++
++ImGuiKey map_key(int key) {
++    if (key >= SDLK_A && key <= SDLK_Z) return (ImGuiKey)(ImGuiKey_A + (key - SDLK_A));
++    if (key >= SDLK_0 && key <= SDLK_9) return (ImGuiKey)(ImGuiKey_0 + (key - SDLK_0));
++    if (key >= SDLK_F1 && key <= SDLK_F12) return (ImGuiKey)(ImGuiKey_F1 + (key - SDLK_F1));
++    switch (key) {
++        case SDLK_TAB: return ImGuiKey_Tab;
++        case SDLK_LEFT: return ImGuiKey_LeftArrow;
++        case SDLK_RIGHT: return ImGuiKey_RightArrow;
++        case SDLK_UP: return ImGuiKey_UpArrow;
++        case SDLK_DOWN: return ImGuiKey_DownArrow;
++        case SDLK_PAGEUP: return ImGuiKey_PageUp;
++        case SDLK_PAGEDOWN: return ImGuiKey_PageDown;
++        case SDLK_HOME: return ImGuiKey_Home;
++        case SDLK_END: return ImGuiKey_End;
++        case SDLK_INSERT: return ImGuiKey_Insert;
++        case SDLK_DELETE: return ImGuiKey_Delete;
++        case SDLK_BACKSPACE: return ImGuiKey_Backspace;
++        case SDLK_SPACE: return ImGuiKey_Space;
++        case SDLK_RETURN: return ImGuiKey_Enter;
++        case SDLK_ESCAPE: return ImGuiKey_Escape;
++        case SDLK_KP_ENTER: return ImGuiKey_KeypadEnter;
++        default: return ImGuiKey_None;
++    }
++}
++
++int map_button(int sdl_button) {
++    switch (sdl_button) {
++        case SDL_BUTTON_LEFT: return 0;
++        case SDL_BUTTON_RIGHT: return 1;
++        case SDL_BUTTON_MIDDLE: return 2;
++        default: return -1;
++    }
++}
++
++void feed_key(ImGuiIO& io, const ImguiEvent& e) {
++    io.AddKeyEvent(ImGuiMod_Ctrl, (e.mods & SDL_KMOD_CTRL) != 0);
++    io.AddKeyEvent(ImGuiMod_Shift, (e.mods & SDL_KMOD_SHIFT) != 0);
++    io.AddKeyEvent(ImGuiMod_Alt, (e.mods & SDL_KMOD_ALT) != 0);
++    io.AddKeyEvent(ImGuiMod_Super, (e.mods & SDL_KMOD_GUI) != 0);
++    ImGuiKey key = map_key(e.key);
++    if (key != ImGuiKey_None) io.AddKeyEvent(key, e.down != 0);
++}
++} // namespace
++
++void imgui_events_init(void) { ImGui::GetPlatformIO().Platform_SetImeDataFn = set_ime_data; }
++
++void imgui_events_feed(void) {
++    ImGuiIO& io = ImGui::GetIO();
++    ImguiEvent e;
++    while (imgui_input_pop(&e)) {
++        switch (e.type) {
++            case IMGUI_EV_MOUSE_POS:
++                if (e.x < NO_MOUSE_BELOW)
++                    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
++                else
++                    io.AddMousePosEvent(e.x, e.y);
++                break;
++            case IMGUI_EV_MOUSE_BUTTON:
++                if (map_button(e.button) >= 0) io.AddMouseButtonEvent(map_button(e.button), e.down != 0);
++                break;
++            case IMGUI_EV_WHEEL: io.AddMouseWheelEvent(e.x, e.y); break;
++            case IMGUI_EV_KEY: feed_key(io, e); break;
++            case IMGUI_EV_TEXT: io.AddInputCharactersUTF8(e.text); break;
++            case IMGUI_EV_FOCUS: io.AddFocusEvent(false); break;
++        }
++    }
++}
++
++void imgui_events_publish(bool menu_visible) {
++    ImGuiIO& io = ImGui::GetIO();
++    ImguiWants w;
++    w.mouse = io.WantCaptureMouse;
++    w.keyboard = io.WantCaptureKeyboard;
++    w.text = io.WantTextInput;
++    w.release = io.WantCaptureMouse || menu_visible;
++    w.ime_x = (int)g_ime_pos.x;
++    w.ime_y = (int)g_ime_pos.y;
++    w.ime_h = (int)g_ime_height;
++    imgui_input_publish(&w);
++}
+diff --git a/src/nx/gpu/vk/imgui_events.h b/src/nx/gpu/vk/imgui_events.h
+new file mode 100644
+index 00000000..6b09fb0c
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_events.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The window's input events (imgui_input.h) into the current ImGui context. Under vk_lock, before NewFrame */
++#ifndef SNX_IMGUI_EVENTS_H
++#define SNX_IMGUI_EVENTS_H
++
++/* the context's platform hooks (the input method's place) */
++void imgui_events_init(void);
++/* every queued event into the context's input */
++void imgui_events_feed(void);
++/* what the windows want, from the frame just begun, for the main thread (imgui_input_publish). menu_visible: the menu
++   bar shows, which also lets go of the cursor */
++void imgui_events_publish(bool menu_visible);
++
++#endif
+diff --git a/src/nx/gpu/vk/imgui_glue.cpp b/src/nx/gpu/vk/imgui_glue.cpp
+new file mode 100644
+index 00000000..89e2ce31
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_glue.cpp
+@@ -0,0 +1,114 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The ImGui context, its fonts and its Vulkan backend (imgui_glue.h) */
++#define IMGUI_IMPL_VULKAN_USE_VOLK
++#include "nx/gpu/vk/imgui_glue.h"
++#include "imgui.h"
++#include "imgui_impl_vulkan.h"
++#include "nx/gpu/vk/imgui_events.h"
++#include "nx/gpu/vk/imgui_input.h"
++#include "nx/gpu/vk/imgui_style.h"
++#include "nx/gpu/vk/imgui_ui.h"
++
++namespace {
++constexpr uint32_t TEXTURE_SLOTS = 16; /* sampler descriptors: the font atlas and a few more images */
++bool g_ready;
++bool g_vk_failed; /* the backend got an error result: set on the frame's thread, under vk_lock */
++ImGuiContext* g_ctx;
++
++void check_vk_result(VkResult r) {
++    if (r < 0) g_vk_failed = true;
++}
++
++bool add_fonts(const ImguiGlueInit* in) {
++    ImGuiIO& io = ImGui::GetIO();
++    if (!in->latin_font) return true;
++    if (!io.Fonts->AddFontFromFileTTF(in->latin_font, in->font_px)) return false;
++    if (in->japanese_font) {
++        ImFontConfig merge;
++        merge.MergeMode = true;
++        if (!io.Fonts->AddFontFromFileTTF(in->japanese_font, in->font_px, &merge)) return false;
++    }
++    return true;
++}
++} // namespace
++
++extern "C" int imgui_glue_init(const ImguiGlueInit* in) {
++    if (g_ready) return 1;
++    IMGUI_CHECKVERSION();
++    g_ctx = ImGui::CreateContext();
++    ImGuiIO& io = ImGui::GetIO();
++    io.IniFilename = nullptr;
++    io.LogFilename = nullptr;
++    imgui_style_apply();
++    imgui_events_init();
++    if (!add_fonts(in)) { /* a font that cannot be read leaves the built-in one */
++        ImGui::DestroyContext(g_ctx);
++        g_ctx = ImGui::CreateContext();
++        ImGui::GetIO().IniFilename = nullptr;
++        ImGui::GetIO().LogFilename = nullptr;
++        imgui_style_apply();
++        imgui_events_init();
++    }
++    ImGui_ImplVulkan_InitInfo vi = {};
++    vi.ApiVersion = VK_API_VERSION_1_3;
++    vi.Instance = in->instance;
++    vi.PhysicalDevice = in->phys;
++    vi.Device = in->dev;
++    vi.QueueFamily = in->family;
++    vi.Queue = in->queue;
++    vi.DescriptorPoolSize = TEXTURE_SLOTS;
++    vi.MinImageCount = 2;
++    vi.ImageCount = in->image_count < 2 ? 2 : in->image_count;
++    vi.UseDynamicRendering = true;
++    vi.CheckVkResultFn = check_vk_result;
++    vi.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
++    vi.PipelineInfoMain.PipelineRenderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
++    vi.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
++    vi.PipelineInfoMain.PipelineRenderingCreateInfo.pColorAttachmentFormats = &in->format;
++    if (!ImGui_ImplVulkan_Init(&vi)) {
++        ImGui::DestroyContext(g_ctx);
++        g_ctx = nullptr;
++        return 0;
++    }
++    g_vk_failed = false;
++    g_ready = true;
++    return 1;
++}
++
++extern "C" void imgui_glue_shutdown(void) {
++    if (!g_ready) return;
++    imgui_ui_reset();
++    ImGui_ImplVulkan_Shutdown();
++    ImGui::DestroyContext(g_ctx);
++    g_ctx = nullptr;
++    g_ready = false;
++}
++
++extern "C" int imgui_glue_ready(void) { return g_ready; }
++
++extern "C" int imgui_glue_vk_failed(void) { return g_vk_failed; }
++
++extern "C" int imgui_glue_frame(ImguiFrame* f) {
++    if (!g_ready) return 0;
++    ImGuiIO& io = ImGui::GetIO();
++    io.DisplaySize = ImVec2(f->w, f->h);
++    io.DeltaTime = f->dt > 0 ? f->dt : 1.0f / 60;
++    imgui_events_feed();
++    ImGui_ImplVulkan_NewFrame();
++    ImGui::NewFrame();
++    bool menu = imgui_ui_draw(f);
++    ImGui::Render(); /* the end of the frame: the IME callback has run */
++    imgui_events_publish(menu);
++    return ImGui::GetDrawData()->TotalVtxCount > 0;
++}
++
++extern "C" void imgui_glue_unwanted(void) {
++    imgui_ui_reset();
++    ImguiWants none = {};
++    imgui_input_publish(&none);
++}
++
++extern "C" void imgui_glue_record(VkCommandBuffer cb) {
++    if (g_ready) ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), cb);
++}
+diff --git a/src/nx/gpu/vk/imgui_glue.h b/src/nx/gpu/vk/imgui_glue.h
+new file mode 100644
+index 00000000..709d8138
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_glue.h
+@@ -0,0 +1,68 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* Dear ImGui's windows over the game. imgui_glue.cpp is the only C++ here: it holds the ImGui context and its Vulkan
++   backend, and takes and gives plain Vulkan handles. imgui.c decides when a frame is drawn and records it (the lock
++   and the recording thread are described there). Every function is called under vk_lock, so the context has one
++   user at a time */
++#ifndef SNX_IMGUI_GLUE_H
++#define SNX_IMGUI_GLUE_H
++#include <stdint.h>
++#include "volk.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct {
++    VkInstance instance;
++    VkPhysicalDevice phys;
++    VkDevice dev;
++    uint32_t family;
++    VkQueue queue;
++    uint32_t image_count; /* the buffers of the backend: at least the frames in flight */
++    VkFormat format;      /* of the images drawn on */
++    const char* latin_font;    /* a TTF file, NULL for ImGui's own font */
++    const char* japanese_font; /* merged into the first, NULL for none */
++    float font_px;
++} ImguiGlueInit;
++
++int imgui_glue_init(const ImguiGlueInit* in); /* 1 when ready */
++void imgui_glue_shutdown(void);               /* the device is idle */
++int imgui_glue_ready(void);
++int imgui_glue_vk_failed(void); /* the backend got a Vulkan error since init: the caller shuts it down */
++/* one frame for a picture w x h, dt seconds after the last one. open_test is the test window's first state. Returns 1
++   when there is something to draw */
++/* the game's keyboard box, as the window shows it (overlay.h's OverlayKeyboardView) and what the window answers. The
++   sizes are those of the box's texts */
++enum { IMGUI_KB_HEADER = 193, IMGUI_KB_SUB = 385, IMGUI_KB_GUIDE = 769, IMGUI_KB_OK = 25, IMGUI_KB_TEXT = 3073 };
++enum { IMGUI_KB_NONE, IMGUI_KB_ENTER, IMGUI_KB_CANCEL };
++typedef struct {
++    int shown;
++    unsigned ticket, units, min, max;
++    int password, numbers;
++    char header[IMGUI_KB_HEADER], sub[IMGUI_KB_SUB], guide[IMGUI_KB_GUIDE], ok[IMGUI_KB_OK];
++    char text[IMGUI_KB_TEXT]; /* in: the box's line. out: the window's, when text_changed */
++    int pad_answer;           /* in: a controller's A or B (IMGUI_KB_ENTER or IMGUI_KB_CANCEL), not yet answered */
++    int text_changed, answer; /* out: the line to take, and IMGUI_KB_ENTER or IMGUI_KB_CANCEL */
++} ImguiKeyboard;
++typedef struct {
++    float w, h, dt;
++    int open_test;
++    /* what the Debug window reports of the display and the game */
++    int window_w, window_h;
++    int game_w, game_h;     /* the game's picture, as the renderer makes it: the console's size times the render scale */
++    int vsync;
++    const char* fps_limit;  /* the setting's text: game, 0 or a number */
++    const unsigned char* gpu_uuid; /* the rendering device: 16 bytes */
++    ImguiKeyboard kb;
++} ImguiFrame;
++int imgui_glue_frame(ImguiFrame* f); /* the keyboard's answer goes in f->kb */
++void imgui_glue_unwanted(void); /* the windows are off: they want no input */
++/* the frame's draw data into cb, inside a rendering scope on the picture. A new texture is uploaded first, on the
++   queue, which the caller keeps idle for it (vk_rec_sync) */
++void imgui_glue_record(VkCommandBuffer cb);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/nx/gpu/vk/imgui_input.c b/src/nx/gpu/vk/imgui_input.c
+new file mode 100644
+index 00000000..818092a3
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_input.c
+@@ -0,0 +1,80 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++#include "nx/gpu/vk/imgui_input.h"
++#include "common/filesystem/host.h"
++
++enum { QUEUE_MAX = 4096 }; /* the frame pops them: a stalled frame (a loading interval) keeps what the player pressed */
++static ImguiEvent g_queue[QUEUE_MAX];
++static int g_head, g_count;
++static PMutex g_lock = PMUTEX_INIT;
++static int g_wants_mouse, g_wants_keyboard, g_wants_text, g_wants_release, g_ime_x, g_ime_y, g_ime_h;
++
++static ImguiEvent* at(int i) { return &g_queue[(g_head + i) % QUEUE_MAX]; }
++
++/* a position or a wheel step can be merged or lost, a button, a key, a text or a focus change cannot */
++static int is_motion(const ImguiEvent* e) { return e->type == IMGUI_EV_MOUSE_POS || e->type == IMGUI_EV_WHEEL; }
++
++/* makes room by removing the oldest motion event: 1 when there is room now */
++static int evict_motion(void) {
++    for (int i = 0; i < g_count; ++i) {
++        if (!is_motion(at(i))) continue;
++        for (int j = i; j + 1 < g_count; ++j) *at(j) = *at(j + 1);
++        --g_count;
++        return 1;
++    }
++    return 0;
++}
++
++void imgui_input_push(const ImguiEvent* e) {
++    pm_lock(&g_lock);
++    ImguiEvent* tail = g_count ? at(g_count - 1) : NULL;
++    if (tail && e->type == IMGUI_EV_MOUSE_POS && tail->type == IMGUI_EV_MOUSE_POS) {
++        *tail = *e; /* only the last place matters */
++    } else if (tail && e->type == IMGUI_EV_WHEEL && tail->type == IMGUI_EV_WHEEL) {
++        tail->x += e->x;
++        tail->y += e->y;
++    } else if (g_count < QUEUE_MAX || evict_motion()) {
++        *at(g_count) = *e;
++        ++g_count;
++    } /* else the queue holds only transitions: the frame has not run for thousands of them */
++    pm_unlock(&g_lock);
++}
++
++int imgui_input_pop(ImguiEvent* e) {
++    int have = 0;
++    pm_lock(&g_lock);
++    if (g_count) {
++        *e = g_queue[g_head];
++        g_head = (g_head + 1) % QUEUE_MAX;
++        --g_count;
++        have = 1;
++    }
++    pm_unlock(&g_lock);
++    return have;
++}
++
++static uint64_t g_alive_ns;
++enum { ALIVE_MS = 500 }; /* a frame this recent: the windows run */
++void imgui_input_alive_set(uint64_t now_ns) { __atomic_store_n(&g_alive_ns, now_ns, __ATOMIC_RELAXED); }
++int imgui_input_alive(uint64_t now_ns) {
++    uint64_t last = __atomic_load_n(&g_alive_ns, __ATOMIC_RELAXED);
++    return last && now_ns - last < (uint64_t)ALIVE_MS * 1000000u;
++}
++
++void imgui_input_publish(const ImguiWants* w) {
++    __atomic_store_n(&g_wants_mouse, w->mouse, __ATOMIC_RELAXED);
++    __atomic_store_n(&g_wants_keyboard, w->keyboard, __ATOMIC_RELAXED);
++    __atomic_store_n(&g_wants_text, w->text, __ATOMIC_RELAXED);
++    __atomic_store_n(&g_wants_release, w->release, __ATOMIC_RELAXED);
++    __atomic_store_n(&g_ime_x, w->ime_x, __ATOMIC_RELAXED);
++    __atomic_store_n(&g_ime_y, w->ime_y, __ATOMIC_RELAXED);
++    __atomic_store_n(&g_ime_h, w->ime_h, __ATOMIC_RELAXED);
++}
++
++ImguiWants imgui_input_wants(void) {
++    ImguiWants w = {__atomic_load_n(&g_wants_mouse, __ATOMIC_RELAXED), __atomic_load_n(&g_wants_keyboard, __ATOMIC_RELAXED),
++                    __atomic_load_n(&g_wants_text, __ATOMIC_RELAXED), __atomic_load_n(&g_wants_release, __ATOMIC_RELAXED),
++                    __atomic_load_n(&g_ime_x, __ATOMIC_RELAXED), __atomic_load_n(&g_ime_y, __ATOMIC_RELAXED),
++                    __atomic_load_n(&g_ime_h, __ATOMIC_RELAXED)};
++    return w;
++}
+diff --git a/src/nx/gpu/vk/imgui_input.h b/src/nx/gpu/vk/imgui_input.h
+new file mode 100644
+index 00000000..ae2baba2
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_input.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The input of the ImGui windows. The main thread polls the window's events (runtime/platform/backend/imgui_sdl.c)
++   and pushes them here. The ImGui context belongs to whoever holds vk_lock, which pops them at the start of its frame.
++   The other way, the frame publishes what the windows want, and the main thread reads it with no lock. The queue has
++   its own mutex, which is a leaf: nothing else is taken while it is held */
++#ifndef SNX_IMGUI_INPUT_H
++#define SNX_IMGUI_INPUT_H
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++enum { IMGUI_EV_MOUSE_POS, IMGUI_EV_MOUSE_BUTTON, IMGUI_EV_WHEEL, IMGUI_EV_KEY, IMGUI_EV_TEXT, IMGUI_EV_FOCUS };
++enum { IMGUI_TEXT_MAX = 32 };
++/* an SDL button number (1 left, 2 middle, 3 right) in button; a key as the SDL keycode and the SDL modifier mask */
++typedef struct {
++    int type;
++    float x, y; /* a position in pixels of the picture, or the wheel's steps. -1e9 for no mouse */
++    int button, down, key, mods;
++    char text[IMGUI_TEXT_MAX];
++} ImguiEvent;
++
++void imgui_input_push(const ImguiEvent* e); /* any thread; motion is merged and goes first when full, the rest stays */
++int imgui_input_pop(ImguiEvent* e);         /* the context's owner: 1 with the oldest event, 0 when empty */
++
++/* what the windows want, set by the frame and read by the main thread */
++typedef struct {
++    int mouse;    /* the cursor is over a window, or a widget holds the mouse: the game does not get it */
++    int keyboard; /* a widget has the keyboard: the game does not get keys */
++    int text;     /* a text field is active: the window's text input is on */
++    int release;  /* the game's mouse look lets go of the cursor */
++    /* where an input method puts its window: the text cursor, in pixels of the picture, and its line's height */
++    int ime_x, ime_y, ime_h;
++} ImguiWants;
++/* the windows are running: the frame says so at each present, and a part that would otherwise draw a thing the player
++   needs (the keyboard's box) leaves it to them while they are, so that a window that failed to start leaves it here */
++void imgui_input_alive_set(uint64_t now_ns);
++int imgui_input_alive(uint64_t now_ns);
++void imgui_input_publish(const ImguiWants* w);
++ImguiWants imgui_input_wants(void);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/src/nx/gpu/vk/imgui_style.cpp b/src/nx/gpu/vk/imgui_style.cpp
+new file mode 100644
+index 00000000..ae46abf8
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_style.cpp
+@@ -0,0 +1,51 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The theme of the ImGui windows (imgui_style.h) */
++#include "nx/gpu/vk/imgui_style.h"
++#include "imgui.h"
++
++namespace {
++constexpr ImVec4 ACCENT = {0x46 / 255.0f, 0x47 / 255.0f, 0x8B / 255.0f, 1.0f};
++constexpr float WINDOW_ALPHA = 0.94f; /* the whole window: its background, text and widgets */
++constexpr float WINDOW_ROUNDING = 8.0f, WIDGET_ROUNDING = 5.0f, POPUP_ROUNDING = 6.0f, SCROLLBAR_ROUNDING = 9.0f;
++/* the blue of ImGui's dark theme has this blue channel at its brightest, and the others are shades of it */
++constexpr float DEFAULT_BLUE_PEAK = 0.98f;
++constexpr float PRESSED_LIGHTEN = 0.25f; /* a pressed widget is its accent moved this far toward white */
++
++const ImGuiCol PRESSED[] = {ImGuiCol_FrameBgActive,   ImGuiCol_SliderGrabActive, ImGuiCol_ButtonActive,
++                            ImGuiCol_HeaderActive,    ImGuiCol_SeparatorActive,  ImGuiCol_ResizeGripActive};
++
++/* a colour of ImGui's dark theme is its blue when the blue channel is clearly the strongest: at least this bright, and
++   this far over the red and over the green. The greys and the other hues of the theme fail one of the three */
++constexpr float BLUE_MIN = 0.4f, BLUE_OVER_RED = 0.2f, BLUE_OVER_GREEN = 0.15f;
++
++bool is_default_blue(const ImVec4& c) { return c.z > BLUE_MIN && c.z > c.x + BLUE_OVER_RED && c.z > c.y + BLUE_OVER_GREEN; }
++
++/* the accent at the brightness that the default blue c has, with c's alpha */
++ImVec4 accent_like(const ImVec4& c) {
++    float k = c.z / DEFAULT_BLUE_PEAK;
++    return ImVec4(ACCENT.x * k, ACCENT.y * k, ACCENT.z * k, c.w);
++}
++
++ImVec4 lighten(const ImVec4& c, float amount) {
++    return ImVec4(c.x + (1.0f - c.x) * amount, c.y + (1.0f - c.y) * amount, c.z + (1.0f - c.z) * amount, c.w);
++}
++} // namespace
++
++void imgui_style_apply(void) {
++    ImGuiStyle& style = ImGui::GetStyle();
++    ImGui::StyleColorsDark(&style);
++    for (int i = 0; i < ImGuiCol_COUNT; ++i)
++        if (is_default_blue(style.Colors[i])) style.Colors[i] = accent_like(style.Colors[i]);
++    for (ImGuiCol i : PRESSED) style.Colors[i] = lighten(style.Colors[i], PRESSED_LIGHTEN);
++    style.Alpha = WINDOW_ALPHA;
++    style.Colors[ImGuiCol_WindowBg].w = 1.0f; /* Style.Alpha already makes it translucent */
++    style.Colors[ImGuiCol_PopupBg].w = 1.0f;
++    style.WindowRounding = WINDOW_ROUNDING;
++    style.ChildRounding = WIDGET_ROUNDING;
++    style.FrameRounding = WIDGET_ROUNDING;
++    style.GrabRounding = WIDGET_ROUNDING;
++    style.TabRounding = WIDGET_ROUNDING;
++    style.PopupRounding = POPUP_ROUNDING;
++    style.ScrollbarRounding = SCROLLBAR_ROUNDING;
++}
+diff --git a/src/nx/gpu/vk/imgui_style.h b/src/nx/gpu/vk/imgui_style.h
+new file mode 100644
+index 00000000..b0f7ec80
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_style.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The look of the ImGui windows: ImGui's dark colors with every blue replaced by the accent #46478B, rounded corners,
++   and an alpha of 0.94 on the whole window. It acts on the current context's style */
++#ifndef SNX_IMGUI_STYLE_H
++#define SNX_IMGUI_STYLE_H
++
++void imgui_style_apply(void);
++
++#endif
+diff --git a/src/nx/gpu/vk/imgui_ui.cpp b/src/nx/gpu/vk/imgui_ui.cpp
+new file mode 100644
+index 00000000..54cd5663
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_ui.cpp
+@@ -0,0 +1,337 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++#include "nx/gpu/vk/imgui_ui.h"
++#include <cfloat>
++#include <cstdio>
++#include <cstring>
++#include "imgui.h"
++#include "nx/gpu/vk/debug_stats.h"
++
++namespace {
++constexpr float BAR_TRIGGER_PX = 24.0f; /* the cursor this close to the top of the picture shows the bar */
++bool g_bar_shown;
++bool g_show_test;
++bool g_show_debug;
++constexpr float DEBUG_WIDTH = 380.0f, DEBUG_HEIGHT = 520.0f, DEBUG_MIN_WIDTH = 300.0f, DEBUG_MIN_HEIGHT = 200.0f;
++constexpr float GRAPH_HEIGHT = 56.0f, GRAPH_TOP_MS = 50.0f;
++constexpr float MB_PER_GB = 1024.0f;
++int g_open_test_was = -1;
++
++bool menu_open_anywhere() {
++    return ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
++}
++
++/* shows from the top edge, and stays while the cursor is on the bar or a menu is open */
++bool bar_wanted() {
++    const ImGuiIO& io = ImGui::GetIO();
++    bool at_top = io.MousePos.x > -FLT_MAX / 2 && io.MousePos.y >= 0 && io.MousePos.y < BAR_TRIGGER_PX;
++    bool on_bar = g_bar_shown && io.MousePos.x > -FLT_MAX / 2 && io.MousePos.y >= 0 && io.MousePos.y < ImGui::GetFrameHeight();
++    return at_top || on_bar || menu_open_anywhere();
++}
++
++void unavailable(const char* what) {
++    ImGui::BeginDisabled();
++    ImGui::MenuItem(what);
++    ImGui::EndDisabled();
++}
++
++void menu_bar() {
++    if (ImGui::BeginMenu("About")) {
++        ImGui::TextUnformatted("NXAevora");
++        ImGui::EndMenu();
++    }
++    if (ImGui::BeginMenu("Settings")) {
++        unavailable("Not available yet");
++        ImGui::EndMenu();
++    }
++    if (ImGui::BeginMenu("Mods")) {
++        unavailable("Not available yet");
++        ImGui::EndMenu();
++    }
++    if (ImGui::BeginMenu("Cheats")) {
++        unavailable("Not available yet");
++        ImGui::EndMenu();
++    }
++    if (ImGui::BeginMenu("Debug")) {
++        ImGui::MenuItem("Debug window", nullptr, &g_show_debug);
++        ImGui::MenuItem("Test window", nullptr, &g_show_test);
++        ImGui::EndMenu();
++    }
++}
++
++void test_window(float dt) {
++    ImGui::SetNextWindowPos(ImVec2(40, 60), ImGuiCond_FirstUseEver);
++    if (!ImGui::Begin("Dear ImGui test", &g_show_test)) {
++        ImGui::End();
++        return;
++    }
++    static bool checked = true;
++    static float value = 0.6f;
++    ImGui::Text("Backend check: Roboto and Noto Sans JP");
++    ImGui::Text("\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE8\xA1\xA8\xE7\xA4\xBA\xE3\x83\x86\xE3\x82\xB9\xE3\x83\x88"); /* Japanese text, UTF-8 */
++    ImGui::Text("%.1f FPS, %.2f ms", ImGui::GetIO().Framerate, dt * 1000.0f);
++    ImGui::Checkbox("Theme check", &checked);
++    ImGui::SliderFloat("Value", &value, 0.0f, 1.0f);
++    ImGui::Button("Button");
++    ImGui::End();
++}
++
++/* a value that the machine did not tell is -1 and shows as ? */
++void number(char* out, size_t n, const char* format, float v, bool tenths = false) {
++    if (v < 0)
++        snprintf(out, n, "?");
++    else if (tenths)
++        snprintf(out, n, format, v);
++    else
++        snprintf(out, n, format, (int)(v + 0.5f));
++}
++
++void row(const char* label, const char* value) {
++    ImGui::TableNextRow();
++    ImGui::TableNextColumn();
++    ImGui::TextUnformatted(label);
++    ImGui::TableNextColumn();
++    ImGui::TextUnformatted(value);
++}
++
++void hardware_lines(const DebugStats& s) {
++    char a[24], b[24], c[24], line[96];
++    number(a, sizeof a, "%d%%", (float)s.gpu_load);
++    number(b, sizeof b, "%d\xC2\xB0" "C", (float)s.gpu_temp);
++    number(c, sizeof c, "%dW", (float)s.gpu_power);
++    snprintf(line, sizeof line, "GPU:   %s   %s   %s", a, b, c);
++    ImGui::TextUnformatted(line);
++    char used[24], total[24], clock[24];
++    number(used, sizeof used, "%.1fGB", s.vram_used_mb < 0 ? -1.0f : s.vram_used_mb / MB_PER_GB, true);
++    number(total, sizeof total, "%.1fGB", s.vram_total_mb < 0 ? -1.0f : s.vram_total_mb / MB_PER_GB, true);
++    number(clock, sizeof clock, "%dMHz", (float)s.vram_clock_mhz);
++    snprintf(line, sizeof line, "VRAM:  %s  /%s  %s", used, total, clock);
++    ImGui::TextUnformatted(line);
++    number(a, sizeof a, "%d%%", (float)s.cpu_load);
++    number(b, sizeof b, "%d\xC2\xB0" "C", (float)s.cpu_temp);
++    number(c, sizeof c, "%dW", (float)s.cpu_power);
++    snprintf(line, sizeof line, "CPU:   %s   %s   %s", a, b, c);
++    ImGui::TextUnformatted(line);
++    char game[24];
++    number(used, sizeof used, "%.1fGB", s.ram_used_mb < 0 ? -1.0f : s.ram_used_mb / MB_PER_GB, true);
++    number(total, sizeof total, "%.1fGB", s.ram_total_mb < 0 ? -1.0f : s.ram_total_mb / MB_PER_GB, true);
++    number(game, sizeof game, "%.1fGB", s.game_ram_mb < 0 ? -1.0f : s.game_ram_mb / MB_PER_GB, true);
++    snprintf(line, sizeof line, "RAM:   %s  /%s  game %s", used, total, game);
++    ImGui::TextUnformatted(line);
++}
++
++void frame_lines(const DebugStats& s) {
++    char fps[24], last[24], max[24], line[96];
++    number(fps, sizeof fps, "%.0fFPS", s.fps, true);
++    number(last, sizeof last, "%.1fms", s.frame_last_ms, true);
++    number(max, sizeof max, "%.1fms", s.frame_max_ms, true);
++    snprintf(line, sizeof line, "%s   %s   max %s", fps, last, max);
++    ImGui::TextUnformatted(line);
++    ImGui::PlotLines("##frames", s.frame_ms, s.frame_count, 0, nullptr, 0.0f, GRAPH_TOP_MS, ImVec2(-1, GRAPH_HEIGHT));
++}
++
++void cost_lines(const DebugStats& s) {
++    char v[32];
++    if (!ImGui::BeginTable("costs", 2, ImGuiTableFlags_SizingStretchProp)) return;
++    number(v, sizeof v, "%.1f ms", s.prep_ms, true);
++    row("CPU frame prep:", v);
++    number(v, sizeof v, "%.1f ms", s.cpu_ms, true);
++    row("CPU busy per frame:", v);
++    number(v, sizeof v, "%.1f ms", s.pipeline_wait_ms, true);
++    row("Pipeline waits:", v);
++    number(v, sizeof v, "%.1f per frame", s.texture_uploads, true);
++    row("Texture uploads:", v);
++    ImGui::EndTable();
++}
++
++void display_lines(const ImguiFrame& f) {
++    char v[48];
++    if (!ImGui::BeginTable("display", 2, ImGuiTableFlags_SizingStretchProp)) return;
++    snprintf(v, sizeof v, "%d x %d", f.window_w, f.window_h);
++    row("Window Size", v);
++    if (f.game_w > 0)
++        snprintf(v, sizeof v, "%d x %d", f.game_w, f.game_h);
++    else
++        snprintf(v, sizeof v, "?");
++    row("Game resolution", v);
++    ImGui::BeginDisabled(); /* no setting behind these two yet */
++    row("Scaling", "-");
++    row("Anti-aliasing", "-");
++    ImGui::EndDisabled();
++    snprintf(v, sizeof v, "%s", f.fps_limit);
++    row("Frame limit", v);
++    row("V-sync", f.vsync ? "On" : "Off");
++    ImGui::EndTable();
++}
++
++void debug_window(const ImguiFrame& f) {
++    DebugStats stats;
++    ImGui::SetNextWindowPos(ImVec2(40, 60), ImGuiCond_FirstUseEver);
++    ImGui::SetNextWindowSize(ImVec2(DEBUG_WIDTH, DEBUG_HEIGHT), ImGuiCond_FirstUseEver);
++    ImGui::SetNextWindowSizeConstraints(ImVec2(DEBUG_MIN_WIDTH, DEBUG_MIN_HEIGHT), ImVec2(FLT_MAX, FLT_MAX));
++    if (!ImGui::Begin("Debug", &g_show_debug)) {
++        debug_stats_hardware_demand(nullptr);
++        ImGui::End();
++        return;
++    }
++    debug_stats_hardware_demand(f.gpu_uuid);
++    debug_stats_get(&stats);
++    hardware_lines(stats);
++    frame_lines(stats);
++    cost_lines(stats);
++    ImGui::Spacing();
++    display_lines(f);
++    ImGui::End();
++}
++
++/* ---- the game's software keyboard (the player's name): the box that overlay.c keeps the state of ---- */
++constexpr float KEYBOARD_FIELD_WIDTH = 420.0f;
++constexpr unsigned UTF16_PAIR_MIN = 0x10000; /* a character from here on is two UTF-16 units, as the game counts them */
++
++struct KeyboardLimit {
++    unsigned max;
++    bool numbers;
++};
++
++/* the UTF-16 units of the UTF-8 text, as the game counts them: a four byte character is a pair */
++unsigned utf16_units(const char* s, size_t n) {
++    unsigned units = 0;
++    for (size_t i = 0; i < n; ++i) {
++        unsigned char c = (unsigned char)s[i];
++        if (c >= 0xF0)
++            units += 2;
++        else if ((c & 0xC0) != 0x80)
++            units += 1;
++    }
++    return units;
++}
++
++/* the longest start of the text that holds at most max units, in bytes: it ends between characters */
++size_t fit_units(const char* s, size_t n, unsigned max) {
++    unsigned units = 0;
++    size_t i = 0;
++    while (i < n) {
++        unsigned char c = (unsigned char)s[i];
++        size_t len = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
++        unsigned add = c >= 0xF0 ? 2 : 1;
++        if (units + add > max || i + len > n) break;
++        units += add;
++        i += len;
++    }
++    return i;
++}
++
++/* ImGui hands the filter the character only (not the line), so it refuses controls and, for a number pad, all but
++   digits. The line's most is kept after each edit, which does have the line */
++int keyboard_callback(ImGuiInputTextCallbackData* data) {
++    const KeyboardLimit* limit = (const KeyboardLimit*)data->UserData;
++    if (data->EventFlag == ImGuiInputTextFlags_CallbackCharFilter) {
++        unsigned c = (unsigned)data->EventChar;
++        if (c < 0x20 || c == 0x7F) return 1;
++        return limit->numbers && (c < '0' || c > '9') ? 1 : 0;
++    }
++    size_t keep = fit_units(data->Buf, (size_t)data->BufTextLen, limit->max);
++    if (keep < (size_t)data->BufTextLen) data->DeleteChars((int)keep, data->BufTextLen - (int)keep);
++    return 0;
++}
++
++/* the window's own state: the line as typed, the request it is for, whether Enter was refused */
++struct KeyboardState {
++    char line[IMGUI_KB_TEXT];
++    unsigned last_ticket;
++    bool was_shown, refused, refocus;
++} g_kb;
++
++void keyboard_reset() { g_kb = KeyboardState(); }
++
++void keyboard_window(ImguiKeyboard& k) {
++    char* line = g_kb.line;
++    bool& was_shown = g_kb.was_shown;
++    bool& refused = g_kb.refused;
++    bool& refocus = g_kb.refocus;
++    unsigned& last_ticket = g_kb.last_ticket;
++    k.text_changed = 0;
++    k.answer = IMGUI_KB_NONE;
++    if (!k.shown) {
++        was_shown = false;
++        return;
++    }
++    bool fresh = !was_shown || k.ticket != last_ticket;
++    if (fresh) {
++        memcpy(line, k.text, sizeof g_kb.line);
++        last_ticket = k.ticket;
++        was_shown = true;
++        refused = false;
++        refocus = false;
++    }
++    const ImGuiViewport* view = ImGui::GetMainViewport();
++    ImGui::SetNextWindowPos(ImVec2(view->Size.x * 0.5f, view->Size.y * 0.4f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
++    if (fresh) ImGui::SetNextWindowFocus();
++    ImGui::Begin("Keyboard", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
++                                         ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoMove);
++    ImGui::PushTextWrapPos(KEYBOARD_FIELD_WIDTH);
++    if (k.header[0]) ImGui::TextUnformatted(k.header);
++    if (k.sub[0]) ImGui::TextDisabled("%s", k.sub);
++    if (k.guide[0]) ImGui::TextDisabled("%s", k.guide);
++    ImGui::PopTextWrapPos();
++    KeyboardLimit limit = {k.max, k.numbers != 0};
++    ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCharFilter |
++                                ImGuiInputTextFlags_CallbackEdit;
++    if (k.password) flags |= ImGuiInputTextFlags_Password;
++    ImGui::SetNextItemWidth(KEYBOARD_FIELD_WIDTH);
++    ImGui::PushID((int)k.ticket); /* a new request is a new field: it starts from its own text, not an old field's */
++    if (fresh || refocus) ImGui::SetKeyboardFocusHere();
++    refocus = false;
++    const bool pad_enter = k.pad_answer == IMGUI_KB_ENTER, pad_cancel = k.pad_answer == IMGUI_KB_CANCEL;
++    bool entered = ImGui::InputText("##line", line, sizeof g_kb.line, flags, keyboard_callback, &limit);
++    unsigned units = utf16_units(line, strlen(line));
++    bool enough = units >= k.min;
++    bool ok = ImGui::Button(k.ok[0] ? k.ok : "OK");
++    ImGui::SameLine();
++    bool cancel = ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape, false) || pad_cancel;
++    ImGui::PopID();
++    if ((entered || ok || pad_enter) && !enough) {
++        refused = true;
++        refocus = true; /* Enter ended the field: the next frame gives it back, so typing goes on */
++    }
++    if (enough) refused = false;
++    ImGui::TextDisabled("%u of %u characters%s. A: %s, B: Cancel.", units, k.max, k.min ? ", a minimum is needed" : "",
++                        k.ok[0] ? k.ok : "OK");
++    if (refused) ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%u more character(s) needed, %u at least.", k.min - units, k.min);
++    ImGui::End();
++    if (strcmp(line, k.text) != 0) {
++        memcpy(k.text, line, sizeof k.text);
++        k.text_changed = 1;
++    }
++    if (cancel)
++        k.answer = IMGUI_KB_CANCEL;
++    else if ((entered || ok || pad_enter) && enough)
++        k.answer = IMGUI_KB_ENTER;
++}
++} // namespace
++
++void imgui_ui_reset(void) {
++    g_bar_shown = false;
++    g_open_test_was = -1;
++    keyboard_reset();
++}
++
++bool imgui_ui_draw(ImguiFrame* f) {
++    if (f->open_test != g_open_test_was) {
++        g_open_test_was = f->open_test;
++        g_show_test = f->open_test != 0;
++    }
++    g_bar_shown = false;
++    if (bar_wanted() && ImGui::BeginMainMenuBar()) {
++        g_bar_shown = true;
++        menu_bar();
++        ImGui::EndMainMenuBar();
++    }
++    if (g_show_debug)
++        debug_window(*f);
++    else
++        debug_stats_hardware_demand(nullptr);
++    if (g_show_test) test_window(f->dt);
++    keyboard_window(f->kb);
++    return g_bar_shown;
++}
+diff --git a/src/nx/gpu/vk/imgui_ui.h b/src/nx/gpu/vk/imgui_ui.h
+new file mode 100644
+index 00000000..99faf42f
+--- /dev/null
++++ b/src/nx/gpu/vk/imgui_ui.h
+@@ -0,0 +1,14 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The windows of the game: a menu bar that shows when the cursor is at the top of the picture, and what its menus
++   open. Called between NewFrame and Render */
++#ifndef SNX_IMGUI_UI_H
++#define SNX_IMGUI_UI_H
++#include "nx/gpu/vk/imgui_glue.h"
++
++/* Returns whether the menu bar shows this frame. f->open_test is the test window's first state, from the .ini */
++bool imgui_ui_draw(ImguiFrame* f);
++/* the windows start again from a closed state: after the context is made again or the windows were off */
++void imgui_ui_reset(void);
++
++#endif
+diff --git a/src/nx/gpu/vk/renderer.c b/src/nx/gpu/vk/renderer.c
+index fdb7a6ee..4144938a 100644
+--- a/src/nx/gpu/vk/renderer.c
++++ b/src/nx/gpu/vk/renderer.c
+@@ -21,6 +21,7 @@
+ #include "nx/runtime/platform/plat.h"
+ #include "nx/runtime/platform/stats.h"
+ #include "nx/gpu/vk/vk.h"
++#include "nx/gpu/vk/debug_stats.h"
+ #include "nx/memory/mem.h"
+ #include "nx/memory/own.h"
+ #include "nx/gpu/vk/pending_pages.h"
+@@ -357,6 +358,7 @@ static void gpu_memory_plots(void) {
+    Under vk_lock */
+ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
+     SNX_ZONE(z_show, "vk show");
++    u64 show_start_ns = plat_ns(); /* the Debug window's cost of showing a frame (debug_stats.h) */
+     /* the size the swapchain was made for, not the extent the surface clamped it to: that can stay different */
+     int ww, wh, srgb = src ? is_srgb(src->f.vk) : g_sc_srgb, shown = backend_window_shown();
+     backend_window_size(&ww, &wh);
+@@ -445,6 +447,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
+                 int safe[4] = {(int)cx, (int)cy, (int)cw, (int)ch};
+                 vk_ui_draw(cb, sc, safe);
+             }
++            vk_imgui_draw(cb, sc, fw, fh);
+             vk_barrier(cb, sc, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+@@ -507,6 +510,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
+         last_present_ns = now_ns;
+         g_vk_present++;
+         stats_frame(now_ns);
++        debug_stats_frame(now_ns, now_ns - show_start_ns, is[3], is[6]);
+         vk_mem_present();
+         if (g_last) vk_surf_touch(g_last); /* what screenshots read stays */
+         vk_tex_frame();
+diff --git a/src/nx/gpu/vk/ui.c b/src/nx/gpu/vk/ui.c
+index 93b82953..cf1a80a7 100644
+--- a/src/nx/gpu/vk/ui.c
++++ b/src/nx/gpu/vk/ui.c
+@@ -306,6 +306,7 @@ static VkImageView sc_view(VkImage sc) {
+         }
+     return VK_NULL_HANDLE;
+ }
++VkImageView vk_ui_swapchain_view(VkImage sc) { return sc_view(sc); }
+ void vk_ui_swapchain_gone(void) {
+     u32 i;
+     for (i = 0; i < VK_SC_MAX; ++i) {
+diff --git a/src/nx/gpu/vk/vk.h b/src/nx/gpu/vk/vk.h
+index 155588b2..425158a1 100644
+--- a/src/nx/gpu/vk/vk.h
++++ b/src/nx/gpu/vk/vk.h
+@@ -1019,6 +1019,10 @@ void vk_render_end(void); /* ends the dynamic rendering pass, if one is open */
+    safe is the picture's part clear of the system's bars (gpu/vk/ui.c) */
+ void vk_ui_draw(VkCommandBuffer cb, VkImage sc, const int safe[4]);
+ void vk_ui_swapchain_gone(void); /* its images' views go before the swapchain does */
++VkImageView vk_ui_swapchain_view(VkImage sc); /* the view of a swapchain image that ui.c made (gpu/vk/imgui.c draws on it) */
++/* gpu/vk/imgui.c: Dear ImGui's windows over the image, under vk_lock; its backend ends with the swapchain */
++void vk_imgui_draw(VkCommandBuffer cb, VkImage sc, u32 game_w, u32 game_h);
++void vk_imgui_swapchain_gone(void);
+ void vk_render_clear(GpuChannel* ch, u32 v);
+ VkViewport vk_render_viewport(const u32* r);
+ VkViewport vk_render_viewport_at(const u32* r, u32 index);
+diff --git a/src/nx/runtime/platform/backend/imgui_sdl.c b/src/nx/runtime/platform/backend/imgui_sdl.c
+new file mode 100644
+index 00000000..4d8a8ae2
+--- /dev/null
++++ b/src/nx/runtime/platform/backend/imgui_sdl.c
+@@ -0,0 +1,147 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++#include "nx/runtime/platform/backend/imgui_sdl.h"
++#include <string.h>
++#include "nx/gpu/vk/imgui_input.h"
++
++enum { NO_MOUSE = -1000000000 };
++static int g_grabbed; /* the buttons whose press the windows took: bit n for SDL button n */
++static int g_was_captured = 1;
++static int g_text_on; /* this file started the window's text input */
++static SDL_Rect g_area;
++
++static void push_pos(float x, float y) {
++    ImguiEvent ev = {.type = IMGUI_EV_MOUSE_POS, .x = x, .y = y};
++    imgui_input_push(&ev);
++}
++
++/* the windows see no mouse while the mouse look holds the cursor, and the cursor's place once it is let go */
++static void follow_capture(int captured, float density) {
++    float x, y;
++    if (captured == g_was_captured) return;
++    g_was_captured = captured;
++    if (captured) {
++        push_pos(NO_MOUSE, NO_MOUSE);
++        return;
++    }
++    SDL_GetMouseState(&x, &y);
++    push_pos(x * density, y * density);
++}
++
++static int button_event(const SDL_Event* e, ImguiWants w) {
++    int bit = 1 << e->button.button, down = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN, taken;
++    ImguiEvent ev = {.type = IMGUI_EV_MOUSE_BUTTON, .button = e->button.button, .down = down};
++    if (e->button.which == SDL_TOUCH_MOUSEID) return 0;
++    imgui_input_push(&ev);
++    if (down) {
++        taken = w.mouse;
++        if (taken) g_grabbed |= bit;
++        return taken;
++    }
++    taken = (g_grabbed & bit) != 0; /* the release of a press that the windows took */
++    g_grabbed &= ~bit;
++    return taken;
++}
++
++/* a commit of any length, in pieces that each end between UTF-8 characters */
++static void push_text(const char* text) {
++    size_t at = 0, n = strlen(text);
++    while (at < n) {
++        ImguiEvent ev = {.type = IMGUI_EV_TEXT};
++        size_t take = n - at < IMGUI_TEXT_MAX - 1 ? n - at : IMGUI_TEXT_MAX - 1;
++        if (at + take < n) /* back to the start of the character that the piece would cut */
++            while (take && ((unsigned char)text[at + take] & 0xC0) == 0x80) --take;
++        if (!take) break; /* a character longer than a piece: not UTF-8 */
++        memcpy(ev.text, text + at, take);
++        imgui_input_push(&ev);
++        at += take;
++    }
++}
++
++static void focus_lost(void) {
++    ImguiEvent ev = {.type = IMGUI_EV_FOCUS};
++    g_grabbed = 0;
++    imgui_input_push(&ev);
++}
++
++static int mouse_event(const SDL_Event* e, float density, ImguiWants w) {
++    ImguiEvent ev = {.type = IMGUI_EV_WHEEL};
++    switch (e->type) {
++        case SDL_EVENT_MOUSE_MOTION:
++            if (e->motion.which == SDL_TOUCH_MOUSEID) return 0;
++            push_pos(e->motion.x * density, e->motion.y * density);
++            return w.mouse;
++        case SDL_EVENT_MOUSE_WHEEL:
++            ev.x = e->wheel.x;
++            ev.y = e->wheel.y;
++            imgui_input_push(&ev);
++            return w.mouse;
++        default: return button_event(e, w);
++    }
++}
++
++static int key_event(const SDL_Event* e, ImguiWants w) {
++    int down = e->type == SDL_EVENT_KEY_DOWN;
++    ImguiEvent ev = {.type = IMGUI_EV_KEY, .key = (int)e->key.key, .mods = (int)e->key.mod, .down = down};
++    imgui_input_push(&ev);
++    return down && w.keyboard;
++}
++
++/* the old menu or the loading screen has the controls: the windows get the ends of what they began (a release, a lost
++   focus) and nothing new */
++static void pass_ends(const SDL_Event* e) {
++    ImguiWants none = {0};
++    switch (e->type) {
++        case SDL_EVENT_KEY_UP: key_event(e, none); break;
++        case SDL_EVENT_MOUSE_BUTTON_UP: button_event(e, none); break;
++        case SDL_EVENT_WINDOW_FOCUS_LOST: focus_lost(); break;
++    }
++}
++
++int imgui_sdl_event(const SDL_Event* e, float density, int captured, int owned) {
++    ImguiWants w = imgui_input_wants();
++    follow_capture(captured, density);
++    if (!owned) {
++        pass_ends(e);
++        return 0;
++    }
++    switch (e->type) {
++        case SDL_EVENT_MOUSE_MOTION:
++        case SDL_EVENT_MOUSE_BUTTON_DOWN:
++        case SDL_EVENT_MOUSE_BUTTON_UP:
++        case SDL_EVENT_MOUSE_WHEEL: return captured ? 0 : mouse_event(e, density, w);
++        case SDL_EVENT_KEY_DOWN:
++        case SDL_EVENT_KEY_UP: return key_event(e, w);
++        case SDL_EVENT_TEXT_INPUT:
++            if (!w.text) return 0;
++            push_text(e->text.text);
++            return 1;
++        case SDL_EVENT_WINDOW_FOCUS_LOST:
++            focus_lost();
++            return 0;
++    }
++    return 0;
++}
++
++void imgui_sdl_text_input(SDL_Window* win, int keyboard_box, float density) {
++    ImguiWants w = imgui_input_wants();
++    int want = w.text && !keyboard_box;
++    SDL_Rect area;
++    if (keyboard_box) { /* the box's own text input is on: not this file's to stop */
++        g_text_on = 0;
++        return;
++    }
++    if (want && density > 0) { /* where the input method puts its window: the field's cursor, in points */
++        area = (SDL_Rect){(int)(w.ime_x / density), (int)(w.ime_y / density), 1, (int)(w.ime_h / density)};
++        if (memcmp(&area, &g_area, sizeof area)) {
++            SDL_SetTextInputArea(win, &area, 0);
++            g_area = area;
++        }
++    }
++    /* asked at each poll, not on a change: the box may have stopped the input that this file needs */
++    if (want && !SDL_TextInputActive(win))
++        SDL_StartTextInput(win);
++    else if (!want && g_text_on && SDL_TextInputActive(win))
++        SDL_StopTextInput(win);
++    g_text_on = want;
++}
+diff --git a/src/nx/runtime/platform/backend/imgui_sdl.h b/src/nx/runtime/platform/backend/imgui_sdl.h
+new file mode 100644
+index 00000000..9be0857e
+--- /dev/null
++++ b/src/nx/runtime/platform/backend/imgui_sdl.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The window's events for the ImGui windows (gpu/vk/imgui_input.h). Main thread only */
++#ifndef SNX_IMGUI_SDL_H
++#define SNX_IMGUI_SDL_H
++#include <SDL3/SDL.h>
++
++/* An event, given to the windows. 1 when they take it, so the game and the old menu do not get it. density is the
++   pixels of the picture for each point of the window, captured whether the mouse look holds the cursor (the windows
++   then see no mouse). owned is 0 while the old menu or the loading screen has the controls: the windows then get only
++   releases and a lost focus, and take nothing. A key-up is never taken: a key the game saw go down must come up */
++int imgui_sdl_event(const SDL_Event* e, float density, int captured, int owned);
++/* turns the window's text input on while a text field is active, unless the game's keyboard box has it (keyboard_box) */
++void imgui_sdl_text_input(SDL_Window* win, int keyboard_box, float density);
++#endif
+diff --git a/src/nx/runtime/platform/backend/sdl3.c b/src/nx/runtime/platform/backend/sdl3.c
+index e240ffeb..c600e593 100644
+--- a/src/nx/runtime/platform/backend/sdl3.c
++++ b/src/nx/runtime/platform/backend/sdl3.c
+@@ -13,6 +13,9 @@
+ #include "nx/hle/kernel/kernel.h"
+ #include "nx/memory/mem.h" /* g_mem: the guest words of the native mouse look */
+ #include "nx/runtime/platform/backend.h"
++#include "nx/runtime/platform/backend/imgui_sdl.h"
++#include "nx/runtime/platform/prepare_screen.h"
++#include "nx/gpu/vk/imgui_input.h"
+ #include "nx/runtime/platform/log.h"
+ #include "nx/runtime/platform/plat.h"
+ #include "nx/runtime/platform/tracy.h"
+@@ -1061,8 +1064,9 @@ static int keyboard_event(const SDL_Event* e) {
+ static int menu_event(const SDL_Event* e) {
+     int w, h;
+     float d;
+-    if ((e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && (e->key.key == SDLK_AC_BACK || e->key.key == SDLK_F2)) ||
+-        (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && e->gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE)) {
++    if (overlay_menu_opens() &&
++        ((e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat && (e->key.key == SDLK_AC_BACK || e->key.key == SDLK_F2)) ||
++         (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && e->gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE))) {
+         if (vpad_editing())
+             vpad_edit(0);
+         else
+@@ -1474,6 +1478,17 @@ static void keyboard_sync(void) {
+     }
+     if (answer >= 0) am_keyboard_answered(ticket, answer, text);
+ }
++/* the picture's pixels for each point of the window: the windows work in pixels, SDL's mouse in points */
++static float imgui_density(void) {
++    float d = SDL_GetWindowPixelDensity(g_win);
++    return d > 0 ? d : 1.0f;
++}
++/* the physical state of Alt, before the windows can take the event: a window that took the press must not leave the
++   mouse look to grab the cursor again */
++static void alt_track(const SDL_Event* e) {
++    if (e->type != SDL_EVENT_KEY_DOWN && e->type != SDL_EVENT_KEY_UP) return;
++    if (e->key.key == SDLK_LALT || e->key.key == SDLK_RALT) g_alt_held = e->type == SDL_EVENT_KEY_DOWN;
++}
+ void video_poll(void) {
+     SDL_Event e;
+     char* left = __atomic_load_n(&g_fatal_left, __ATOMIC_ACQUIRE);
+@@ -1486,6 +1501,8 @@ void video_poll(void) {
+        gives the box's line) is in this poll's state */
+     int menu_had = overlay_shown() || vpad_editing() || overlay_keyboard_shown();
+     while (!g_opt_headless && SDL_PollEvent(&e)) {
++        alt_track(&e);
++        if (imgui_sdl_event(&e, imgui_density(), g_mouse_captured, !overlay_shown() && !prepare_screen_shown())) continue;
+         if (press_event(&e)) continue;
+         if (overlay_event(&e)) continue;
+         switch (e.type) {
+@@ -1524,7 +1541,6 @@ void video_poll(void) {
+                 wsafe_set();
+                 break;
+             case SDL_EVENT_KEY_DOWN:
+-                if (e.key.key == SDLK_LALT || e.key.key == SDLK_RALT) g_alt_held = 1;
+                 if (keymap(e.key.scancode) && g_settings.mouse_look) g_use_mouse = 1;
+                 if (e.key.key == SDLK_ESCAPE) { /* a fresh press: the repeats of the Esc that closed the menu don't */
+                     if (!e.key.repeat) g_quit = 1;
+@@ -1541,7 +1557,6 @@ void video_poll(void) {
+                 if (!e.key.repeat) keys_held |= keymap(e.key.scancode);
+                 break;
+             case SDL_EVENT_KEY_UP:
+-                if (e.key.key == SDLK_LALT || e.key.key == SDLK_RALT) g_alt_held = 0;
+                 keys_held &= ~keymap(e.key.scancode);
+                 break;
+             case SDL_EVENT_WINDOW_FOCUS_LOST:
+@@ -1569,7 +1584,10 @@ void video_poll(void) {
+     /* the scripted presses act like keys, stick keys included. Bits 16..23 (the stick directions as buttons) can be
+        scripted too, but the stick keys (40..47) are no npad buttons */
+     static u64 script_was; /* the scripted buttons of the last poll: a Home press opens or closes the menu */
+-    if (!g_opt_headless) mouse_capture_update(overlay_shown() || vpad_editing() || overlay_keyboard_shown());
++    if (!g_opt_headless) {
++        imgui_sdl_text_input(g_win, g_typing.ticket != 0, imgui_density());
++        mouse_capture_update(overlay_shown() || vpad_editing() || overlay_keyboard_shown() || imgui_input_wants().release);
++    }
+     u64 s = unattended_buttons(), k = keys_held | s | g_mouse_buttons;
+     if (s & ~script_was & SNX_SCRIPT_HOME) {
+         ui_lock();
+@@ -1646,7 +1664,7 @@ void video_poll(void) {
+         ui_lock();
+         vpad_state(&vb, vs);
+         acts = vpad_actions();
+-        if (acts & SNX_VPAD_DO_MENU) menu_open(1);
++        if ((acts & SNX_VPAD_DO_MENU) && overlay_menu_opens()) menu_open(1);
+         /* with the menu open, the pads move it: the on-screen controls' and the connected ones', sticks too */
+         overlay_do(overlay_controls(vb | pb | (s & 0xFFFFFull), vs[0] || vs[1] ? vs : pad, SDL_GetTicks()));
+         ui_unlock();
+diff --git a/src/nx/runtime/platform/overlay.c b/src/nx/runtime/platform/overlay.c
+index 57ae319f..8eb56188 100644
+--- a/src/nx/runtime/platform/overlay.c
++++ b/src/nx/runtime/platform/overlay.c
+@@ -465,6 +465,7 @@ static struct {
+     OverlayKeyboard kb;
+     u32 units;
+     int kb_shown, refused, answer;
++    int pad_answer; /* with the window drawing the box: the controller's A or B, for the window to answer in order with the text */
+     DialogRows event_rows;
+ } g_overlay;
+ /* d on a picture sw x sh, into l (NULL: only where it all goes, in out): the head, each paragraph after a blank row,
+@@ -615,12 +616,51 @@ void overlay_keyboard_show(const OverlayKeyboard* k) {
+     kb_add(k->text);
+     g_overlay.refused = 0;
+     g_overlay.answer = KB_WAITING;
++    g_overlay.pad_answer = -1;
+     __atomic_store_n(&g_overlay.kb_shown, 1, __ATOMIC_RELEASE);
+ }
+ void overlay_keyboard_hide(u32 ticket) {
+     if (g_overlay.kb.ticket == ticket) __atomic_store_n(&g_overlay.kb_shown, 0, __ATOMIC_RELEASE);
+ }
+ int overlay_keyboard_shown(void) { return __atomic_load_n(&g_overlay.kb_shown, __ATOMIC_ACQUIRE); }
++/* the window of Dear ImGui draws the box: this file's own drawing and taps stay out */
++static int (*g_external)(void);
++void overlay_keyboard_external_set(int (*running)(void)) { __atomic_store_n(&g_external, running, __ATOMIC_RELEASE); }
++int overlay_windows_run(void) {
++    int (*running)(void) = __atomic_load_n(&g_external, __ATOMIC_ACQUIRE);
++    return __atomic_load_n(&g_settings.imgui, __ATOMIC_RELAXED) && running && running();
++}
++static int kb_external(void) { return overlay_windows_run(); }
++int overlay_menu_opens(void) { return !overlay_windows_run() || __atomic_load_n(&g_settings.legacy_menu, __ATOMIC_RELAXED); }
++int overlay_keyboard_view(OverlayKeyboardView* v) {
++    const OverlayKeyboard* k = &g_overlay.kb;
++    if (!g_overlay.kb_shown) return 0;
++    v->ticket = k->ticket;
++    v->units = g_overlay.units;
++    v->min = k->min;
++    v->max = k->max;
++    v->password = k->password;
++    v->numbers = k->numbers;
++    memcpy(v->header, k->header, sizeof v->header);
++    memcpy(v->sub, k->sub, sizeof v->sub);
++    memcpy(v->guide, k->guide, sizeof v->guide);
++    memcpy(v->ok, k->ok, sizeof v->ok);
++    memcpy(v->text, k->text, sizeof v->text);
++    v->pad_answer = g_overlay.pad_answer;
++    g_overlay.pad_answer = -1;
++    return 1;
++}
++int overlay_keyboard_apply(u32 ticket, const char* text, int key) {
++    if (!g_overlay.kb_shown || g_overlay.kb.ticket != ticket) return 0;
++    if (text) {
++        g_overlay.kb.text[0] = 0;
++        g_overlay.units = 0;
++        kb_add(text);
++        g_overlay.refused = 0;
++    }
++    if (key >= 0) overlay_keyboard_key(key);
++    return 1;
++}
+ void overlay_keyboard_type(const char* text) {
+     if (!g_overlay.kb_shown) return;
+     kb_add(text);
+@@ -711,6 +751,7 @@ static int kb_tap(float x, float y, int sw, int sh) {
+     KbTexts t;
+     Dialog d;
+     DialogDrawn at;
++    if (kb_external()) return OVERLAY_NONE;
+     kb_dialog(&d, &t);
+     dialog_draw(NULL, sw, sh, &d, g_overlay.event_rows, &at);
+     if (overlay_error_hit(&at.field, x, y)) return OVERLAY_TYPE;
+@@ -720,6 +761,11 @@ static int kb_tap(float x, float y, int sw, int sh) {
+ }
+ /* a button pressed on the box (one HidNpadButton bit): A gives the line, B cancels */
+ static int kb_pad(u64 button) {
++    if (kb_external()) { /* in order with the text that the window still has to take: it answers */
++        if (button == 1ull << 0) g_overlay.pad_answer = OVERLAY_KEY_ENTER;
++        if (button == 1ull << 1) g_overlay.pad_answer = OVERLAY_KEY_CANCEL;
++        return OVERLAY_NONE;
++    }
+     if (button == 1ull << 0) return overlay_keyboard_key(OVERLAY_KEY_ENTER);
+     if (button == 1ull << 1) return overlay_keyboard_key(OVERLAY_KEY_CANCEL);
+     return OVERLAY_NONE;
+@@ -728,7 +774,7 @@ int overlay_keyboard_typing(int sw, int sh, OverlayTyping* t) {
+     KbTexts texts;
+     Dialog d;
+     DialogDrawn at;
+-    if (!g_overlay.kb_shown) return 0;
++    if (!g_overlay.kb_shown || kb_external()) return 0;
+     kb_dialog(&d, &texts);
+     dialog_draw(NULL, sw, sh, &d, g_overlay.event_rows, &at);
+     t->ticket = g_overlay.kb.ticket;
+@@ -962,7 +1008,7 @@ void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
+     Dialog d;
+     DialogDrawn at;
+     if (!shown) { /* the keyboard's box, which the menu goes over */
+-        if (g_overlay.kb_shown) {
++        if (g_overlay.kb_shown && !kb_external()) {
+             KbTexts t;
+             kb_dialog(&d, &t);
+             dialog_draw(l, sw, sh, &d, rows_of, &at);
+diff --git a/src/nx/runtime/platform/overlay.h b/src/nx/runtime/platform/overlay.h
+index 86798570..c5622549 100644
+--- a/src/nx/runtime/platform/overlay.h
++++ b/src/nx/runtime/platform/overlay.h
+@@ -143,4 +143,29 @@ typedef struct {
+ } OverlayTyping;
+ int overlay_keyboard_typing(int sw, int sh, OverlayTyping* t);
+ 
++/* With the setting imgui on, the Dear ImGui window draws the box and the line's editing (gpu/vk/imgui.c), and this file
++   keeps the state, the limits and the answer. The box is then neither drawn nor tapped here, and it asks the window's
++   text input for nothing. A copy of the state, 1 while the box shows (under ui_lock) */
++typedef struct {
++    u32 ticket, units, min, max; /* units: the line's UTF-16 units; min and max as the game's, max within the box's most */
++    int password, numbers;
++    char header[sizeof(((OverlayKeyboard*)0)->header)], sub[sizeof(((OverlayKeyboard*)0)->sub)],
++        guide[sizeof(((OverlayKeyboard*)0)->guide)], ok[sizeof(((OverlayKeyboard*)0)->ok)];
++    int pad_answer; /* a controller's A (OVERLAY_KEY_ENTER) or B (OVERLAY_KEY_CANCEL) since the last view, else -1 */
++    char text[OVERLAY_KB_TEXT];
++} OverlayKeyboardView;
++int overlay_keyboard_view(OverlayKeyboardView* v);
++/* the window's check that it runs (a window that failed to start leaves the box to this file): NULL for never */
++void overlay_keyboard_external_set(int (*running)(void));
++/* 1 while the Dear ImGui windows run (the setting imgui is on and they have drawn lately) */
++int overlay_windows_run(void);
++/* 1 when this file's menu may be opened (F2, Back, Home, the on-screen controls' menu button): not while the windows
++   run, which replace it, unless the setting legacy_menu is on. Its pages for the gamepads' map and the save states
++   have no window yet */
++int overlay_menu_opens(void);
++/* What the window answers, for the request that it showed (ticket): the line (NULL: unchanged), cut as typing it would
++   be, then the key (OVERLAY_KEY_ENTER or OVERLAY_KEY_CANCEL, or -1 for none). 0, and nothing done, when that request
++   is no longer the box's (the game took it away or asked again meanwhile). Under ui_lock */
++int overlay_keyboard_apply(u32 ticket, const char* text, int key);
++
+ #endif
+diff --git a/src/nx/runtime/settings.txt b/src/nx/runtime/settings.txt
+index ac9034fe..6d1aa0ba 100644
+--- a/src/nx/runtime/settings.txt
++++ b/src/nx/runtime/settings.txt
+@@ -814,6 +814,27 @@ setting Verify macros
+     startup
+     words Off|On
+     help 1 = runs each native and compiled macro against the interpreter too, and logs where they differ
++setting Imgui
++    key imgui
++    int 0 1
++    default 1
++    words Off|On
++    help 1 = the windows of Dear ImGui: a menu bar at the top of the picture, shown when the cursor is there (hold Alt
++    help to free the cursor from the mouse look). 0 = none, and they take no input
++setting Legacy menu
++    key legacy_menu
++    int 0 1
++    default 0
++    words Off|On
++    help 1 = the game's old menu (F2, Back, Home) opens even while the Dear ImGui windows run. It has pages that the
++    help windows do not have yet: the gamepads' button map and the save states. 0 = only the windows
++setting Imgui test
++    key imgui_test
++    int 0 1
++    default 0
++    words Off|On
++    help 1 = the Dear ImGui test window is open at the start (also in the menu bar's Debug menu), to check the backend
++    help and the fonts (fonts/ in the data folder)
+ setting RenderDoc captures
+     key renderdoc
+     text 1024

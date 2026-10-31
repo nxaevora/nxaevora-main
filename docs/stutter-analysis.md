@@ -125,7 +125,7 @@ What is known (the logs of 2026-10-31 and the runs before):
 - The stop is not the reading of the dump in place: run M read extracted files and had it. That comparison had other
   differences (cold cache, 183 JIT misses, no save).
 
-Next measurement: the patch `recomp/patches/0004-hitch-dump.patch` adds the setting `hitch_dump` (set to 400 in the
+Next measurement: the patch `recomp/patches/diagnostics/0004-hitch-dump.patch` adds the setting `hitch_dump` (set to 400 in the
 game's `.ini`). When the frame count stands still for 400 ms and again at 800 ms, the runtime writes `hitch-1.txt` and
 `hitch-2.txt` (and more for later stops) in the game's folder. Each has the state of every game thread, what it waits
 for (a service, an event, a mutex, a sleep with its time) and its call chain. The same call chain in both files names
@@ -159,7 +159,7 @@ loaded data (decompress, set up) or more waiting is not known. This is the first
 which the earlier comparison with extracted files (run M) could not show.
 
 What is not known yet: which file and how big it is, and how long the read takes. The IPC read is a read of the RomFS
-image at an absolute offset, so the log has no file name for it. Patch `0005-slow-romfs-read.patch` logs each such read
+image at an absolute offset, so the log has no file name for it. Patch `diagnostics/0005-slow-romfs-read.patch` logs each such read
 that takes 50 ms or more, with its size and its offset, while `hitch_dump` is on. The offset gives the file, and the
 time and size give the rate of the read in place (decrypt and read of the dump). The next run shows if the stop is the
 read itself (a slow read of the size of the stop) or a short read followed by work of the main thread.
@@ -188,7 +188,7 @@ The stop came at 15.6 s to 16.9 s (the frame after it took 1297 ms). `hitch-2.tx
   is missed and ends by a time limit in the virtual function. The first run's snapshot fits too: its read had just
   ended, and the main thread was out of the loop at 816 ms.
 
-Patch `0006-stop-dump-sleep-and-gpu.patch` adds what is missing in the next dump:
+Patch `diagnostics/0006-stop-dump-sleep-and-gpu.patch` adds what is missing in the next dump:
 
 - The registers of the main thread's last `svcSleepThread` and what they point to (`dump_sleeps`, a function that was
   there already but needed 100 sleeps; a stop makes 25). The registers hold the entry (x25) and the object. The pointees
@@ -215,7 +215,7 @@ are done at the first question, and the loop does not sleep. So the question is 
 main thread asks, and is done one sleep later, while all other threads idle.
 
 Not known: the class of the objects and what their function at vtable +0x40 reads. Patch
-`0007-stop-dump-object-chain.patch` prints, for the callee-saved registers of the sleeping thread, the pointer, the object
+`diagnostics/0007-stop-dump-object-chain.patch` prints, for the callee-saved registers of the sleeping thread, the pointer, the object
 and its virtual function table with the names of its first twelve functions. The vtable's +0x40 is the slot 8.
 Next run: read the chain of x25 (the pointer of the object, at +0x108 of the entry), disassemble the function in the
 slot 8 with `tools/disasm.py`, and see what it reads.
@@ -244,7 +244,7 @@ The stop came at 12.0 s to 13.4 s (the frame after it took 1401 ms). The four fi
   (`plat_win32.c`, `timer_period_1ms`), but Windows 11 may not honor that for a process in some states (a window that is not
   in front). Whether it does in the game's process is what the next run measures.
 
-Patch `0008-sleep-time-in-dump.patch` makes the dump of a sleeping thread say how much `svcSleepThread` time it asked for
+Patch `diagnostics/0008-sleep-time-in-dump.patch` makes the dump of a sleeping thread say how much `svcSleepThread` time it asked for
 and how long the sleeps took, since the last dump and for one call. If one call takes about 38 ms or more for 16 ms, the
 runtime's sleep is too long and the cause is in the timer (the 1 ms request is not honored, or the thread waits for its
 core after the sleep). If one call takes about 16 ms, the game's own loop is the stop.

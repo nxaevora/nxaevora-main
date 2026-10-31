@@ -155,6 +155,8 @@ Sources to find in step 1 (a value that no source gives shows as `?`, as the sta
 ## Progress
 
 - Step 1 (investigation): done.
+- Note on the patch names below: patches `0013` to `0022` were one patch each while the work went on. They are now one patch,
+  `recomp/patches/0013-imgui-windows.patch`, and the names below are the history. The review fixes are inside it.
 - Step 2 (dependency): done. Patch `0013-imgui-dependency.patch` pins Dear ImGui 1.93.0 (MIT). The configure of
   ScarletNX downloaded it and checked the SHA-256. Nothing is compiled yet. The credits entry for ImGui, Roboto and
   Noto Sans JP comes with step 3, when the font files are added.
