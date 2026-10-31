@@ -3,7 +3,10 @@
 <!-- Copyright 2026 the NXAevora contributors -->
 
 <p align="center">
-  <img alt="aevora-icon" src="assets/aevora-logo-dark.png" width="300px" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/aevora-logo-dark.png">
+    <img alt="aevora-icon" src="assets/aevora-logo.png" width="300px">
+  </picture>
 </p>
 <p align="center">
   <img src="https://img.shields.io/badge/platform-windows%20x64-blue?style=for-the-badge&logo=gitforwindows" alt="Badge">
@@ -15,7 +18,7 @@
 </p>
 <p align="center">
 NXAevora is a project to run Pokemon Legends Arceus natively on a Windows PC. The code of the game is translated
-ahead of time from ARM64 to x86-64 with the static recompiler [ScarletNX](https://github.com/scarletnx/ScarletNX).<br>
+ahead of time from ARM64 to x86-64 with the static recompiler <a href="https://github.com/scarletnx/ScarletNX">ScarletNX</a>.<br>
 NXAevora adds the settings, patches and tools that are specific to this game, and a launcher is planned.
 </p>
 
