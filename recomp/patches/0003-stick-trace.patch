@@ -1,0 +1,466 @@
+diff --git a/src/nx/CMakeLists.txt b/src/nx/CMakeLists.txt
+index bf8cc17..dcdaf9a 100644
+--- a/src/nx/CMakeLists.txt
++++ b/src/nx/CMakeLists.txt
+@@ -33,7 +33,7 @@ function(snx_component name)
+     target_link_libraries(snx_${name} PUBLIC snx_nx_flags)
+ endfunction()
+ 
+-snx_component(core runtime/main.c runtime/arm.c runtime/loader.c runtime/rtapi.c runtime/clock.c runtime/pause.c runtime/state.c runtime/state_fns.c runtime/state_file.c runtime/crash.c runtime/options.c
++snx_component(core runtime/main.c runtime/arm.c runtime/loader.c runtime/rtapi.c runtime/clock.c runtime/pause.c runtime/state.c runtime/state_fns.c runtime/state_file.c runtime/crash.c runtime/gtrace.c runtime/options.c
+               runtime/startup.c runtime/gdbstub.c runtime/present.c runtime/guest_jit.c
+               runtime/cheats.c)
+ target_link_libraries(snx_core PRIVATE snx_driver snx_lz4 snx_zstd snx_build_info)
+diff --git a/src/nx/runtime/crash.c b/src/nx/runtime/crash.c
+index e215266..71b1651 100644
+--- a/src/nx/runtime/crash.c
++++ b/src/nx/runtime/crash.c
+@@ -10,6 +10,7 @@
+ #include "nx/hle/kernel/kernel.h"
+ #include "nx/memory/mem.h"
+ #include "nx/runtime/arm.h"
++#include "nx/runtime/gtrace.h"
+ #include "nx/runtime/loader.h"
+ #include "nx/runtime/platform/log.h"
+ #include "nx/runtime/platform/plat.h"
+@@ -66,6 +67,9 @@ static int game_function_at(u64 pc, u64* guest, u64* offset) {
+     return 1;
+ }
+ 
++/* the recompiled function a host pc is in (gtrace.c's log): 1 with its guest address and the offset in it */
++int crash_game_function_at(u64 pc, u64* guest, u64* offset) { return game_function_at(pc, guest, offset); }
++
+ /* where host_pc is: the game's code, or the runtime's own with its offset for addr2line */
+ static void report_place(void* host_pc) {
+     u64 pc = (u64)(size_t)host_pc, guest = 0, offset = 0;
+diff --git a/src/nx/runtime/gtrace.c b/src/nx/runtime/gtrace.c
+new file mode 100644
+index 0000000..3e12643
+--- /dev/null
++++ b/src/nx/runtime/gtrace.c
+@@ -0,0 +1,356 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The stick trace (setting trace_stick): finds the guest code that reads the right stick. After a delay it holds the
++   right stick at a known value, searches the guest memory for the two floats the game makes of it, and protects the
++   pages of the matches. Every access to a match is logged by the guest function that made it. Windows only: the
++   exception handler lets each protected access run alone (the trap flag) and protects the page again. */
++#include "nx/runtime/gtrace.h"
++#include "nx/runtime/main.h"
++#include "nx/hle/kernel/kernel.h"
++#include "nx/memory/mem.h"
++#include "nx/runtime/platform/log.h"
++#include "nx/runtime/platform/plat.h"
++#include <string.h>
++
++#define GT_STICK_X     14158 /* the held right stick in the pad's range, 0.432 of the travel */
++#define GT_STICK_Y     4043  /* and 0.123 */
++#define GT_STICK_RANGE 32767.0f
++#define GT_HOLD_NS     ((u64)2000000000) /* the stick is held this long before the search: the game reads it by then */
++#define GT_MAX_MATCHES 128
++#define GT_MAX_PAGES   48
++#define GT_MAX_HITS    512
++#define GT_PAGE        4096
++#define GT_MATCHES_PER_PAGE 4
++#define GT_WORD_BYTES  8 /* the two floats of a stick */
++#define GT_STACK_BELOW 0x400 /* the stack searched around a reader's sp, for the copies it leaves */
++#define GT_STACK_ABOVE 0x800
++#define GT_MAX_DUMPS   12 /* the game threads' registers and call chains logged for the first reads */
++
++enum { GT_WAIT, GT_HOLD, GT_WATCH, GT_DONE };
++static int g_state;
++static u64 g_t0, g_ts;
++
++#if defined(_WIN32)
++#include <windows.h>
++
++typedef struct {
++    u64 fn, off; /* the guest function and the host offset in it (the host pc when it is not game code) */
++    int match, write;
++    long count;
++} GtHit;
++static u8* g_match[GT_MAX_MATCHES];
++static int g_nmatch;
++static u8* g_page[GT_MAX_PAGES];
++static int g_npage;
++static GtHit g_hit[GT_MAX_HITS];
++static int g_nhit;
++static volatile LONG g_lock;
++static _Thread_local int tl_pending = -1; /* the page whose access runs alone on this thread */
++
++static u32 float_bits(float f) {
++    u32 b;
++    memcpy(&b, &f, sizeof b);
++    return b;
++}
++
++/* every committed readable region of the guest memory, searched for the held stick's two floats (x then y) */
++static void scan(void) {
++    u32 bx = float_bits((float)GT_STICK_X / GT_STICK_RANGE), by = float_bits((float)GT_STICK_Y / GT_STICK_RANGE);
++    MEMORY_BASIC_INFORMATION mbi;
++    u8 *p = g_mem, *end = g_mem + AS_SIZE;
++    g_nmatch = 0;
++    while (p < end && VirtualQuery(p, &mbi, sizeof mbi)) {
++        u8* next = (u8*)mbi.BaseAddress + mbi.RegionSize;
++        if (mbi.State == MEM_COMMIT && !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
++            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
++            const u32* w = (const u32*)mbi.BaseAddress;
++            size_t i, n = mbi.RegionSize / sizeof(u32);
++            for (i = 0; i + 1 < n && g_nmatch < GT_MAX_MATCHES; i++) {
++                int k, same_page = 0;
++                if (w[i] != bx || w[i + 1] != by) continue;
++                /* a table with the value in each entry would use up the words and the pages */
++                for (k = 0; k < g_nmatch; k++)
++                    if (((size_t)g_match[k] >> 12) == ((size_t)(w + i) >> 12)) same_page++;
++                if (same_page < GT_MATCHES_PER_PAGE) g_match[g_nmatch++] = (u8*)(w + i);
++            }
++        }
++        p = next;
++    }
++}
++
++static int page_index(const u8* a) {
++    int i;
++    for (i = 0; i < g_npage; i++)
++        if (a >= g_page[i] && a < g_page[i] + GT_PAGE) return i;
++    return -1;
++}
++static int match_at(const u8* a) {
++    int i;
++    for (i = 0; i < g_nmatch; i++)
++        if (a >= g_match[i] && a < g_match[i] + GT_WORD_BYTES) return i;
++    return -1;
++}
++
++/* the copies of the stick that a reader left on its thread's stack: the frames of the next calls use the same slots, so
++   watching them finds the code that takes the stick from the reader (the listeners). Added to the watched words */
++static void stack_watch(const KThread* t) {
++    u32 bx = float_bits((float)GT_STICK_X / GT_STICK_RANGE), by = float_bits((float)GT_STICK_Y / GT_STICK_RANGE);
++    u64 sp = t->cpu.x[31];
++    const u32* w;
++    const u8 *lo, *hi;
++    size_t i, n;
++    MEMORY_BASIC_INFORMATION mbi;
++    DWORD old;
++    if (sp < GT_STACK_BELOW || sp + GT_STACK_ABOVE >= AS_SIZE) return;
++    if (!VirtualQuery(g_mem + sp, &mbi, sizeof mbi) || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
++        return;
++    lo = g_mem + sp - GT_STACK_BELOW; /* only what is committed: a stack ends, and the page past it is not there */
++    hi = g_mem + sp + GT_STACK_ABOVE;
++    if (lo < (const u8*)mbi.BaseAddress) lo = (const u8*)mbi.BaseAddress;
++    if (hi > (const u8*)mbi.BaseAddress + mbi.RegionSize) hi = (const u8*)mbi.BaseAddress + mbi.RegionSize;
++    w = (const u32*)lo;
++    n = (size_t)(hi - lo) / sizeof(u32);
++    {
++        static LONG said;
++        if (InterlockedIncrement(&said) <= 8)
++            WARN("trace: stack search around sp %llx, %llx bytes from guest %llx\n", (unsigned long long)sp,
++                 (unsigned long long)(hi - lo), (unsigned long long)(lo - g_mem));
++    }
++    for (i = 0; i + 1 < n; i++) {
++        u8* a = (u8*)(w + i);
++        int j, page;
++        if (w[i] != bx || w[i + 1] != by || match_at(a) >= 0 || g_nmatch >= GT_MAX_MATCHES) continue;
++        page = page_index(a);
++        if (page < 0) {
++            if (g_npage >= GT_MAX_PAGES) continue;
++            g_page[g_npage] = (u8*)((size_t)a & ~(size_t)(GT_PAGE - 1));
++            for (j = 0; j < g_npage; j++)
++                if (g_page[j] == g_page[g_npage]) break;
++            if (j == g_npage) {
++                g_npage++;
++                VirtualProtect(g_page[j], GT_PAGE, PAGE_NOACCESS, &old);
++            }
++        }
++        g_match[g_nmatch] = a;
++        g_nmatch++;
++        WARN("trace: stack copy %d at guest %llx (sp %llx)\n", g_nmatch - 1, (unsigned long long)(a - g_mem),
++             (unsigned long long)sp);
++    }
++}
++
++/* adds the 8 bytes at guest address ga to the watched words (and its page to the protected pages) */
++static void add_watch(u64 ga, const char* why) {
++    u8* a = g_mem + ga;
++    DWORD old;
++    int j, page;
++    if (ga < 0x10000 || ga + 8 >= AS_SIZE || match_at(a) >= 0 || g_nmatch >= GT_MAX_MATCHES) {
++        WARN("trace: no watch at guest %llx (%s): range %d, already %d, full %d\n", (unsigned long long)ga, why,
++             ga < 0x10000 || ga + 8 >= AS_SIZE, match_at(a) >= 0, g_nmatch >= GT_MAX_MATCHES);
++        return;
++    }
++    page = page_index(a);
++    if (page < 0) {
++        u8* pg = (u8*)((size_t)a & ~(size_t)(GT_PAGE - 1));
++        if (g_npage >= GT_MAX_PAGES) return;
++        for (j = 0; j < g_npage && g_page[j] != pg; j++) {
++        }
++        if (j == g_npage) {
++            g_page[g_npage] = pg;
++            g_npage++;
++            VirtualProtect(pg, GT_PAGE, PAGE_NOACCESS, &old);
++        }
++    }
++    g_match[g_nmatch] = a;
++    g_nmatch++;
++    WARN("trace: watching word %d at guest %llx (%s)\n", g_nmatch - 1, (unsigned long long)ga, why);
++}
++
++/* The distributors build the input structure in their frame, with the sticks at fixed places: a50d75c at sp+0x6c and
++   sp+0x74, 96f41a8 at sp+0x8 and sp+0x10. The sp of the CPU state is the one of the last call, the frame's own or its
++   caller's, so both frames are watched. The readers of these words are the code that takes the sticks from the structure */
++static void frame_watch(const KThread* t, u64 fn) {
++    static u64 done[8];
++    static int ndone;
++    u64 sp = t->cpu.x[31], frame = fn == 0xa50d75c ? 0xe0 : 0x70, a, b;
++    int i;
++    WARN("trace: frame watch for %llx at sp %llx (done %d)\n", (unsigned long long)fn, (unsigned long long)sp, ndone);
++    for (i = 0; i < ndone; i++)
++        if (done[i] == sp + fn) return;
++    if (ndone == 8) return;
++    done[ndone++] = sp + fn;
++    a = fn == 0xa50d75c ? 0x6c : 0x8;
++    b = fn == 0xa50d75c ? 0x74 : 0x10;
++    add_watch(sp + a, "own frame");
++    add_watch(sp + b, "own frame");
++    add_watch(sp - frame + a, "frame below the synced sp");
++    add_watch(sp - frame + b, "frame below the synced sp");
++}
++
++static void record(void* pc, int match, int write) {
++    u64 fn = 0, off = 0;
++    int i, fresh = 0, again = 0;
++    static LONG dumps;
++    static u64 scanned[8];
++    static int nscanned;
++    if (!crash_game_function_at((u64)(size_t)pc, &fn, &off)) off = (u64)(size_t)pc;
++    while (InterlockedCompareExchange(&g_lock, 1, 0)) YieldProcessor();
++    for (i = 0; i < g_nhit; i++)
++        if (g_hit[i].fn == fn && g_hit[i].off == off && g_hit[i].match == match && g_hit[i].write == write) break;
++    if (i < g_nhit) {
++        g_hit[i].count++;
++        if (!write && g_hit[i].count == 3 && fn && nscanned < 8) {
++            int k;
++            for (k = 0; k < nscanned && scanned[k] != fn; k++) {}
++            if (k == nscanned) scanned[nscanned++] = fn, again = 1;
++        }
++    } else if (g_nhit < GT_MAX_HITS) {
++        g_hit[g_nhit].fn = fn;
++        g_hit[g_nhit].off = off;
++        g_hit[g_nhit].match = match;
++        g_hit[g_nhit].write = write;
++        g_hit[g_nhit].count = 1;
++        g_nhit++;
++        fresh = 1;
++    }
++    InterlockedExchange(&g_lock, 0);
++    if (again && kthread_cur()) stack_watch(kthread_cur());
++    if (!write && (fn == 0xa50d75c || fn == 0x96f41a8) && kthread_cur()) frame_watch(kthread_cur(), fn);
++    if (fresh && !write && InterlockedIncrement(&dumps) <= GT_MAX_DUMPS) {
++        KThread* t = kthread_cur();
++        WARN("trace: first read by game function %llx (+%llx on the host) of match %d\n",
++             (unsigned long long)fn, (unsigned long long)off, match);
++        if (t) kernel_dump_regs(&t->cpu);
++    }
++}
++
++#define GT_TRAP_SCANS     3   /* the traps after a read in which the stack is searched */
++#define GT_TRAP_SCANS_MAX 400 /* and the most searches in all: each one costs a little */
++static _Thread_local int tl_scans; /* the searches this thread has left after its last read of the stick */
++static volatile LONG g_scans_done;
++
++/* an access to a watched page beside the stick's words, soon after a reader took the stick: its copy is on the stack,
++   so the stack is searched */
++static void trap_scan(void) {
++    if (tl_scans <= 0 || !kthread_cur()) return;
++    tl_scans--;
++    if (InterlockedIncrement(&g_scans_done) <= GT_TRAP_SCANS_MAX) stack_watch(kthread_cur());
++}
++
++static LONG WINAPI watch_handler(EXCEPTION_POINTERS* e) {
++    EXCEPTION_RECORD* r = e->ExceptionRecord;
++    DWORD old;
++    if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && r->NumberParameters >= 2 && g_state == GT_WATCH) {
++        const u8* a = (const u8*)r->ExceptionInformation[1];
++        int page = page_index(a), match = page < 0 ? -1 : match_at(a);
++        if (page < 0) return EXCEPTION_CONTINUE_SEARCH;
++        if (match >= 0) {
++            record(r->ExceptionAddress, match, r->ExceptionInformation[0] == 1);
++            if (r->ExceptionInformation[0] != 1) tl_scans = GT_TRAP_SCANS;
++        } else {
++            trap_scan();
++        }
++        VirtualProtect(g_page[page], GT_PAGE, PAGE_READWRITE, &old);
++        tl_pending = page;
++        e->ContextRecord->EFlags |= 0x100; /* the trap flag: one instruction, then EXCEPTION_SINGLE_STEP */
++        return EXCEPTION_CONTINUE_EXECUTION;
++    }
++    if (r->ExceptionCode == EXCEPTION_SINGLE_STEP && tl_pending >= 0) {
++        if (g_state == GT_WATCH) VirtualProtect(g_page[tl_pending], GT_PAGE, PAGE_NOACCESS, &old);
++        tl_pending = -1;
++        return EXCEPTION_CONTINUE_EXECUTION;
++    }
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++
++static void watch_start(void) {
++    DWORD old;
++    int i, j;
++    g_npage = 0;
++    g_nhit = 0;
++    for (i = 0; i < g_nmatch; i++) {
++        u8* page = (u8*)((size_t)g_match[i] & ~(size_t)(GT_PAGE - 1));
++        for (j = 0; j < g_npage && g_page[j] != page; j++) {
++        }
++        if (j == g_npage && g_npage < GT_MAX_PAGES) g_page[g_npage++] = page;
++    }
++    AddVectoredExceptionHandler(1, watch_handler);
++    for (i = 0; i < g_npage; i++) VirtualProtect(g_page[i], GT_PAGE, PAGE_NOACCESS, &old);
++}
++static void watch_stop(void) {
++    DWORD old;
++    int i;
++    for (i = 0; i < g_npage; i++) VirtualProtect(g_page[i], GT_PAGE, PAGE_READWRITE, &old);
++    RemoveVectoredExceptionHandler(watch_handler);
++}
++
++static void summary(void) {
++    int i;
++    LOG("trace: %d places read or wrote the held stick's words\n", g_nhit);
++    for (i = 0; i < g_nhit; i++) {
++        const GtHit* h = &g_hit[i];
++        if (h->fn)
++            LOG("trace: %s of match %d (guest %llx) by game function %llx (+%llx on the host), %ld times\n",
++                h->write ? "write" : "read", h->match, (unsigned long long)(g_match[h->match] - g_mem),
++                (unsigned long long)h->fn, (unsigned long long)h->off, h->count);
++        else
++            LOG("trace: %s of match %d (guest %llx) by the runtime or a library at host %llx, %ld times\n",
++                h->write ? "write" : "read", h->match, (unsigned long long)(g_match[h->match] - g_mem),
++                (unsigned long long)h->off, h->count);
++    }
++}
++
++void gtrace_poll(void) {
++    u64 now;
++    int i;
++    if (!g_settings.trace_stick || g_state == GT_DONE) return;
++    now = plat_ns();
++    if (!g_t0) {
++        g_t0 = now;
++        return;
++    }
++    switch (g_state) {
++        case GT_WAIT:
++            if (now - g_t0 < (u64)g_settings.trace_stick_start * 1000000000u) return;
++            LOG("trace: holding the right stick at %d %d\n", GT_STICK_X, GT_STICK_Y);
++            g_state = GT_HOLD;
++            g_ts = now;
++            break;
++        case GT_HOLD:
++            if (now - g_ts < GT_HOLD_NS) return;
++            scan();
++            LOG("trace: %d matches of the stick's floats in the guest memory\n", g_nmatch);
++            for (i = 0; i < g_nmatch; i++)
++                LOG("trace: match %d at guest %llx\n", i, (unsigned long long)(g_match[i] - g_mem));
++            if (!g_nmatch) {
++                g_state = GT_DONE;
++                return;
++            }
++            g_state = GT_WATCH; /* before the pages are protected: the handler takes only accesses in this state */
++            g_ts = now;
++            watch_start();
++            LOG("trace: watching %d pages for %d seconds\n", g_npage, g_settings.trace_stick_seconds);
++            break;
++        case GT_WATCH:
++            if (now - g_ts < (u64)g_settings.trace_stick_seconds * 1000000000u) return;
++            g_state = GT_DONE;
++            watch_stop();
++            summary();
++            break;
++        default: break;
++    }
++}
++#else
++void gtrace_poll(void) {
++    if (g_settings.trace_stick && g_state != GT_DONE) {
++        LOG("trace: the stick trace works on Windows only\n");
++        g_state = GT_DONE;
++    }
++}
++#endif
++
++int gtrace_stick(i32* x, i32* y) {
++    if (g_state != GT_HOLD && g_state != GT_WATCH) return 0;
++    *x = GT_STICK_X;
++    *y = GT_STICK_Y;
++    return 1;
++}
+diff --git a/src/nx/runtime/gtrace.h b/src/nx/runtime/gtrace.h
+new file mode 100644
+index 0000000..07898ca
+--- /dev/null
++++ b/src/nx/runtime/gtrace.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++   Copyright 2026 the NXAevora contributors */
++/* The stick trace: a diagnostic that finds the guest code reading the right stick (docs/camera-analysis.md) */
++#ifndef SNX_GTRACE_H
++#define SNX_GTRACE_H
++#include "common/cpu/aarch64/cpu.h"
++
++/* once per main loop pass: runs the trace's steps (waiting, holding the stick, searching, watching, the summary) */
++void gtrace_poll(void);
++/* 1 while the right stick is held at the trace's value: x and y are in the pad's range */
++int gtrace_stick(i32* x, i32* y);
++/* the recompiled function a host pc is in (crash.c) */
++int crash_game_function_at(u64 pc, u64* guest, u64* offset);
++
++#endif
+diff --git a/src/nx/runtime/platform/backend/sdl3.c b/src/nx/runtime/platform/backend/sdl3.c
+index ad75514..5c3d63f 100644
+--- a/src/nx/runtime/platform/backend/sdl3.c
++++ b/src/nx/runtime/platform/backend/sdl3.c
+@@ -4,6 +4,7 @@
+    and touch. Runs natively on Wayland and on X11 (SDL_VIDEO_DRIVER=x11 picks X11), and takes the unattended-run
+    options (seconds, frames, shot, shot_every, press_len, script: platform/unattended.c). */
+ #include "nx/runtime/main.h"
++#include "nx/runtime/gtrace.h"
+ #include "nx/runtime/options.h"
+ #include "nx/runtime/pause.h"
+ #include "nx/runtime/state.h"
+@@ -1528,6 +1529,8 @@ void video_poll(void) {
+             rx = mx;
+             ry = my;
+         }
++        gtrace_poll();
++        gtrace_stick(&rx, &ry);
+     }
+     { /* the on-screen controls, as one more pad: their sticks over the others' while held */
+         u64 vb;
+diff --git a/src/nx/runtime/settings.txt b/src/nx/runtime/settings.txt
+index 61cee43..22390ed 100644
+--- a/src/nx/runtime/settings.txt
++++ b/src/nx/runtime/settings.txt
+@@ -577,6 +577,22 @@ setting Log level
+     int 0 2
+     default 1
+     help The log's detail, 0 to 2: 2 logs everything, which slows the game down
++setting Trace stick
++    key trace_stick
++    int 0 1
++    default 0
++    help A diagnostic for the camera: 1 = after Trace stick start seconds the right stick is held at a known value, the
++    help game memory is searched for it, and the code that reads and writes those words is logged (Windows only)
++setting Trace stick start
++    key trace_stick_start
++    int 5 3600
++    default 60
++    help The seconds after the start at which the stick trace begins
++setting Trace stick seconds
++    key trace_stick_seconds
++    int 2 120
++    default 10
++    help How long the stick is held and the words are watched
+ setting Log size limit
+     key log_max
+     int 1 1024

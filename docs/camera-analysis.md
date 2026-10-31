@@ -179,8 +179,8 @@ the six copies of 993ed00 and the three objects of 99510b4, which this one frame
 
 ## Status of the work (paused by the user's decision)
 
-The investigation is closed for now. The stick trace stays in the runtime (patch `0001-native-mouse-input.patch`) and is
-off by default (`trace_stick=0`). To go on: read the large reader 0x99ea4b8 and the readers of the persistent copies
+The investigation is closed for now. The stick trace is in its own patch (`recomp/patches/0003-stick-trace.patch`, apply
+it after `0001`) and is not in the runtime now. To go on, apply it and set `trace_stick=1`. Then read the large reader 0x99ea4b8 and the readers of the persistent copies
 (0x155872b40, the three objects of 0x99510b4, the six copies of 0x993ed00), and run the trace with a shorter watch time or
 with fewer protected pages so that the game does not run at a crawl. The game-code patch `camera-unclamp.pchtxt` had no
 effect on the camera and is removed from the game (the copy in `recomp/patches/` stays as a record).
