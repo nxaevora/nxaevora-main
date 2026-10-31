@@ -207,3 +207,8 @@ Sources to find in step 1 (a value that no source gives shows as `?`, as the sta
   `legacy_menu=1` opens it anyway, because its gamepad button map and save state pages have no window yet. These two
   pages, the on-screen controls' edit mode and the stats corner are the first things for the Settings window. The scripted
   Home press (unattended runs) still opens it.
+- Review of patches 0013 to 0019 (code reviewer agent, GPT-6.1-Sol): 23 findings. Group 1 (name input) is fixed by patch
+  `0020-imgui-keyboard-fixes.patch`: findings 2, 3, 4, 5, 6, 11, 12 and 13. Built and the shader and settings tests pass,
+  not yet run. Left: group 2 (key and button releases on queue overflow and on the old menu's bypass, Alt, the Vulkan
+  error handler), group 3 (NVML loader, GPU choice, small rules) and two design points (refresh while the game does not
+  present, the 0.5 s test of the windows). No test covers the new code yet.
