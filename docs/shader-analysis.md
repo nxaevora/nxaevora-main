@@ -40,13 +40,63 @@ repository.
 - `RED` is a reduction atomic. The translator handles some forms (`global_atomic_opcode`) and returns
   `0xffffffff` for the others. The form of this word is the missing one.
 
+## Decode of the `RED` word
+
+Fields of `ebf9000000270406`, read with the bit positions of `global_atomic_opcode` (`spirv_translate.c:320`):
+
+| Field | Bits | Value | Meaning |
+| ----- | ---- | ----- | ------- |
+| value register | 0 to 7 | 0x06 | R6 (a 64-bit value uses R6 and R7) |
+| address register | 8 to 15 | 0x04 | R4 |
+| size | 20 to 22 | 2 | 64-bit unsigned integer |
+| operation | 23 to 25 | 0 | add |
+
+So the program does `RED.E.ADD.64`, a 64-bit add into global memory. The function returns 0 for each size other than
+0, 1 and 3 (the 32-bit forms and the float add), so the translator rejects the program. The size 2 is the missing form.
+The program is a fragment program, and the draw is skipped in each frame because of it.
+
+What the translator would need (not started):
+
+- The module must declare the capabilities `Int64` and `Int64Atomics`, and the device must have the feature
+  `shaderBufferInt64Atomics`. The runtime asks for `shaderInt64` now (`device.c:253`) and does not ask for the second.
+  Whether the RTX 2060 SUPER has it is not checked here.
+- The pointer code (`global_atomic_pointer`) gives a pointer to one 32-bit word of the buffer. A 64-bit access needs a
+  64-bit view of the same buffer.
+- An emulation with two 32-bit atomics is not exact. The pair is not one atomic step, and the carry between the two
+  halves can be lost when two invocations add at once.
+
+What the program does with the 64-bit counter is not known. A 64-bit add in a fragment program is usually a counter or
+a sum over the pixels (for example statistics or exposure).
+
+## Patch 0002: `RED.E.ADD.64` added (built, not yet run)
+
+The user decided to add the form. The patch is `recomp/patches/0002-global-red-add-u64.patch` and it changes the
+working tree of the submodule (not committed, like patch 0001).
+
+- The module declares `Int64` and `Int64Atomics`. Each global buffer is also declared as an array of 64-bit words on
+  the same binding, and both variables carry the decoration `Aliased`. The atomic adds through the 64-bit view
+  (`OpAtomicIAdd` on a `ulong` pointer). The pair of registers R(d) and R(d+1) is the value.
+- The device asks for `shaderBufferInt64Atomics` (Vulkan 1.2 feature). A device without it makes `vk_spirv_unavailable`
+  refuse the program, which is the old behavior.
+- Only the add is added. The other 64-bit forms of `RED` and of `ATOM` stay refused.
+- The word index goes through the page map as before and is divided by 2. This holds when the address is a multiple
+  of 8, which the instruction needs. An address that is not aligned is not checked.
+- Checks done: the build, the ten shader tests of `ctest`, and a new regression test. Its output passes `spirv-val`
+  with the target `vulkan1.3`. The disassembly shows the two capabilities, the two `Aliased` variables and one
+  `OpAtomicIAdd %ulong`.
+- Not done: a run of the game. A build is not a test. Whether the driver accepts the module and whether the skipped
+  draws go to 0 needs the user's run (see below).
+
+How to read the run: the log must not have the line `shader 3aa06ea216ba378c (stage 4) not translated`, and the count
+of skipped draws must stop growing by 600 in each 20 s window. If the log shows a failed pipeline for this program,
+the driver did not accept the aliased 64-bit view.
+
 ## What is open
 
-1. Decode `ebf9000000270406`: find which `RED` form it is and what the program does with it. Then decide if the form can
-   be added to the translator (`spirv_translate.c`, ScarletNX).
-2. Find the draw that is skipped each frame, to see what it draws. A log of the draw state at the skip would show it.
-3. Check the 4 programs with the offset words against the disassembly, to see if they are jump table data.
-4. Run the scenes of the 10 interface programs (bag, box, clothes, battle introduction) and read the log for draws
+1. Find the draw that is skipped each frame, to see what it draws. A log of the draw state at the skip would show it.
+2. Check the 4 programs with the offset words against the disassembly, to see if they are jump table data.
+3. Run the scenes of the 10 interface programs (bag, box, clothes, battle introduction) and read the log for draws
    that fail at the first use.
 
-Items 1 and 3 need only files. Item 2 needs a patch of the runtime log. Item 4 needs the user to run the game.
+Item 2 needs only files. Item 1 needs a patch of the runtime log (it may not be needed if the run of patch 0002 shows
+that the skipped draws are gone). Item 3 needs the user to run the game.
