@@ -1,0 +1,89 @@
+diff --git a/src/nx/hle/kernel/debug.c b/src/nx/hle/kernel/debug.c
+index 394d666..edbf747 100644
+--- a/src/nx/hle/kernel/debug.c
++++ b/src/nx/hle/kernel/debug.c
+@@ -342,11 +342,13 @@ static const char* thread_state(const KThread* t, char* s, size_t n) {
+ /* A thread that called svcSleepThread 100 times or more since the last dump polls something: its registers at its last
+    sleep, what they point at, and the code around the sleep's return address and its three callers'. Counted per
+    thread slot (g_hle.debug.sleeps), from 0 again when a new thread takes the slot */
+-static void dump_sleeps(const KThread* t, u64 since) {
++static void dump_sleeps(const KThread* t, u64 since, u64 req_ns, u64 took_ns) {
+     char ls[200];
+     u64 f[3];
+     int i, n;
+     sym_name(t->sleep_lr, ls, sizeof ls);
++    LOG("    %llu svcSleepThread calls since the last dump asked for %.1f ms in all and took %.1f ms (%.1f ms for a call)\n",
++        (unsigned long long)since, (double)req_ns / 1e6, (double)took_ns / 1e6, since ? (double)took_ns / 1e6 / (double)since : 0.0);
+     LOG("    %llu svcSleepThread calls since the last dump, the last from %llx %s, with:\n", (unsigned long long)since,
+         (unsigned long long)t->sleep_lr, ls);
+     for (i = 0; i < 31; i += 4)
+@@ -387,6 +389,7 @@ void kernel_dump_threads(void) {
+         if (g_hle.debug.sleeps[i].tid != t->id) {
+             g_hle.debug.sleeps[i].tid = t->id;
+             g_hle.debug.sleeps[i].n = 0;
++            g_hle.debug.sleeps[i].req_ns = g_hle.debug.sleeps[i].took_ns = 0;
+         }
+         if (t->state == 0) continue;
+         pc = wide ? t->cpu.pc : t->arm.r[15];
+@@ -404,8 +407,12 @@ void kernel_dump_threads(void) {
+         }
+         if (t->id == g_hle.thread.main_tid) /* the main thread's callers: where it waits on the rest of the game */
+             for (k = 0; k < nf && k < 3; k++) dump_code(1, "code at a caller", f[k] - 0x20, f[k] + 0x20, f[k]);
+-        if (t->sleep_n - g_hle.debug.sleeps[i].n >= (u64)g_dump_sleep_min) dump_sleeps(t, t->sleep_n - g_hle.debug.sleeps[i].n);
++        if (t->sleep_n - g_hle.debug.sleeps[i].n >= (u64)g_dump_sleep_min)
++            dump_sleeps(t, t->sleep_n - g_hle.debug.sleeps[i].n, t->sleep_req_ns - g_hle.debug.sleeps[i].req_ns,
++                        t->sleep_took_ns - g_hle.debug.sleeps[i].took_ns);
+         g_hle.debug.sleeps[i].n = t->sleep_n;
++        g_hle.debug.sleeps[i].req_ns = t->sleep_req_ns;
++        g_hle.debug.sleeps[i].took_ns = t->sleep_took_ns;
+     }
+     dump_rings(1);
+ }
+diff --git a/src/nx/hle/kernel/kernel.h b/src/nx/hle/kernel/kernel.h
+index 13c3068..432ccd3 100644
+--- a/src/nx/hle/kernel/kernel.h
++++ b/src/nx/hle/kernel/kernel.h
+@@ -105,6 +105,7 @@ struct KThread {
+     u64 wait_tid; /* the thread a join waits for, for the thread dump */
+     i64 wait_timeout;
+     u64 sleep_lr, sleep_n, sleep_x[31]; /* where a sleep loop sleeps from, for diagnostics */
++    u64 sleep_req_ns, sleep_took_ns;    /* the time svcSleepThread was asked for in all, and the time its sleeps took */
+ };
+ 
+ typedef struct KShmem {
+diff --git a/src/nx/hle/kernel/kernel_int.h b/src/nx/hle/kernel/kernel_int.h
+index 4084429..b4d1894 100644
+--- a/src/nx/hle/kernel/kernel_int.h
++++ b/src/nx/hle/kernel/kernel_int.h
+@@ -242,7 +242,7 @@ typedef struct {
+     /* the svcSleepThread count of each thread slot's thread at the last dump, from 0 again when a new thread (tid)
+        takes the slot */
+     struct {
+-        u64 tid, n;
++        u64 tid, n, req_ns, took_ns;
+     } sleeps[KTHREAD_MAX];
+ } HleDebug;
+ /* svc.c */
+diff --git a/src/nx/hle/svc/svc.c b/src/nx/hle/svc/svc.c
+index 7345bb3..94f5969 100644
+--- a/src/nx/hle/svc/svc.c
++++ b/src/nx/hle/svc/svc.c
+@@ -166,6 +166,7 @@ static u32 start_thread(u32 h) {
+ /* svcSleepThread: a sleep off the core, or one of the three yields (0 on its core, -1 and -2 to any core) */
+ static void sleep_thread(KThread* t, i64 ns) {
+     int i;
++    u64 t0;
+     t->sleep_n++;
+     if (g_arm_mod) {
+         t->sleep_lr = t->arm.r[14];
+@@ -179,7 +180,10 @@ static void sleep_thread(KThread* t, i64 ns) {
+         pm_lock(&g_host.kernel.klock);
+         t->woken = 0;
+         t->wait_svc = WAIT_SVC_SLEEP;
++        t0 = plat_ns();
+         sleep_nl(t, ns);
++        t->sleep_req_ns += (u64)ns;
++        t->sleep_took_ns += plat_ns() - t0;
+         pm_unlock(&g_host.kernel.klock);
+         return;
+     }

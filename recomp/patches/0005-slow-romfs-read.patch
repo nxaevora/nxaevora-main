@@ -1,0 +1,49 @@
+diff --git a/src/nx/hle/filesystem/fs.c b/src/nx/hle/filesystem/fs.c
+index 4af27e59..89f9c7b5 100644
+--- a/src/nx/hle/filesystem/fs.c
++++ b/src/nx/hle/filesystem/fs.c
+@@ -1234,6 +1234,22 @@ static int check_transfer(i64 offset, IpcBuf buffer, i64 size) {
+     R_UNLESS((i64)buffer.size >= 0 && (u64)size <= buffer.size, FS_INVALID_SIZE);
+     R_SUCCEED();
+ }
++#define SLOW_READ_MS 50 /* a RomFS read this slow is logged while hitch_dump is on */
++
++/* romfs_read with its time, for hitch_dump: a read that takes this long can hold the game, and the log names its
++   place and size */
++static int storage_romfs_read(u64 off, void* dst, u64 size) {
++    u64 t0, ms;
++    int rc;
++    if (!__atomic_load_n(&g_settings.hitch_dump, __ATOMIC_RELAXED)) return romfs_read(off, dst, size, 0);
++    t0 = plat_ns();
++    rc = romfs_read(off, dst, size, 0);
++    ms = (plat_ns() - t0) / 1000000u;
++    if (ms >= SLOW_READ_MS)
++        LOG("fs: RomFS read of %llu bytes at %llx took %llu ms\n", (unsigned long long)size, (unsigned long long)off,
++            (unsigned long long)ms);
++    return rc;
++}
+ static int nn_fssrv_sf_IStorage_Read(SvcObj* self, i64 offset, IpcBuf buffer, i64 size_in) {
+     FileData* data = self->data;
+     u64 off = (u64)offset, sz = (u64)size_in, a = buffer.addr;
+@@ -1255,7 +1271,7 @@ static int nn_fssrv_sf_IStorage_Read(SvcObj* self, i64 offset, IpcBuf buffer, i6
+     if (!data) { /* the RomFS */
+         R_UNLESS(sz <= (u64)INT64_MAX - off && romfs_in(off, sz), FS_OUT_OF_RANGE);
+         R_UNLESS(buffer_valid(a, sz), FS_OUT_OF_RANGE);
+-        return romfs_read(off, GP(a), sz, 0) ? FS_OUT_OF_RANGE : 0;
++        return storage_romfs_read(off, GP(a), sz) ? FS_OUT_OF_RANGE : 0;
+     }
+     R_UNLESS(sz <= (u64)INT64_MAX - off && buffer_valid(a, sz), FS_OUT_OF_RANGE);
+     pm_lock(&g_hle.fs.tree.lock);
+diff --git a/tests/filesystem_service.c b/tests/filesystem_service.c
+index 264b0ef7..1d98ad4c 100644
+--- a/tests/filesystem_service.c
++++ b/tests/filesystem_service.c
+@@ -160,6 +160,8 @@ void plat_file_unshare(int fd, const u8* data, u64 size) {
+ }
+ static int test_left_said; /* the warnings that a folder was left by an older version, the last in test_left_text */
+ static char test_left_text[1024];
++/* platform/plat.c: the clock, which the slow read log of fs.c reads only while hitch_dump is on */
++u64 plat_ns(void) { return 0; }
+ /* memory/own.c: nothing is GPU-owned here */
+ void own_acquire(u64 addr, u64 size) { (void)addr, (void)size; }
+ static char test_fs_text[1024]; /* the last warning of fs.c's own, "fs: ..." */

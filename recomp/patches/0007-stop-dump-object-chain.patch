@@ -1,0 +1,44 @@
+diff --git a/src/nx/hle/kernel/debug.c b/src/nx/hle/kernel/debug.c
+index 2319cb0..394d666 100644
+--- a/src/nx/hle/kernel/debug.c
++++ b/src/nx/hle/kernel/debug.c
+@@ -183,6 +183,30 @@ static void dump_pointees(int lvl, const char* reg, const u64* r, int nr, int wo
+         logf_(lvl, "  mem %s%d %llx:%s\n", reg, i, (unsigned long long)a, line);
+     }
+ }
++/* A stop's dump (g_dump_sleep_min is 1): the memory a register points at, then what its first pointer points at, then
++   what that points at, as a pointer to an object does (the pointer, the object, its virtual function table with the
++   names of the functions in it). Each level is read once, after the check that it can be read */
++static void dump_chain(int lvl, int reg, u64 a) {
++    int level, k;
++    for (level = 0; level < 3 && a >= 0x10000 && !(a & 7); level++) {
++        char line[24 * 9 + 1];
++        size_t l = 0;
++        int words = level == 2 ? 24 : 8;
++        u64 next;
++        if (!readable(a, 4 * (u64)words)) return;
++        next = (u64)gr32(a) | (u64)gr32(a + 4) << 32;
++        for (k = 0; k < words; k++) l += (size_t)sprintf(line + l, " %08x", gr32(a + 4 * (u64)k));
++        logf_(lvl, "  x%d level %d %llx:%s\n", reg, level, (unsigned long long)a, line);
++        if (level == 2)
++            for (k = 0; k < 12; k++) {
++                char name[200];
++                u64 f = (u64)gr32(a + 8 * (u64)k) | (u64)gr32(a + 8 * (u64)k + 4) << 32;
++                sym_name(f, name, sizeof name);
++                logf_(lvl, "      vtable[%d] %llx %s\n", k, (unsigned long long)f, name);
++            }
++        a = next;
++    }
++}
+ /* the last 40 SVCs (the ring svc.c's dispatch fills) and 32 IPC requests, oldest first. Each ring's count is read
+    once: other threads go on filling them */
+ static void dump_rings(int lvl) {
+@@ -331,6 +355,8 @@ static void dump_sleeps(const KThread* t, u64 since) {
+             (unsigned long long)(i + 2 < 31 ? t->sleep_x[i + 2] : 0), i + 3,
+             (unsigned long long)(i + 3 < 31 ? t->sleep_x[i + 3] : 0));
+     dump_pointees(1, "x", t->sleep_x, 31, 8);
++    if (g_dump_sleep_min == 1) /* a stop's dump: the callee-saved registers hold the objects that a loop works on */
++        for (i = 19; i < 29; i++) dump_chain(1, i, __atomic_load_n(&t->sleep_x[i], __ATOMIC_RELAXED));
+     dump_code(1, "code at the sleep", t->sleep_lr - 0x20, t->sleep_lr + 0x20, t->sleep_lr);
+     if (g_arm_mod) return; /* a 32-bit thread's frame pointer isn't among the SVC's registers */
+     n = frames(t->sleep_x[29], 1, f, 3);

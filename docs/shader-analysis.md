@@ -112,9 +112,21 @@ names come from `maxwell_opcodes.def`.
   table in a constant buffer`).
 - All the hits with `000003b800000380` (the programs in `bag_top`, `bag_top_over`, `blost`, `box_search`, `box_top`,
   `dressup`) have the same form: the table directly after the padding of the program, a run of 6 non-zero words, then
-  zeros. The other words (`000003f0000003b8`, `0000039800000360`) are the first entries of other tables. One of
-  them is in `bag_top_over` and `dressup` after words that are not a known opcode, so that form was not decoded. The
-  word `0000039800000360` is not in an archive, so it is in the executable (`main.data`), which was not read.
+  zeros.
+- The other two words are the same form. `000003f0000003b8` is in `main.data` (the module `main`, guest 0xc049f08, the
+  table directly after `EXIT` and `BRA`), and `0000039800000360` is in `fade_common_00.arc` (`EXIT`, `BRA`, `NOP`s,
+  then the table). `main.data` is the data segment of the `main` module, read with
+  `scarletnx --dump-modules <ExeFS folder> <folder>`. The word `000003b800000380` is also in `main.data` (guest
+  0xc047808). So the 4 programs that fail with an unknown opcode are: `a3c1291e` and `adb94885` (`000003b800000380`),
+  `45a7cf5b` (`000003f0000003b8`, in `main.data`) and one of `fade_common_00` (`0000039800000360`). All 4 have the table
+  right after the code.
+- The 6 programs of the first group have the table apart from the code. Checked on one: in `bag_top_over_00.arc` the
+  table at 0x17400 comes after `EXIT`, `BRA`, `NOP`s and 24 zero words. The length scan stops at the first zero word,
+  so the table is not part of the program. The other 5 were not opened.
+- So the two groups have one cause. The pass before the start has no constant buffer, so a `BRX` table is unknown. Where
+  the table is right after the code, the scan runs into it (4 programs, unknown opcode). Where zeros come between, the
+  scan stops in time, the translation succeeds, but it read a constant buffer and the pass drops the result (6
+  programs).
 - Reading: this is not a missing opcode. A draw reads the table from its bound constant buffer, the targets are known,
   and the scan ends at the `EXIT`. The 10 programs wait for their first draw. This is not proven for the draw: none
   of the 10 was drawn in the runs. The scenes that draw them (bag, box, clothes, battle introduction) are not tested.
@@ -165,4 +177,4 @@ log line has no gain.
 
 1. Find the draw that was skipped each frame, to see what it draws (the skips are 0 now, so this has little value).
 2. Done: the scenes of the 10 interface programs were run (see the run of 681 s).
-3. Check the form of the program with `000003f0000003b8` and the programs of `main.data`.
+3. Done: the form of the programs of `main.data` and of the two other words (see above).

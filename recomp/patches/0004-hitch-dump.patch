@@ -1,0 +1,88 @@
+diff --git a/src/nx/runtime/main.c b/src/nx/runtime/main.c
+index 6641536..f3cd485 100644
+--- a/src/nx/runtime/main.c
++++ b/src/nx/runtime/main.c
+@@ -510,18 +510,40 @@ void snx_save_before_exit(void) {
+    line (prepare_wait) */
+ #define STALL_NS ((u64)15000000000u)
+ 
+-static void write_threads(u64 second) {
+-    char path[sizeof g_statedir + 16];
++#define HITCH_DUMPS 6 /* the files of one run (hitch_dump) */
++
++/* the threads of the game to <name>, under a first line that tells when (name is threads.txt or hitch-N.txt) */
++static void write_threads_to(const char* name, const char* head) {
++    char path[sizeof g_statedir + 32];
+     FILE* f;
+-    snprintf(path, sizeof path, "%sthreads.txt", g_statedir);
++    snprintf(path, sizeof path, "%s%s", g_statedir, name);
+     f = fopen(path, "w");
+     if (!f) return;
+-    fprintf(f, "second %llu, frames %d\n", (unsigned long long)second, __atomic_load_n(&g_frames, __ATOMIC_RELAXED));
++    fprintf(f, "%s, frames %d\n", head, __atomic_load_n(&g_frames, __ATOMIC_RELAXED));
+     tls_log_redirect = f; /* this thread's lines only: the others keep the log */
+     kernel_dump_threads();
+     tls_log_redirect = NULL;
+     fclose(f);
+ }
++static void write_threads(u64 second) {
++    char head[48];
++    snprintf(head, sizeof head, "second %llu", (unsigned long long)second);
++    write_threads_to("threads.txt", head);
++}
++/* hitch_dump: the frame count has stood still for stopped_ms. At the setting and at twice it, the threads go to a file
++   of their own, so that the wait that holds the game shows in two snapshots of one stop */
++static void hitch_check(u64 stopped_ms, int* stage, int* dumps) {
++    int ms = __atomic_load_n(&g_settings.hitch_dump, __ATOMIC_RELAXED), want;
++    char name[24], head[96];
++    if (!ms) return;
++    want = stopped_ms >= 2 * (u64)ms ? 2 : stopped_ms >= (u64)ms ? 1 : 0;
++    if (want <= *stage || *dumps >= HITCH_DUMPS) return;
++    *stage = want;
++    snprintf(name, sizeof name, "hitch-%d.txt", ++*dumps);
++    snprintf(head, sizeof head, "no new frame for %llu ms", (unsigned long long)stopped_ms);
++    write_threads_to(name, head);
++    LOG("hitch: no new frame for %llu ms, the threads are in %s\n", (unsigned long long)stopped_ms, name);
++}
+ 
+ /* the host threads blocked on a mutex or waiting on a condition variable: the caller as an offset from pm_lock and the
+    mutex as one from pm_wait_base, which the runtime's symbols name (nm, addr2line). The watchdog's own report of a
+@@ -537,7 +559,7 @@ static void report_lock_waits(void) {
+ static void frontend_loop(void) {
+     const u64 period = 1000000000u / VI_REFRESH_HZ;
+     u64 tick = 0, next = plat_ns(), now, changed = next, rate_at = next;
+-    int frames = 0, stalls = 0, rate_frames = 0;
++    int frames = 0, stalls = 0, rate_frames = 0, hitch_stage = 0, hitch_dumps = 0;
+     while (!g_quit) {
+         int shown, paused;
+         SNX_ZONE(z_frontend, "frontend tick");
+@@ -597,7 +619,11 @@ static void frontend_loop(void) {
+         if (shown != frames || paused || overlay_keyboard_shown()) {
+             frames = shown;
+             changed = now;
+-        } else if (now - changed >= STALL_NS && stalls < 4) {
++            hitch_stage = 0;
++        } else {
++            hitch_check((now - changed) / 1000000u, &hitch_stage, &hitch_dumps);
++        }
++        if (now - changed >= STALL_NS && stalls < 4) {
+             stalls++;
+             changed = now;
+             WARN("No new frame for %llu seconds (%d shown, %llu GPU submissions): the game's threads\n",
+diff --git a/src/nx/runtime/settings.txt b/src/nx/runtime/settings.txt
+index 61cee43..8fd4ef6 100644
+--- a/src/nx/runtime/settings.txt
++++ b/src/nx/runtime/settings.txt
+@@ -577,6 +577,12 @@ setting Log level
+     int 0 2
+     default 1
+     help The log's detail, 0 to 2: 2 logs everything, which slows the game down
++setting Hitch dump
++    key hitch_dump
++    int 0 5000
++    default 0
++    help A diagnostic for stops: 0 = off. Else a stop of the frame count of this many milliseconds writes the game's
++    help threads and what each waits for to hitch-N.txt, and again at twice the time (six files at most)
+ setting Log size limit
+     key log_max
+     int 1 1024

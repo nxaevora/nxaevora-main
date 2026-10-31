@@ -118,7 +118,10 @@ Exit condition: the decision above is recorded. The optional check can be done a
   analysis is in `docs/stutter-analysis.md`: ScarletNX already prepares the shaders ahead of time, and the pipelines
   for new draw states cannot be made before the game uses them. Most slow frames are not from pipelines. The setting
   `async_pipelines=1` removed the wait for pipelines (0 ms in 375 s, with an empty cache), and the user reports clearly
-  less stutter. The cause of the other slow frames and of the stop of about 1.2 s at the start is not known.
+  less stutter. The stop of about 1.2 s to 1.4 s at the start is the game's own loading loop: its main thread starts 39
+  pooled objects one after the other and waits for each with a sleep of 16 ms, with no other thread busy and no slow file
+  read (see `docs/stutter-analysis.md`, the hitch runs). The runtime's sleeps are exact, so no fix is planned. The cause of
+  the other slow frames is not known.
 - Audio, input and save data.
 - Services of the console that Arceus needs and ScarletNX does not have yet (`runtime/hle`).
 

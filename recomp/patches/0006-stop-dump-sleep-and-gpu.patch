@@ -1,0 +1,80 @@
+diff --git a/src/nx/hle/kernel/debug.c b/src/nx/hle/kernel/debug.c
+index 7683807..2319cb0 100644
+--- a/src/nx/hle/kernel/debug.c
++++ b/src/nx/hle/kernel/debug.c
+@@ -340,6 +340,7 @@ static void dump_sleeps(const KThread* t, u64 since) {
+    the lock. The values can be a moment stale or mid-change (a slot freed or taken meanwhile), which is all a dump
+    needs. Mutex owners are named from the thread a waiter recorded, which needs no handle lookup: the waiter holds a
+    reference to it */
++int g_dump_sleep_min = 100;
+ void kernel_dump_threads(void) {
+     int i, n = 0;
+     for (i = 0; i < KTHREAD_MAX; i++) n += g_hle.thread.threads[i].o.type == KO_THREAD;
+@@ -377,7 +378,7 @@ void kernel_dump_threads(void) {
+         }
+         if (t->id == g_hle.thread.main_tid) /* the main thread's callers: where it waits on the rest of the game */
+             for (k = 0; k < nf && k < 3; k++) dump_code(1, "code at a caller", f[k] - 0x20, f[k] + 0x20, f[k]);
+-        if (t->sleep_n - g_hle.debug.sleeps[i].n >= 100) dump_sleeps(t, t->sleep_n - g_hle.debug.sleeps[i].n);
++        if (t->sleep_n - g_hle.debug.sleeps[i].n >= (u64)g_dump_sleep_min) dump_sleeps(t, t->sleep_n - g_hle.debug.sleeps[i].n);
+         g_hle.debug.sleeps[i].n = t->sleep_n;
+     }
+     dump_rings(1);
+diff --git a/src/nx/hle/kernel/kernel.h b/src/nx/hle/kernel/kernel.h
+index 9b30bba..13c3068 100644
+--- a/src/nx/hle/kernel/kernel.h
++++ b/src/nx/hle/kernel/kernel.h
+@@ -200,6 +200,9 @@ void kernel_load_symbols(void);
+ u64 kernel_find_symbol_exact(const char* name); /* 0 when no loaded module exports this name */
+ void kernel_dump_regs(CPU* c);
+ void kernel_dump_threads(void);
++/* a thread's last svcSleepThread registers go in a dump from this many calls since the last dump (100: a thread that
++   polls with sleeps, as a hang does). A stop's dump (hitch_dump) sets 1, to see what a thread that sleeps waits for */
++extern int g_dump_sleep_min;
+ void mem_report(char* out, int n);
+ 
+ /* g_klock, the kernel lock, is g_host.kernel.klock (hle.h): every list a waiter or signaller touches is under it */
+diff --git a/src/nx/runtime/main.c b/src/nx/runtime/main.c
+index f3cd485..82b98e1 100644
+--- a/src/nx/runtime/main.c
++++ b/src/nx/runtime/main.c
+@@ -513,7 +513,8 @@ void snx_save_before_exit(void) {
+ #define HITCH_DUMPS 6 /* the files of one run (hitch_dump) */
+ 
+ /* the threads of the game to <name>, under a first line that tells when (name is threads.txt or hitch-N.txt) */
+-static void write_threads_to(const char* name, const char* head) {
++static void report_lock_waits(void);
++static void write_threads_to(const char* name, const char* head, int stop) {
+     char path[sizeof g_statedir + 32];
+     FILE* f;
+     snprintf(path, sizeof path, "%s%s", g_statedir, name);
+@@ -521,14 +522,20 @@ static void write_threads_to(const char* name, const char* head) {
+     if (!f) return;
+     fprintf(f, "%s, frames %d\n", head, __atomic_load_n(&g_frames, __ATOMIC_RELAXED));
+     tls_log_redirect = f; /* this thread's lines only: the others keep the log */
++    g_dump_sleep_min = stop ? 1 : 100;
+     kernel_dump_threads();
++    g_dump_sleep_min = 100;
++    if (stop) { /* the host's side of the stop: what the GPU thread does, and the host threads that wait for a lock */
++        gpu_report_stall();
++        report_lock_waits();
++    }
+     tls_log_redirect = NULL;
+     fclose(f);
+ }
+ static void write_threads(u64 second) {
+     char head[48];
+     snprintf(head, sizeof head, "second %llu", (unsigned long long)second);
+-    write_threads_to("threads.txt", head);
++    write_threads_to("threads.txt", head, 0);
+ }
+ /* hitch_dump: the frame count has stood still for stopped_ms. At the setting and at twice it, the threads go to a file
+    of their own, so that the wait that holds the game shows in two snapshots of one stop */
+@@ -541,7 +548,7 @@ static void hitch_check(u64 stopped_ms, int* stage, int* dumps) {
+     *stage = want;
+     snprintf(name, sizeof name, "hitch-%d.txt", ++*dumps);
+     snprintf(head, sizeof head, "no new frame for %llu ms", (unsigned long long)stopped_ms);
+-    write_threads_to(name, head);
++    write_threads_to(name, head, 1);
+     LOG("hitch: no new frame for %llu ms, the threads are in %s\n", (unsigned long long)stopped_ms, name);
+ }
+ 
