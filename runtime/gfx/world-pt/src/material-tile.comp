@@ -1,0 +1,13 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D sourceImage;
+layout(buffer_reference,std430,buffer_reference_align=8) writeonly buffer Tile {uvec2 pixel[];};
+layout(push_constant) uniform Push {Tile target;} pc;
+void main(){
+    uvec2 p=gl_GlobalInvocationID.xy;
+    ivec2 size=textureSize(sourceImage,0);
+    float lod=max(0.,log2(float(max(size.x,size.y))/64.));
+    vec4 c=textureLod(sourceImage,(vec2(p)+.5)/64.,lod);
+    pc.target.pixel[64u*p.y+p.x]=uvec2(packHalf2x16(c.rg),packHalf2x16(c.ba));
+}

@@ -1,0 +1,118 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_ray_query : require
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D depthMap;
+layout(binding=3,rgba16f) uniform writeonly image2D shaded;
+layout(binding=5) uniform sampler2D albedoMap;
+layout(binding=6) uniform samplerCube environmentMap;
+layout(binding=7) uniform samplerCube diffuseProbe;
+layout(buffer_reference,std430,buffer_reference_align=16) buffer Vertices {vec4 v[];};
+layout(buffer_reference,std430,buffer_reference_align=4) buffer Counts {uint primary;uint covered;uint matchingDepth;uint bounce;};
+layout(push_constant) uniform Inputs {
+    vec4 camera;
+    Vertices vertices;
+    uvec2 scene, stats;
+    uint frame,count;
+    Vertices clip;
+    vec4 axisX,axisY,axisZ;
+} u;
+#ifdef BUILD_MESH
+void main(){
+    uint tri=gl_WorkGroupID.x*64u+gl_LocalInvocationIndex;
+    if(tri>=u.count)return;
+    uint first=tri*3u;
+    vec4 a=u.clip.v[first],b=u.clip.v[first+1],c=u.clip.v[first+2];
+    bool missing=all(equal(a,vec4(0)))&&all(equal(b,vec4(0)))&&all(equal(c,vec4(0)));
+    for(uint i=0;i<3;i++){
+        vec4 p=u.clip.v[first+i];
+        vec3 point=vec3(p.x*u.camera.x,-p.y*u.camera.y,p.w);
+        if(missing || any(isnan(point)) || any(isinf(point)))point=vec3(uintBitsToFloat(0x7fc00000u),0,0);
+        u.vertices.v[first+i]=vec4(point,1);
+    }
+}
+#else
+uint hash(uint x){x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;return x^(x>>16);}
+float sample01(uint x){return float(hash(x)>>8)/16777216.;}
+vec3 diffuse(vec3 n,uint seed){
+    float r=sample01(seed),a=6.2831853*sample01(seed+1);
+    vec3 t=normalize(cross(abs(n.z)<.9?vec3(0,0,1):vec3(0,1,0),n));
+    return sqrt(1.-r)*n+sqrt(r)*(cos(a)*t+sin(a)*cross(n,t));
+}
+bool traceScene(vec3 origin,vec3 direction,float nearT,float farT,out vec3 hit,out uint primitive){
+    rayQueryEXT ray;
+    rayQueryInitializeEXT(ray,accelerationStructureEXT(u.scene),gl_RayFlagsOpaqueEXT,255,origin,nearT,direction,farT);
+    while(rayQueryProceedEXT(ray)){}
+    if(rayQueryGetIntersectionTypeEXT(ray,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)return false;
+    hit=origin+direction*rayQueryGetIntersectionTEXT(ray,true);
+    primitive=uint(rayQueryGetIntersectionPrimitiveIndexEXT(ray,true));return true;
+}
+bool shadowed(vec3 origin,vec3 direction,float bias){
+    rayQueryEXT ray;
+    rayQueryInitializeEXT(ray,accelerationStructureEXT(u.scene),gl_RayFlagsOpaqueEXT|gl_RayFlagsTerminateOnFirstHitEXT,255,origin,bias,direction,5000.);
+    while(rayQueryProceedEXT(ray)){}
+    return rayQueryGetIntersectionTypeEXT(ray,true)!=gl_RayQueryCommittedIntersectionNoneEXT;
+}
+vec3 materialAt(vec3 hit,ivec2 size){
+    if(hit.z>0.){
+        vec2 uv=.5+.5*hit.xy/(u.camera.xy*hit.z);
+        if(all(greaterThanEqual(uv,vec2(0))) && all(lessThan(uv,vec2(1)))){
+            ivec2 p=ivec2(uv*vec2(size));
+            float z=texelFetch(depthMap,p,0).r;
+            float viewZ=1./max(1e-7,z*u.camera.z+u.camera.w);
+            if(z>0. && abs(viewZ-hit.z)<max(.01,.025*hit.z))
+                return clamp(texelFetch(albedoMap,p,0).rgb,vec3(0),vec3(.95));
+        }
+    }
+    return vec3(.36);
+}
+void main(){
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy),size=imageSize(shaded);
+    if(any(greaterThanEqual(pixel,size)))return;
+    vec3 direction=normalize(vec3(((vec2(pixel)+.5)/vec2(size)*2.-1.)*u.camera.xy,1));
+    vec3 origin=vec3(0),throughput=vec3(1),radiance=vec3(0);
+    float nearT=.01;
+    bool depthMatch=false;bool primaryHit=false;uint secondary=0;
+    uint seed=hash(uint(pixel.x+pixel.y*size.x))+hash(u.frame%64u);
+    for(uint depth=0;depth<3;depth++){
+        vec3 hit;uint primitive;
+        if(!traceScene(origin,direction,nearT,5000.,hit,primitive)){
+            vec3 worldDir=direction.x*u.axisX.xyz+direction.y*u.axisY.xyz+direction.z*u.axisZ.xyz;
+            if(depth==0u)radiance+=max(textureLod(environmentMap,worldDir,0.).rgb,vec3(0));break;
+        }
+        if(depth==0u){
+            float z=texelFetch(depthMap,pixel,0).r;
+            float expected=1./max(1e-7,z*u.camera.z+u.camera.w);
+            depthMatch=z>0. && abs(hit.z-expected)<max(.02,expected*.025);
+        }
+        primaryHit=true;
+        if(depth>0)secondary++;
+        uint j=3u*primitive;vec3 a=u.vertices.v[j].xyz;
+        vec3 normal=normalize(cross(u.vertices.v[j+1].xyz-a,u.vertices.v[j+2].xyz-a));
+        if(dot(normal,direction)>0.)normal=-normal;
+        throughput*=materialAt(hit,size);
+        nearT=max(.0005,.00008*length(hit));origin=hit+normal*nearT;
+        vec3 worldNormal=normal.x*u.axisX.xyz+normal.y*u.axisY.xyz+normal.z*u.axisZ.xyz;
+        // The guest diffuse probe contains local irradiance, including light in enclosed rooms.
+        // Use it as a finite-length termination estimate at surfaces, weighted across path depths.
+        vec3 localLight=max(textureLod(diffuseProbe,normalize(worldNormal),0.).rgb,vec3(0));
+        radiance+=throughput*localLight*(depth==0u?.72:depth==1u?.20:.08);
+        // Sample the environment directly. A second cosine-weighted sample continues to other surfaces.
+        vec3 lightDir=diffuse(normal,seed+depth*111u+53u);
+        if(!shadowed(origin,lightDir,nearT)){
+            vec3 worldDir=lightDir.x*u.axisX.xyz+lightDir.y*u.axisY.xyz+lightDir.z*u.axisZ.xyz;
+            radiance+=throughput*max(textureLod(environmentMap,worldDir,0.).rgb,vec3(0));
+        }
+        direction=diffuse(normal,seed+depth*111u);
+    }
+    if(any(notEqual(u.stats,uvec2(0))) && all(equal(pixel%8,ivec2(0)))){
+        Counts c=Counts(u.stats);atomicAdd(c.primary,1);
+        if(primaryHit)atomicAdd(c.covered,1);if(depthMatch)atomicAdd(c.matchingDepth,1);
+        atomicAdd(c.bounce,secondary);
+    }
+    // Preserve the game's sky and effects in pixels without a captured primary surface.
+    if(primaryHit && depthMatch)imageStore(shaded,pixel,vec4(radiance,1));
+}
+#endif
+

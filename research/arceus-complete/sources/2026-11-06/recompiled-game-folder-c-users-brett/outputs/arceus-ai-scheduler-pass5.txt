@@ -1,0 +1,248 @@
+Arceus 1.1.1 offline research pass 5: AI scheduler ownership and clock epochs
+2026-11-06
+
+Scope
+Addresses are main-relative; add 0x8005000 for original virtual addresses.
+Source: local main.bin SHA-256
+d13df31aef8e3bdf9dce8fcb12518900218091b8f33a6880b36cfaaf2acf44c0.
+Only work/pass5-ai research files were written. No game, save, asset, runtime,
+package, or rendering setting was changed. No game process was launched/closed.
+
+New conclusions
+- 1050E00 is a bound member callback owned by a scheduler object, via a generic
+  task wrapper. The static construction path makes one scheduler per enclosing
+  services owner; it does not prove one scheduler exists globally for all scenes.
+- The callback argument has a clock pointer at +0 and a 32-bit task-dispatch epoch
+  at +8. This is a usable candidate for deduplicating a future tick accumulator.
+  Epoch alone is insufficient: pair it with scheduler/clock/dispatcher identity
+  and lifecycle. No accumulator is implemented in this pass.
+- Five concrete AI categories have 1/4/6/8/16 rotating buckets. The round-robin
+  choice advances every scheduler callback, independently of elapsed duration.
+- +81 is an action-controlled full-cadence override; +82 has a demonstrated
+  special WildAI initialization override. They are not pause flags.
+- 1050E00 itself does not pause on zero dt and applies no extra time scale after
+  reading channel 1. Generic task dispatch can suppress its callback on zero
+  selected-channel duration or task state, before 1050E00 is entered.
+- Isolated guest instructions passed 83,449 assertions with zero failures.
+
+Ownership and invocation source chain
+1. 17625F4 calls outer owner constructor 1869E00 at 1762B28.
+2. 1869E00 allocates a 0x2E8-byte services object, calls 1893E74 at 1869F40,
+   and stores it at outer-owner +0x70 (1869F84).
+3. 1893E74 allocates a 0xF0-byte scheduler, calls 1050AA0 at 1897218, and stores
+   it at services-owner +0x2A8 (1897238). The apparent second constructor call
+   at 18986AC is the allocation-failure path, not a second normal scheduler.
+4. 1050AA0 initializes scheduler vtable 40F3018 and creates a generic 0x420-byte
+   task via 1055F64. It retains this task at scheduler +0x80 (1050B7C).
+5. The task gets the generic vtable 417E528 at 1056000..1056030. Its +0x70 slot
+   is 2966A2C. The constructor binds:
+     task +0x3A0 = 10560B0 (member-function adapter), at 1050B9C;
+     task +0x3C0 = scheduler pointer, at 1050BC0;
+     task +0x3C8 = 1050E00, at 1050B90;
+     task +0x3D0 = 0, at 1050BC4 (member adjustment/virtual marker).
+6. Worker routine 296D6B8 obtains a task and calls 29684DC at 296D7C4.
+   29684DC validates the weak owner/lifetime gate, calls pre-callback work, then
+   invokes task vtable +0x70 at 2968534, preserving its callback argument X1.
+7. 2966A2C loads task +0x3A0, changes X0 to task +0x3C0, and tail-calls the
+   adapter. 10560B0 loads the bound scheduler and function, applies its member
+   adjustment, and tail-calls 1050E00. X1 remains the task argument.
+
+1050E00 has no indexed direct BL callers and no direct vtable entry. Its indexed
+code reference is the binding in 1050AA0. The adapter is the missing dynamic edge.
+This explains why a direct-call-only search appeared to stop at a constructor.
+
+One callback traverses the scheduler's linked category list (+0xB8), and then
+every bucket/context in each category. The categories are not separate scheduler
+invocations. The five registration calls below all use the same services+0x2A8.
+Nevertheless, scene loading/owner replacement or concurrent owner lifetimes could
+produce different scheduler objects. This static pass does not count live owners.
+
+Task epoch and clock provenance
+Main loop 27812DC supplies its clock object (loop object +0xB8) in the record at
+SP+0x10 and calls task dispatcher 296ADC8 at 278136C. The dispatcher object is
+loaded from global 42EEF30. In 296ADC8:
+  296AF64 loads dispatcher +0x208;
+  296AF68 increments that 32-bit value;
+  296AF74 stores the new epoch;
+  296AF7C..88 copy the clock pointer into worker +0x5C8 and epoch into +0x5D0;
+  296AF9C..AC do the same for additional workers.
+Worker callback argument X1 points to worker+0x5C8, so its layout is:
+  +0x00: clock pointer;
+  +0x08: 32-bit dispatch epoch;
+  +0x0C: worker index used for affinity/queue routing.
+Worker execution calls 29684DC with this argument, and the bound scheduler keeps
+the same argument. 1050E00 currently reads only its +0 clock pointer.
+
+The worker also stores the epoch in finished task +0x37C at 296D814; the skipped
+task propagation path does so at 2968730. This is corroborating epoch provenance,
+not proof of deduplication: the inspected scheduling path does not compare the
+incoming epoch to +0x37C before calling the scheduler.
+
+Generic task dependencies, concurrency, and multiplicity limits
+296863C uses an atomic completion counter at task+0x1F0 when the dependency vector
+at +0x70/+0x78 is nonempty, and schedules only when the counter equals dependency
+count (2968664..29686EC or 2968768..29687F0). Worker completion clears that counter
+at 296D804. This coordinates multiple parent completions into one normal callback.
+If the vector is empty, there is no such counter barrier. Extra/duplicate graph
+notifications after a reset are not rejected here by an explicit epoch comparison.
+The queue/work-stealing routines show multiple workers share the same epoch.
+Ordinary one-callback-per-epoch behavior is plausible but still requires live
+counting or fuller graph invariants; this report does not claim it is proven.
+
+1050E00 takes a per-scheduler lock at +0x78 (1050E64..1050EA4) and releases it at
+10523E8. Registration/context creation use the same lock. Thus two calls into the
+same object serialize their state changes, but independent scheduler objects have
+different locks. The clock read/conversion at 1050E28..54 occurs BEFORE this lock.
+A future shared remainder cannot assume this object lock protects a global map.
+
+Category registration and exact round-robin behavior
+1877A4C registers the following names through 1053308:
+  Name                    Callsite    W2 bucket count
+  WildAI                  187D798      4
+  WildAIPerception        187D7E4      8
+  NsAI                    187D830      1
+  NpcAI                   187D87C      6
+  PokePlateCheckVisible   187D8C8     16
+The string lengths stored alongside names (6,16,4,5,21) are not bucket counts.
+1053308 clamps W2 to at least 1 (105337C..84 / 10537D4..DC), constructs the category
+and buckets, and stores {current_index=0, bucket_count=W2} at category+0xC8/+0xCC
+(10534DC/E0, with X20=category+0x70). Each bucket is initialized with +0x90=1,
++0x91=0 by the 16-bit store at 1053C4C; +0x94 records the bucket index.
+
+During 1050E00:
+  1051784 loads the OLD current index into W15 and the bucket count into W8;
+  1051788..94 computes next=(old+1 >= count ? 0 : old+1), stored at +0xC8;
+  10517C8/CC copies each bucket's current +0x90 flag into previous +0x91;
+  10517D0..DC sets current +0x90 = (bucket_index == OLD current index).
+Exactly one bucket per category is selected on each callback. Initial selection
+is bucket 0; the counter already holds 1 while that selection is being processed.
+
+Conditional example rates, not measured live cadence:
+  Scheduler Hz       30      60      120
+  WildAI /4          7.5     15       30
+  Perception /8      3.75     7.5     15
+  NsAI /1           30      60      120
+  NpcAI /6           5      10       20
+  Visibility /16     1.875    3.75     7.5
+These rates exclude force overrides. This is separate from how much elapsed time
+an action consumes. Correcting integer frame timers alone leaves decisions sampled
+more often at higher scheduler cadence; throttling the entire scheduler instead
+changes decision/input responsiveness and the mixed seconds/frame action system.
+
+Eligibility, resets, and force overrides
+For each live context, the real branch block 1051830..10518DC implements:
+  force = context[0x81] != 0 || context[0x82] != 0;
+  if (bucket.previous || force) { seconds=0; frames=0; }
+  context[0x80] = bucket.current || force;
+  context.seconds += channel1_seconds;
+  context.frames += 1;
+It visits unselected buckets too. +0x80 is a published eligibility result, not a
+timer-pause state. The getter1059A68 loads this flag. BEDB94 calls it at BEDDD8 and
+branches around behavior evaluation when false (BEDDE4 / BEDF8C); true continues
+to evaluation at BEDE3C. This gives a concrete consumer of scheduler eligibility.
+
+Context constructor105410C clears +0x80/+0x81/+0x82 and the clocks at10543B4..BC.
+Setter1059A80 stores W1 bit0 into context+0x81. Examples tied by action vtables:
+- Step: init B302D4 sets it at B30454; B30AA4 and B30E18 clear it at B30AD0 and
+  B30E48. Vtable name slot40DF698 points to B311A0, string "Step".
+- RushMove: init B1E32C sets it at B1E75C; teardown functions B1FAFC/B1FE7C are
+  further setter callers. Vtable name slot40DDCD0 -> B201CC, "RushMove".
+Thus +0x81 is used to bypass normal bucket throttling during an action.
+
+A concrete +0x82 writer is1CF2E68: the WildAI actor initializer loads its context
+from actor+0x870 and stores1. That context was created through105410C at1CFA854
+and installed at1CFA888 under the "WildAI" key. The override lies behind a
+special actor/configuration condition involving numeric cases and a hash; this
+pass does not assign an unverified gameplay name to that condition. No claim that
+the bit can never be cleared through another indirect/inlined path is made.
+
+Channel1 scaling and pause evidence
+1050E00 invokes clock vtable slot0 with W1=1 at1050E38, reads record+8 ns at
+1050E3C, divides by1e9, and converts to float at1050E54. There is no other time
+scale multiplier or zero-duration branch in this scheduler. If called with dt=0,
+its group rotation and frame increment still happen. Guest execution verifies it.
+
+The traced clock implementation has vtable4171538:
+  getter278303C: return clock+8+(signed channel)*16;
+  raw setter277BEF4: store X2 at clock+0x10+channel*16;
+  mode setter2783048: select a nanosecond value from table397E8D0 and tail-call
+    the raw setter. It does not multiply the record on read.
+The main loop writes mode1 to channels0..3 at2781508/153C/1570/15A4, and separately
+writes zero to channel2 at2781354 before dispatch. In the current runtime source,
+adjust_duration only substitutes elapsed time for those four known33333334ns
+main-loop writes, via arceus_step; zero/other callsites are preserved. Channel1
+therefore supplies the existing elapsed-clock duration on that path. This is
+different from proving that every gameplay pause/time-scale feature has already
+been folded into that record; such features may suppress tasks elsewhere.
+
+Generic task296863C supplies a concrete upstream gate:
+  if task+0x1E0 bit0 is clear, or task+0x1E8 is nonzero, bypass this task's callback
+    and propagate its dependency completion/children;
+  otherwise read the clock channel selected by task+0x398;
+  if record+8 is zero, take that same callback-bypass path;
+  otherwise arrange normal task execution.
+The selector at task+0x398 initializes to1 in2968230 (2968280). This is the base
+constructor used by this scheduler's wrapper. The clock test at2968760/64 is a
+zero test, not a positive-duration range check. Initial generic task flags are
+0x16 at296F72C, and1050B10 ORs in0x8, yielding0x1E before later activation. The
+live enabling/pause writer sequence for this exact task was not resolved, so the
+initial flags must not be mistaken for its eventual running-state flags.
+
+Design constraints for a future authored-time accumulator
+Prefer an explicit epoch-aware design over one update per getter or per context:
+- A per-scheduler implementation can key persistent state by scheduler identity
+  plus clock identity/generation, and remember the last32-bit dispatch epoch.
+  Advance a persistent fraction at most once for that scheduler in that epoch.
+  All categories/contexts in that invocation receive the same cached tick delta.
+- A genuinely shared clock accumulator instead needs a clock/dispatcher/generation
+  key plus epoch, with a cached tick count reusable by all scheduler instances.
+  Never add the same channel duration once for each scheduler or worker callback.
+  The same numeric epoch from distinct dispatchers or old/new clock objects is not
+  the same timeline. Epoch is32-bit and wraps; pointers can also be reused.
+- Do not use duration equality as an epoch test: adjacent normal frames commonly
+  have equal deltas. Do not use context+0x88 as the epoch: it resets and batches.
+- The callback argument provides the epoch, but it is not stored in1050E00's own
+  state today. No current source proof guarantees no duplicate scheduler callback
+  per epoch; a read-only observation should verify before changing even increments.
+- Shared clock phase continues while an individual scheduler is suspended, whereas
+  per-scheduler phase can freeze. Decide this explicitly. New contexts/schedulers
+  and resuming tasks can otherwise receive different first-tick phase behavior.
+- Consume the selected channel's game duration. Do not independently sample host
+  time here, or reuse the channel0 blink remainder just because current main-loop
+  writes often match. Task pause/activation and channel identity still matter.
+- Keep the fraction outside context+0x84/+0x88 ordinary resets, and retain existing
+  eligibility and reset behavior. Changes to force flags during action transitions
+  must not discard fractional authored progress accidentally.
+- This only addresses frame-delta accounting. Pass4 showed Turn/TurnKey motion
+  does not scale with getter delta; those actions still need coupled motion and
+  completion changes. No blanket correction is justified by this pass.
+
+New isolated guest-instruction verification
+Result: Scheduler guest checks=83449 failures=0 compiled_functions=3.
+Actual slices executed using the existing SnxJitService:
+  round index1051784..1051798, appended RET;
+  bucket current/previous selection10517C0..10517E0, appended RET;
+  context branches1051830..10518E0, RET substituted at1051880 before ref release.
+All internal relative context branches remain in their original relative layout.
+No external stubs were required. Controlled pointers keep the final +0x58 load
+readable. Context reference release, task queue, actor evaluation, and resources
+are not executed. fixture-provenance.json records exact ranges/substitution/hash.
+
+The test covers the five configured bucket counts, three elapsed inputs
+(1/30,1/60,1/120), eight complete cycles per combination, both ordinary operation
+and +0x81 transition / +0x82 override scenarios. It checks old-index selection,
+modulo advance, current/previous bucket flags, per-context clocks and eligibility,
+exactly one selected bucket per callback, and every bucket selected once per cycle.
+A separate zero-dt case confirms group/count progression despite no elapsed time.
+Printed per-bucket Hz values are conditional mathematical rates, not live samples.
+
+Outstanding live evidence
+Record scheduler pointer, task wrapper pointer, clock pointer, incoming epoch,
+thread/worker identity, selected-channel duration, and category old/next indices
+at actual30/60/120 tests. Count calls per(scheduler,clock,epoch), including menus,
+pause, loads, owner replacement, hitches, and any gameplay time-scale sequence.
+Observe task+1E0/+1E8/+398 to distinguish a skipped task from zero dt inside it.
+Observe context force transitions and first update after creation/resume. This
+will establish whether a shared phase or per-scheduler phase matches baseline.
+The current findings resolve source ownership and arithmetic, not these live
+cadence/lifetime invariants. No runtime patch was made.

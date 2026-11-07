@@ -1,0 +1,164 @@
+--- a/src/nx/gpu/vk/render.c
++++ b/src/nx/gpu/vk/render.c
+@@ -2483,6 +2483,152 @@
+     render_draw(ch, indexed, topology, first, count, base_vertex, base_instance, instances);
+     SNX_ZONE_END(z);
+ }
++/* Opt-in material metadata for textured geometry. This reads already resolved
++   CPU metadata only: no guest reads, image copies, descriptor creation or draw
++   state changes. Unlike resolution_trace, distinct mesh shaders and bindings
++   are retained. Indexed descriptor tables are explicitly not expanded here. */
++static void material_trace(VkViewport vp, VkRect2D sc, VkSh* vs, VkSh* fs,
++                           const TexRes* tex, u32 count, u64 scaled, const u32* r) {
++    enum { LIMIT = 512, TABLE = 2048 };
++    static int enabled = -1;
++    static u32 used;
++    static u64 seen[TABLE];
++    if (enabled < 0) {
++        const char* e = getenv("SNX_MATERIAL_TRACE");
++        enabled = e && !strcmp(e, "1");
++        if (enabled)
++            LOG("material-trace: resolved-input metadata enabled, limit=%u; indexed tables not expanded\n", LIMIT);
++    }
++    if (!enabled || used == LIMIT || !fs || !g_rp.zt) return;
++    int nt = fs->si.ntex < SH_MAXTEX ? fs->si.ntex : SH_MAXTEX;
++    struct {
++        u64 vs, fs, scaled;
++        u32 colors, ntex;
++        u32 bias[6];
++        VkViewport vp;
++        VkRect2D sc;
++    } head = {0};
++    head.vs = vs ? vs->hash : 0; head.fs = fs->hash; head.scaled = scaled;
++    head.colors = g_rp.n; head.ntex = (u32)nt; head.vp = vp; head.sc = sc;
++    head.bias[0] = r[0x55B]; head.bias[1] = r[0x56F]; head.bias[2] = r[0x61F];
++    head.bias[3] = r[0x370]; head.bias[4] = r[0x371]; head.bias[5] = r[0x372];
++    u64 key = vk_hash(&head, sizeof head);
++    for (u32 i = 0; i <= g_rp.n; i++) {
++        const Surf* t = i == g_rp.n ? g_rp.zt : g_rp.rt[i];
++        if (!t) continue;
++        u64 output[] = {i, i == g_rp.n, t->gva, t->w, t->h, t->sw, t->sh, t->fkey, t->f.vk};
++        key = (key ^ vk_hash(output, sizeof output)) * 0x9e3779b97f4a7c15ull;
++    }
++    for (int i = 0; i < nt; i++) {
++        const ShTex* st = &fs->si.tex[i];
++        if (st->flags & SNX_TEX_INDEXED) continue;
++        const TexRes* x = &tex[i];
++        u64 part[4] = {(u64)(u32)i, x->have, 0, 0};
++        if (x->have) {
++            part[2] = vk_hash(x->tic, sizeof x->tic);
++            part[3] = vk_hash(x->tsc, sizeof x->tsc);
++        }
++        key = (key ^ vk_hash(part, sizeof part)) * 0x9e3779b97f4a7c15ull;
++        if (x->have && x->t) {
++            const Surf* t = x->t;
++            u64 shape[] = {t->gva, t->w, t->h, t->sw, t->sh, t->layers, t->levels, t->depth3d,
++                           t->fkey, t->f.vk, t->f.conv, t->is_rt, t->bl, t->bh, t->bd, t->pitch};
++            key = (key ^ vk_hash(shape, sizeof shape)) * 0x9e3779b97f4a7c15ull;
++        }
++    }
++    /* Generation counters and per-draw counts deliberately do not grow the key. */
++    if (!key) key = 1;
++    u32 at = (u32)(key >> 32) & (TABLE - 1);
++    while (seen[at] && seen[at] != key) at = (at + 1) & (TABLE - 1);
++    if (seen[at]) return;
++    seen[at] = key;
++    u32 id = ++used;
++    LOG("material-trace: draw id=%u present=%u vs=%llx fs=%llx count=%u colors=%u viewport=%g,%g,%g,%g scissor=%d,%d,%u,%u scaled=%llx bias_raw=%08x,%08x,%08x bias_enable=%u,%u,%u\n",
++        id, g_vk_present, (unsigned long long)head.vs, (unsigned long long)head.fs, count, g_rp.n,
++        vp.x, vp.y, vp.width, vp.height, sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height,
++        (unsigned long long)scaled, r[0x55B], r[0x56F], r[0x61F], r[0x370], r[0x371], r[0x372]);
++    for (u32 i = 0; i <= g_rp.n; i++) {
++        const Surf* t = i == g_rp.n ? g_rp.zt : g_rp.rt[i];
++        if (!t) continue;
++        LOG("material-trace: output id=%u slot=%u depth=%u address=%llx guest=%ux%u image=%ux%u fkey=%x vkfmt=%u\n",
++            id, i, i == g_rp.n, (unsigned long long)t->gva, t->w, t->h, t->sw, t->sh, t->fkey, (u32)t->f.vk);
++    }
++    for (int i = 0; i < nt; i++) {
++        const ShTex* st = &fs->si.tex[i];
++        LOG("material-trace: shader-input id=%u slot=%d cbuf_word=%x bindless=%u cb=%u split=%u split_cb=%u split_word=%x type=%u array=%u shadow=%u flags=%x\n",
++            id, i, st->cbuf_off, st->bindless, st->bl_cbuf, st->bl2, st->bl2_cbuf, st->bl2_off,
++            st->type, st->array, st->shadow, st->flags);
++        if (st->flags & SNX_TEX_INDEXED) {
++            LOG("material-trace: input id=%u slot=%d indexed_table=1 details=not-expanded\n", id, i);
++            continue;
++        }
++        const TexRes* x = &tex[i];
++        if (!x->have) {
++            LOG("material-trace: input id=%u slot=%d resolved=0\n", id, i);
++            continue;
++        }
++        LOG("material-trace: descriptors id=%u slot=%d handle=%08x tic=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x tsc=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
++            id, i, x->handle, x->tic[0], x->tic[1], x->tic[2], x->tic[3], x->tic[4], x->tic[5], x->tic[6], x->tic[7],
++            x->tsc[0], x->tsc[1], x->tsc[2], x->tsc[3], x->tsc[4], x->tsc[5], x->tsc[6], x->tsc[7]);
++        const Surf* t = x->t;
++        if (!t) {
++            LOG("material-trace: input id=%u slot=%d resolved=1 surface=0\n", id, i);
++            continue;
++        }
++        VkComponentMapping map = tex_map(t, x->tic);
++        LOG("material-trace: input id=%u slot=%d address=%llx guest=%ux%u image=%ux%u layers=%u levels=%u depth3d=%u rt=%d fkey=%x vkfmt=%u conversion=%u block=%ux%u bytes=%u signed=%u integer=%u depth=%u bgra=%u srgb=%d map=%u,%u,%u,%u layout=%u,%u,%u,%u upload_valid=%d wgen=%u\n",
++            id, i, (unsigned long long)t->gva, t->w, t->h, t->sw, t->sh, t->layers, t->levels, t->depth3d,
++            t->is_rt, t->fkey, (u32)t->f.vk, t->f.conv, t->f.bw, t->f.bh, t->f.bpp,
++            t->f.sint, t->f.is_int, t->f.depth, t->f.bgra, tex_srgb(x->tic, x->tsc),
++            (u32)map.r, (u32)map.g, (u32)map.b, (u32)map.a,
++            t->bl, t->bh, t->bd, t->pitch, t->upload_valid, t->wgen);
++    }
++    if (used == LIMIT) LOG("material-trace: distinct configuration limit reached\n");
++}
++
++/* Opt-in resolution diagnosis. Log each distinct viewport/target combination once;
++   retain shader identity for small fullscreen/postprocess draws, but not every mesh.
++   Disabled runs pay only the cached flag check. No shader or rendering state changes. */
++static void resolution_trace(VkViewport vp, VkRect2D sc, VkSh* fs, TexRes* tex, u32 count, u64 fs_addr) {
++    static int enabled = -1;
++    static struct {
++        u32 w, h, sw, sh, format, n, depth, small;
++        float vw, vh;
++        u32 cw, ch;
++        u64 shader;
++    } seen[512];
++    static u32 used;
++    if (enabled < 0) {
++        const char* e = getenv("SNX_RESOLUTION_TRACE");
++        enabled = e && *e && *e != '0';
++    }
++    if (!enabled || used == 512) return;
++    Surf* dst = NULL;
++    for (u32 i = 0; i < g_rp.n && !dst; i++) dst = g_rp.rt[i];
++    if (!dst) dst = g_rp.zt;
++    if (!dst) return;
++    typeof(seen[0]) key = {0};
++    key.w = dst->w; key.h = dst->h; key.sw = dst->sw; key.sh = dst->sh;
++    key.format = dst->fkey; key.n = g_rp.n; key.depth = g_rp.zt != NULL;
++    key.small = count <= 6; key.vw = vp.width; key.vh = vp.height;
++    key.cw = sc.extent.width; key.ch = sc.extent.height;
++    key.shader = key.small && fs ? fs->hash : 0;
++    for (u32 i = 0; i < used; i++) if (!memcmp(&seen[i], &key, sizeof key)) return;
++    seen[used++] = key;
++    LOG("resolution-trace: draw id=%u present=%u guest=%ux%u image=%ux%u viewport=%gx%g scissor=%ux%u colors=%u depth=%u count=%u target=%llx fs=%llx hash=%llx\n",
++        used, g_vk_present, dst->w, dst->h, dst->sw, dst->sh, vp.width, vp.height,
++        sc.extent.width, sc.extent.height, g_rp.n, key.depth, count,
++        (unsigned long long)dst->gva, (unsigned long long)fs_addr,
++        (unsigned long long)(fs ? fs->hash : 0));
++    if (fs) for (int i = 0; i < fs->si.ntex && i < SH_MAXTEX; i++) {
++        if (!tex[i].have || !tex[i].t) continue;
++        Surf* t = tex[i].t;
++        LOG("resolution-trace: input id=%u slot=%d target=%llx guest=%ux%u image=%ux%u rt=%d\n",
++            used, i, (unsigned long long)t->gva, t->w, t->h, t->sw, t->sh, t->is_rt);
++    }
++    if (used == 512) LOG("resolution-trace: draw configuration limit reached\n");
++}
++
+ static void render_draw(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count, u32 base_vertex,
+                         u32 base_instance, u32 instances) {
+     u32* r = ch->r3d;
+@@ -3084,6 +3230,8 @@
+         }
+         scissor[i] = sc;
+     }
++    resolution_trace(viewport[0], scissor[0], fs, fres, count, code + r[0x851]);
++    material_trace(viewport[0], scissor[0], vs, fs, fres, count, scaled, r);
+     if (fresh || g_dyn.viewports != viewports || memcmp(g_dyn.vp, viewport, viewports * sizeof *viewport)) {
+         memcpy(g_dyn.vp, viewport, viewports * sizeof *viewport);
+         rec_CmdSetViewportWithCount(cb, viewports, viewport);

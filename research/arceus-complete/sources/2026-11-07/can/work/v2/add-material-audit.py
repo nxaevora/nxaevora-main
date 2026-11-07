@@ -1,0 +1,2 @@
+from pathlib import Path
+p=Path('work/v2/render.c');s=p.read_text().replace('#include "rr-render.inc"','#include "rr-render.inc"\n#include "material-audit.inc"').replace(' particle_capture_previous();',' material_audit_save();\n particle_capture_previous();').replace('     vkUpdateDescriptorSets(g_vk.dev,3,writes,0,NULL);','     vkUpdateDescriptorSets(g_vk.dev,3,writes,0,NULL);\n     material_audit_capture(cb,extras[1],extras[2]);');p.write_text(s)

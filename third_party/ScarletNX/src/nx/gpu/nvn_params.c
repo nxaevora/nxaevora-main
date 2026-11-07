@@ -174,6 +174,23 @@ uint32_t nvn_vertex_attrib_state_set_stream_index(uint32_t word, uint32_t stream
     return (word & 0xFFFFFFE0u) | stream_index;
 }
 
+void nvn_vertex_attrib_state_get_format(uint32_t word, uint32_t* format, uint64_t* relative_offset) {
+    *format = (word >> 21) & 0x3FFu;
+    *relative_offset = (word >> 7) & 0x3FFFu;
+}
+
+uint32_t nvn_vertex_attrib_state_get_stream_index(uint32_t word) { return word & 0x1Fu; }
+
+/* The library table at sdk 0xde877bc (update 1.1.1), one word for each counter type. */
+static const uint32_t reset_counter_words[] = {0x01u, 0x01u, 0x12u, 0x13u, 0x15u, 0x16u, 0x17u, 0x1Au, 0x1Eu,
+                                               0x18u, 0x1Bu, 0x1Cu, 0x1Du, 0x1Fu, 0x10u, 0x02u, 0x01u};
+
+int nvn_reset_counter_word(uint32_t type, uint32_t* word) {
+    if (type >= sizeof reset_counter_words / sizeof reset_counter_words[0]) return 0;
+    *word = reset_counter_words[type];
+    return 1;
+}
+
 void nvn_color_state_defaults(uint32_t* words) { words[0] = 0x08030000u; }
 
 void nvn_depth_stencil_state_defaults(uint32_t* words) {
@@ -290,6 +307,10 @@ int nvn_raster_methods(NvnRasterKind which, const uint32_t w[3], NvnRasterMethod
     case NVN_RASTER_LINE_WIDTH:
         out[n++] = (NvnRasterMethod){NVN_RASTER_METHOD_LINE_WIDTH, w[0]};
         out[n++] = (NvnRasterMethod){NVN_RASTER_METHOD_LINE_WIDTH_ALIAS, w[0]};
+        break;
+    case NVN_RASTER_POINT_SIZE:
+        out[n++] = (NvnRasterMethod){NVN_RASTER_METHOD_POINT_SIZE, w[0]};
+        out[n++] = (NvnRasterMethod){NVN_RASTER_METHOD_POINT_SIZE_FOLLOW, 0u};
         break;
     default:
         return 0;
@@ -1862,6 +1883,59 @@ uint32_t nvn_clear_depth_stencil_words(uint32_t depth_bits, uint32_t depth_enabl
     return w.at;
 }
 
+#define NVN_XFB_METHOD_BUFFER 0xE0u      /* enable, address high, address low, size of buffer 0 */
+#define NVN_XFB_METHOD_BUFFER_STEP 8u
+#define NVN_XFB_BUFFER_WORDS 4u
+#define NVN_XFB_METHOD_ENABLE 0x1D1u
+#define NVN_XFB_METHOD_BEGIN_MACRO 0xE00u /* macro 0 of the library's macro code */
+#define NVN_XFB_METHOD_REPORT 0x6C0u      /* report semaphore: address high, address low, payload, query */
+#define NVN_XFB_REPORT_WORDS 4u
+#define NVN_XFB_COUNT_OFFSET 4u          /* the byte count of buffer i goes to address + 4 + 4i */
+
+/* The query words of End, from the library's constants at sdk 0xde13dc0, 0xde135c8, 0xde13e50 and 0xde13f78. */
+static const uint32_t xfb_count_query[NVN_XFB_BUFFER_COUNT] = {0x1D005002u, 0x1D005022u, 0x1D005042u, 0x1D005062u};
+
+uint32_t nvn_bind_xfb_words(uint32_t slot, uint64_t addr, uint32_t size, uint32_t* out) {
+    if (!out || slot >= NVN_XFB_BUFFER_COUNT) return 0;
+    NvnBindWriter w = {out, 0};
+    uint32_t method = NVN_XFB_METHOD_BUFFER + NVN_XFB_METHOD_BUFFER_STEP * slot;
+    if (!addr) {
+        bind_value(&w, method, 0);
+        return w.at;
+    }
+    bind_run(&w, method, NVN_XFB_BUFFER_WORDS);
+    bind_word(&w, 1);
+    bind_word(&w, (uint32_t)(addr >> 32));
+    bind_word(&w, (uint32_t)addr);
+    bind_word(&w, size);
+    return w.at;
+}
+
+uint32_t nvn_xfb_words(uint32_t kind, uint64_t addr, uint32_t* out) {
+    if (!out) return 0;
+    NvnBindWriter w = {out, 0};
+    switch (kind) {
+    case NVN_XFB_BEGIN:
+        bind_macro(&w, NVN_XFB_METHOD_BEGIN_MACRO, 2);
+        bind_word(&w, (uint32_t)(addr >> 32));
+        bind_word(&w, (uint32_t)addr);
+        return w.at;
+    case NVN_XFB_END:
+        bind_value(&w, NVN_XFB_METHOD_ENABLE, 0);
+        for (uint32_t i = 0; i < NVN_XFB_BUFFER_COUNT; i++) {
+            uint64_t at = addr + NVN_XFB_COUNT_OFFSET * (i + 1u);
+            bind_run(&w, NVN_XFB_METHOD_REPORT, NVN_XFB_REPORT_WORDS);
+            bind_word(&w, (uint32_t)(at >> 32));
+            bind_word(&w, (uint32_t)at);
+            bind_word(&w, 0);
+            bind_word(&w, xfb_count_query[i]);
+        }
+        return w.at;
+    default:
+        return 0;
+    }
+}
+
 /* The draw macros and methods that the five library draw functions write. The headers use the same forms as the bind
    packets: a mode 5 macro of count words, a mode 1 run and a mode 4 inline value. */
 #define NVN_DRAW_TYPE_MAX                 0x1FFFu
@@ -2025,6 +2099,8 @@ enum {
 #define COMPUTE_QMD_GPR_ALLOC_UNKNOWN 0u    /* the byte at x21+0x823: vk_dispatch does not read it */
 #define COMPUTE_QMD_SASS_VERSION_UNKNOWN 0u /* the byte at x21+0x82b: vk_dispatch does not read it */
 #define COMPUTE_QMD_CBUF0_ENABLE 0x1u       /* the library leaves it clear; vk_dispatch reads cbuf 0 for storage */
+#define COMPUTE_QMD_CBUF_SIZE_MAX (UINT32_MAX >> NVN_COMPUTE_CBUF_ADDRESS_HIGH_SHIFT)
+#define COMPUTE_QMD_CBUF_SIZE_PADDING 0xFFu /* uniform sizes round up to 256 bytes */
 
 /* Writes the address and size pair of one QMD constant buffer. The size sits in bits 31:15 of the second word. */
 static void compute_qmd_cbuf_config(uint32_t* qmd, uint32_t index, uint64_t address, uint32_t size) {
@@ -2040,12 +2116,21 @@ uint32_t nvn_compute_qmd_check(const NvnProgramComputeIn* prog, uint32_t x, uint
     if (x > COMPUTE_QMD_GRID_X_MAX) return NVN_QMD_GRID_X;
     if (y > COMPUTE_QMD_GRID_YZ_MAX) return NVN_QMD_GRID_Y;
     if (z > COMPUTE_QMD_GRID_YZ_MAX) return NVN_QMD_GRID_Z;
-    if ((uint64_t)prog->h6fc + 0xFFu > UINT32_MAX) return NVN_QMD_CBUF1_SIZE;
+    if ((uint64_t)prog->h6fc + COMPUTE_QMD_CBUF_SIZE_PADDING > COMPUTE_QMD_CBUF_SIZE_MAX)
+        return NVN_QMD_CBUF1_SIZE;
     for (uint32_t slot = 0; slot < NVN_COMPUTE_UNIFORM_SLOTS; slot++) {
         const NvnComputeBindEntry* entry = &binds->uniform[slot];
-        if (!entry->bound || entry->size <= UINT32_MAX) continue;
-        if (detail) *detail = slot;
-        return NVN_QMD_UNIFORM_SIZE;
+        if (!entry->bound) continue;
+        uint32_t reason = NVN_QMD_OK;
+        if (entry->size > UINT32_MAX)
+            reason = NVN_QMD_UNIFORM_SIZE;
+        else if (slot < NVN_COMPUTE_UNIFORM_QBUF_SLOTS &&
+                 entry->size > (COMPUTE_QMD_CBUF_SIZE_MAX & ~COMPUTE_QMD_CBUF_SIZE_PADDING))
+            reason = NVN_QMD_UNIFORM_QBUF_SIZE;
+        if (reason != NVN_QMD_OK) {
+            if (detail) *detail = slot;
+            return reason;
+        }
     }
     if (detail) *detail = 0;
     return NVN_QMD_OK;
@@ -2058,8 +2143,9 @@ const char* nvn_compute_qmd_reason_name(uint32_t reason) {
     case NVN_QMD_GRID_X: return "grid x above its field";
     case NVN_QMD_GRID_Y: return "grid y above its field";
     case NVN_QMD_GRID_Z: return "grid z above its field";
-    case NVN_QMD_CBUF1_SIZE: return "constant buffer 1 size above 32 bits";
+    case NVN_QMD_CBUF1_SIZE: return "constant buffer 1 size above its QMD field";
     case NVN_QMD_UNIFORM_SIZE: return "uniform size above 32 bits";
+    case NVN_QMD_UNIFORM_QBUF_SIZE: return "rounded uniform size above its QMD field";
     default: return "unknown";
     }
 }
@@ -2067,7 +2153,7 @@ const char* nvn_compute_qmd_reason_name(uint32_t reason) {
 int nvn_compute_qmd_build(const NvnProgramComputeIn* prog, uint32_t x, uint32_t y, uint32_t z,
                           const NvnComputeBinds* binds, uint32_t qmd[NVN_COMPUTE_QMD_WORDS]) {
     if (!qmd || nvn_compute_qmd_check(prog, x, y, z, binds, NULL) != NVN_QMD_OK) return 0;
-    uint64_t cb1_size = (uint64_t)prog->h6fc + 0xFFu;
+    uint64_t cb1_size = (uint64_t)prog->h6fc + COMPUTE_QMD_CBUF_SIZE_PADDING;
     memset(qmd, 0, NVN_COMPUTE_QMD_WORDS * sizeof qmd[0]);
     qmd[COMPUTE_QMD_PROGRAM_START] = prog->code_offset;
     qmd[COMPUTE_QMD_GRID_DIM_X] = x & COMPUTE_QMD_GRID_X_MAX;
@@ -2095,8 +2181,8 @@ int nvn_compute_qmd_build(const NvnProgramComputeIn* prog, uint32_t x, uint32_t 
         const NvnComputeBindEntry* entry = &binds->uniform[slot];
         if (!entry->bound || entry->size == 0) continue;
         enable |= 1u << (slot + 3u);
-        compute_qmd_cbuf_config(qmd, slot + 3u, entry->addr,
-                                ((uint32_t)entry->size + 0xFFu) & ~0xFFu);
+        uint32_t size = ((uint32_t)entry->size + COMPUTE_QMD_CBUF_SIZE_PADDING) & ~COMPUTE_QMD_CBUF_SIZE_PADDING;
+        compute_qmd_cbuf_config(qmd, slot + 3u, entry->addr, size);
     }
     qmd[COMPUTE_QMD_CONST_BUFFER_ENABLE] = enable;
     return 1;

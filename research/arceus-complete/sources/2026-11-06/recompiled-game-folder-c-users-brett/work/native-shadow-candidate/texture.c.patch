@@ -1,0 +1,15 @@
+--- texture.c
++++ texture.c
+@@ -552,8 +552,10 @@
+         c->gva = rt->gva;
+         c->w = w;
+         c->h = h;
+-        c->sw = vk_sc(w) < rt->sw ? vk_sc(w) : rt->sw; /* the same region of the scaled target */
+-        c->sh = vk_sc(h) < rt->sh ? vk_sc(h) : rt->sh;
++        u32 cw = rt->sw == rt->w ? w : vk_sc(w);
++        u32 ch = rt->sh == rt->h ? h : vk_sc(h);
++        c->sw = cw < rt->sw ? cw : rt->sw; /* the same region of the scaled target */
++        c->sh = ch < rt->sh ? ch : rt->sh;
+         c->layers = rt->layers;
+         c->levels = c->depth3d = 1;
+         c->f = f;

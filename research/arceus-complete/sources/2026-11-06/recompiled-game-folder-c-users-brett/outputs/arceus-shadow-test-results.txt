@@ -1,0 +1,70 @@
+Shadow candidate visual-test review, 2026-11-06
+
+Run: C:/Users/brett/Documents/Codex/work/arceus-runs/timing-20261106-181617-047
+Runtime: B32D40B03CEE8ADAF34DA9150A657E97F25F9950E4CA25FBAD7F641CF8CAF019
+User closed normally; game_exit=0. No new launch during this review.
+
+Outcome: original repeating pattern resolved in the tested stone/bridge/wheel
+scenes, supported by the user's direct feedback and the captured final images.
+Preserve this shadow candidate as the tested visual baseline. This does not
+establish correctness for all scenes, and the pink crafting-box issue remains.
+No shared runtime source, installed runtime or launchers changed in this review.
+
+Configuration evidence:
+Vulkan, native-shadow override enabled, target120FPS, camera2.2, controller
+DualSense Edge with both sensors, fixed scene resolution and4/3 scaling.
+Depth-tested scene viewports2560x1440. TargetFPS is configuration, not a claim
+of sustained displayed120FPS. Existing timing hooks retained.
+No mixed-attachment diagnostic, VK_ERROR, device-lost, failed or fatal entry
+found in game-err.txt. This is log inspection, not Vulkan validation-layer proof.
+
+Four detailed snapshots succeeded, with64/66/66/64 attachments, zero failures:
+181707 present3133: stone steps/walls
+181736 present5136: bridge
+181740 present5468: bridge/wheel
+181800 present6978: pink crafting box
+181810 is an additional ordinary screenshot (mission complete); the four-buffer
+capture limit was already reached. It also shows the purple/pink box edges.
+
+All four snapshots have1024x1024 D32 shadow producers and matching R8_UINT tags.
+Compared both source layers against corresponding sampled-array layers for
+depth AND tags:16 full-layer comparisons,41,943,040 bytes, ZERO mismatches.
+This confirms the old1365-to1024 nearest-resampling mismatch is removed.
+Evidence: work/shadow-test-review/copy-verification.json.
+Local analysis script: work/review-shadow-test.py.
+PNG conversions are lossless previews; original captures were not modified.
+
+Pink box localization:
+Full capture181800 includes the reported effect. The ordinary181810 image
+shows it from another view. Purple highlights trace wood scratches and edges
+of the fold-out crafting case/table; this is not a solid missing-texture color.
+Base color552a80000 (attachment45) is brown/gold, without those pink highlights.
+Scene lighting5508c0000 (attachment48, packed unsigned float RGB) already has
+the purple highlights; final tone mapping/postprocessing is not their first
+appearance. The normal-map detail552210000 follows those scratches/edges.
+The earlier551130000 attachment42 is dark on the box without the same visible
+highlights. Attachment43 is material data, not display color; its red/green
+preview must not be mistaken for corruption. Shadow receiver540a88000 is dark
+on the box and retains other scene data; do not assume every pixel is rewritten
+for this cutscene just because its last-write present matches.
+
+Working hypothesis: investigate material specular/environment/probe lighting
+and normal/material interpretation for this object, with the shadow fix kept.
+Neither the exact shader nor root cause is yet proven. Pink appearance could
+also be influenced by intended scene illumination; no matched original-game
+reference or pre-shadow-fix box capture is available. Do not label it a proven
+new regression. No speculative shader/bias/TAA fix applied.
+
+Decoded box intermediates:
+work/pass10-captures/screenshot_20261106_181800_buffers_4_attachments/
+42_551130000_layer0.png,43_5519a0000_layer0.png,
+44_552210000_layer0-decoded-normal.png,48_5508c0000_layer0.png.
+Final/base-color/shadow-receiver PNGs: work/shadow-test-review/.
+decode-surface-capture.py now supports --index to inspect selected attachments.
+
+Next investigation: isolate the box's lighting shader/bindings and compare its
+normal/material inputs against the actual specular/environment contribution.
+Current captures bound the issue to lighting or its inputs, not enough to
+justify changing global lighting or reverting the successful shadow correction.
+Do not launch again automatically. Keep1440p,120FPS target, timing fixes,
+controller support, Vulkan and manual closure.

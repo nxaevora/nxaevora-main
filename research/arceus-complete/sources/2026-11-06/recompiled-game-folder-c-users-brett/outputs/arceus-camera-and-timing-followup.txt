@@ -1,0 +1,173 @@
+Arceus camera and timing follow-up — 2026-11-06
+
+CURRENT RESULT
+
+The user-confirmed blinking correction is preserved byte-for-byte. Camera speed
+is not yet verified against an original-speed 30 FPS gameplay measurement.
+This build fixes a proven response-clamping defect and offers an explicit faster
+preset. The faster preset is a usability workaround, not proof of authentic
+30 FPS camera calibration. No game was launched or closed during this work.
+
+Build SHA256:
+8EC5DE0AC689C5CA8EA22A5E764C322FDDFF3219B6CA23AD828C88FB012BEF63
+Runtime and installed ArceusTest.exe hashes match. Previous build is backed up
+locally as work/Arceus-before-camera-v3.exe. Runtime source and the repository's
+ScarletNX copy are synchronized. No save or extracted game asset was edited.
+
+WHEN YOU RETURN
+
+Test-Arceus-Responsive-Camera-120FPS.cmd:
+  All previously enabled timing fixes, confirmed blinking fix, controller,
+  Vulkan, and a camera speed multiplier of 2. The in-game sensitivity value
+  still multiplies this rate. This is twice the last candidate's turning speed
+  for the same elapsed time and sensitivity, independent of target FPS.
+
+Test-Arceus-Responsive-Camera-60FPS.cmd:
+  Same camera multiplier and fixes at 60 FPS.
+
+Test-Arceus-Blink-Camera-120FPS.cmd:
+  New response-clamping fix, original 1x camera calibration. Kept for comparison.
+
+Test-Arceus-Camera-Baseline-30FPS.cmd:
+  Original gameplay timing and unmodified camera response/rate, with read-only
+  camera and physics/navigation probes. It uses the current runtime, but does
+  not enable the experimental timing corrections or speed multiplier.
+
+For calibration, compare baseline 30 against the standard 1x 120 test at the
+same in-game sensitivity and scene: hold full right stick horizontally for
+several seconds, release it, then try partial stick and the lowest/highest
+sensitivity. A sustained full-stick turn separates maximum speed from ramp time.
+The 2x preset is available if the 1x camera remains unpleasantly slow.
+
+Save in-game, then close the window yourself. No time limit. Escape does not
+quit gameplay. Tests use the existing local save/controller configuration.
+Each run writes game-err.txt and research-summary.json under arceus-runs.
+
+CAMERA EVIDENCE AND CHANGES
+
+Reviewed timing-20261106-121814-537/game-err.txt. It ends with Exit, has no
+arceus guard failures, and shows the three blink hooks installing and executing.
+Camera-input count reaches at least 4800; camera-rate count reaches at least
+3600. These are sparse cumulative log samples, not displayed FPS measurements.
+
+The unscaled sensitivity getter returned 1, then 2, then 1. Therefore the
+in-game selection does reach the game code. This contradicts a diagnosis that
+the setting is completely disconnected; it does not contradict the reported
+feel or establish that the total output speed is right.
+
+main+193C04C:
+  Reads raw stick +38C/+390, deadzone/curve parameters, acceleration +424/+42C,
+  deceleration +428/+430, response state +434/+438 and direction +43C/+440.
+  The previous fractional wrapper interpolated AFTER the game's clamp.
+  Example at 120 FPS: old response .005, release decrement .04. Original step
+  clamps to 0; previous wrapper produced .00375, then an exponential tail.
+  New helper applies the fractional linear decrement before clamping, reaching
+  zero. Full-stick saturation now reaches one instead of approaching it
+  indefinitely. Partial-stick behavior retains the original result/interpolation.
+  This fixes endpoint behavior; it does not explain a fourfold steady-speed
+  difference, and is not presented as solving that calibration question.
+
+main+193C2C4:
+  Sensitivity/configuration getter. Three direct call sites, in two functions:
+  main+19358D0, main+1935C6C and main+193D26C.
+  The prior wrapper applies elapsed_ns / 33333334 to its result.
+  New optional SNX_ARCEUS_CAMERA_SPEED accepts .25 through 4; default is 1.
+  The separately named Responsive launchers explicitly select 2.
+  Settings remain multiplicative, not replaced by a fixed sensitivity.
+
+main+193D16C:
+  Field-camera manual rotation. Yaw integration uses response * direction *
+  object+420 * sensitivity; pitch uses response * direction * object+708 *
+  sensitivity. Instrumentation now logs the setting on changes, update caller,
+  timestamp, response/raw input and, for this path, yaw and base step values.
+  Constructor conversion for +420 references nn::util FloatPi/FloatDegree180
+  through imported symbols. That conversion is degrees-to-radians, not itself
+  evidence of another elapsed-time multiplier.
+
+Whole-text related-field scan found only main+193C04C with the complete camera
+response field group. No second matching inlined copy was found by that pattern.
+This does not rule out differently optimized copies or other camera systems.
+
+NEW RESEARCH FINDINGS
+
+1. Two additional blink bodies in ride-controller code:
+   main+2518BA8 (size FC) is BYTE-IDENTICAL to main+194F110.
+   main+2518CA4 (size FC) implements the +48 base-subobject variant.
+   Both decrement +68C and use virtual slots +358/+360/+368/+370.
+   The primary has direct callers 2549FA0, 256C3AC, 256C478, 25A0534, 25A12EC.
+   Its vtables and constructors lead to ride controller setup, including
+   nyuura/climbing and other named ride animation/controller configuration.
+   These are outside the three currently patched entries. They were NOT
+   enabled in this build because the confirmed current-scene blinking is fixed,
+   and ride update cadence has not been measured. They are concrete future
+   coverage targets if ride Pokemon still blink rapidly.
+   Whole-text +68C/+644 load/decrement/store scan found those two plus the three
+   already covered entries. Pattern matching is not proof of exhaustive coverage.
+
+2. Script-frame producer identified:
+   main+1050E00 reads clock channel 1 and converts nanoseconds to seconds at
+   +1050E3C..+1050E54. At +1051860..+105187C, a context accumulates seconds in
+   +84 but separately increments its integer +88 by exactly one.
+   main+1059A70 returns the seconds; main+1059A78 returns the integer.
+   WaitFrame update main+B35AE0 subtracts that integer from its +13C wait.
+   Context flags can clear both fields at +105189C/+10518D4. This explains why
+   a blanket replacement of the getter with floor(seconds*30) is unsafe: if the
+   context resets every update, sub-frame fractions could be lost and waits
+   could stall. A correction must retain remainder across the appropriate
+   context lifetime. This is not yet identified as the NPC A/B advance guard.
+
+3. Battle idle wait consumption verified:
+   main+9BB904 initializes +238 from Trainer_IdleAnimationMin/MaxWaitFrames and
+   IdleAnimationMinWaitFrames. main+9BAD68 checks +220 and subtracts one from
+   +238 at +9BAD94, proceeding when <=0. This is an actual countdown, separate
+   from eye blinking. Real call cadence remains unmeasured.
+
+4. Cave/environment light blend confirmed:
+   main+1E1B278 constructs 1/120, stores it as a blend increment, and
+   main+1E1B2B0 adds it to progress on subsequent updates. Progress clamps to 1.
+   Owner main+1E1A25C has environment/cave_light_change_easing names.
+   If called once per render, 120 updates mean four seconds at 30 FPS and one
+   second at 120 FPS. That is a conditional prediction, not an observed run.
+   The denominator 120 is an authored update count, not necessarily an intended
+   120-Hz simulation. Leave duration units intact when eventually correcting it.
+
+5. Object motion writes verified:
+   main+1D4892C adds 1/120 to +328 after writing an interpolated vector to the
+   associated object's +D0 transform field and setting +E0.
+   main+1D49838 adds 1/60 to the same timer after another transform update.
+   Both are reached through main+1D48268. These are motion/transform updates,
+   not harmless stand-alone constants, but the exact visible object/use and
+   scheduler cadence remain unresolved.
+
+6. Camera recentering remains separate:
+   main+193633C increments +414 at +193644C and uses duration +45C, including
+   reset_turn_keep_update_target logic. The stick response fix does not fix this
+   integer-duration path. Test recentering separately from holding the stick.
+
+7. Physics/navigation: instrumentation prepared, behavior unchanged:
+   Navigation main+2795204 selects fixed 1/30 when +150 is zero; otherwise S0.
+   Rigid-body main+2AF25B4 selects fixed 1/30 when +121 is zero; otherwise S0,
+   with a separate +124 rate. Existing caller/constructor evidence is retained
+   in arceus-timing-investigation.txt.
+   SNX_ARCEUS_TIMING_RESEARCH now logs entry cadence, incoming dt, object, mode
+   and rate. Enabled in the Responsive and Baseline launchers. It changes no
+   timestep or physics state. These entry snapshots are not a trace inside the
+   eventual solver. Fixed-step mode alone is not a bug if scheduled at 30 Hz.
+   Compare flags AND calls/elapsed time before touching ball flight/physics.
+
+VALIDATION AND LIMITS
+
+Runtime build passed. C tests use the actual response helper and cover release,
+full-stick saturation, disabled input, partial-stick equilibrium, and sensitivity
+ratios at 30/60/120. Existing clock/blink conservation and instruction/function
+metadata checks pass. New physics/navigation guards and equivalent branch
+encodings match the local 1.1.1 binary. PowerShell launcher parsing passes.
+The research summarizer was exercised against the latest existing test log.
+
+No live gameplay test was performed. New hook execution, camera feel and exact
+30 FPS equivalence are still unverified. The next useful evidence is an actual
+baseline comparison; increasing a multiplier alone cannot prove a timing fix.
+No blanket replacement of the 58 previously inventoried signed 1/30 sites.
+Water, release effects, realtime event camera and the confirmed blink paths are
+preserved. The existing broader inventory remains in arceus-timing-investigation.txt;
+this follow-up supersedes its older status for the three corrected blink paths.

@@ -1,0 +1,199 @@
+ARCEUS 1.1.1 PHYSICS SCHEDULING / ACTUAL TRANSLATION RESEARCH, PASS 4
+Date: 2026-11-06
+
+Scope and provenance
+All addresses below are offsets from main, whose loaded base is 0x8005000.
+Local source: arceus-cache/scarletnx/module-dumps/0244d4dd2474e625/main.bin.
+All work was offline; no game was started, stopped, or modified. No runtime,
+package, save, or game asset was edited. Files created only in work/pass4-physics.
+Analysis uses local unwind/function/call/relocation indexes and LLVM AArch64
+disassembly. Function names below are descriptive except quoted embedded strings.
+
+New findings beyond the previous StepInfo storage analysis
+1. The wrapper has a small-positive-dt threshold, not an every-N-frames gate.
+2. A zero-length solve task graph does not imply no integration: the singlethread
+   virtual implementation runs its physics before the graph counts are tested.
+3. The game's construction path explicitly selects the multithread implementation.
+4. Both implementations reach the same final motion translation function.
+5. A 24-instruction slice of that real function was executed by the local JIT;
+   its XYZ arithmetic passed 447 checks with no failures. This is stronger than
+   testing only timestep storage but is not a live body trajectory measurement.
+
+A. Game callback and wrapper gate
+main+2B00CA8 is an update callback referenced by vtable slot main+4187FF0.
+At 2B00CC8 it obtains a clock record through a virtual call, converts the signed
+nanoseconds at record+8 to floating seconds, gets manager+230, and tail-calls
+2AF25B4 at 2B00CF4. This callback contains no elapsed-time accumulator or divider.
+
+The constructing function 2AFCD08 stores the physics wrapper at manager+230
+(2AFD1F4). It initializes the halfword at wrapper+120 to zero at 2AFD174, including
+the time-selection byte +121, and float wrapper+124 to 1 at 2AFD178. The callback
+object gets vtable4187F80 at 2AFD568 and its manager pointer at +3A0 at 2AFD55C.
+That vtable's +70 entry is 2B00CA8. These are defaults, not proof of later values.
+
+Prior work established that 2AF25B4 chooses incoming S0 if wrapper+121 != 0,
+otherwise fixed 1/30. New gate trace:
+  2AF2A10 load wrapper+124 rate
+  2AF2A18 selected_dt * rate
+  2AF2A14/1C construct 0x34000000 = 2^-23 = 1.1920928955078125e-7
+  2AF2A20 FCMP selected_dt*rate, threshold
+  2AF2A24 B.LS 2AF2A64
+The rejected/very-small-dt path calls a world virtual method at slot+460, unlocks,
+and returns. Ordinary finite positive 1/30, 1/60, or 1/120 at rate1 pass this gate.
+Do not extrapolate the comparison to invalid NaN or negative input requirements.
+
+Passing path constructs StepInfo on the stack and calls:
+  2AF2AB4 -> 2F39630, with world, StepInfo, taskmanager+18 or null
+  2AF2AC8 -> 2F3B120, with world and taskmanager+18 or null
+The wrapper's optional body/work list processing does not impose a 30Hz clock:
+its empty-list branch still reaches 2AF2A10. There is no elapsed accumulator or
+frame modulo gate in this wrapper. Upstream scheduler invocation frequency,
+locks, world state, body activation and downstream task execution remain separate.
+
+B. Why empty solve lists are not enough to diagnose scheduling
+2F3B120 loads world+4A8 simulation and world+908 context at 2F3B228 onward.
+At 2F3B240 it calls simulation.vtable+18 with the task graph. Only afterwards:
+  2F3B268 load stack+28 count
+  2F3B26C load stack+338 count
+  OR counts, branch at 2F3B274 to task execution if nonzero
+  2F3B314 calls task-manager virtual slot+B0 on that execution path
+Consequently task counts describe queued work, not all physics already executed.
+
+C. Simulation implementations and the game's selection
+World constructor 2F28830 reads configuration+70 at 2F2A00C and compares it to1.
+Non1 branch allocates 0x20 bytes and sets:
+  world+4A8 -> simulation, simulation+18 tag0
+  simulation.vtable = main+41B5000
+  vtable+10 = main+2FDFA1C, embedded strings identify SingleThreadedSimulation
+  vtable+18 = main+2FE2604
+Equal1 branch allocates 0x6E0 bytes and runs 2F8DB0C, which sets:
+  simulation.vtable = main+41B3AC8 (2F8DB38)
+  simulation+18 tag1 (2F8DB34)
+  vtable+10 = main+2F8DFD4, embedded string identifies MultithreadedSimulation
+  vtable+18 = main+2F9158C
+
+Game setup 2AEFA20 is called by 2AFCD08 at 2AFD3B8. It passes SP+40 as the world
+configuration to 2F28830 at 2AEFE88. At 2AEFAF0 W9 becomes1, and 2AEFB08 stores
+that byte to SP+B0 = configuration+70. No other direct store to this byte was
+found before the constructor. The nearby helper 2AF0954 operates on pointed
+collision-filter data, not this stack configuration. Thus this game construction
+path explicitly selects multithread simulation. Another constructor caller exists
+at 2CD17E4; this research does not claim all worlds must use the same setting.
+Actual live world identity still needs the suggested read-only metadata.
+
+D. Singlethread inline solve and integration
+2FE2604, the singlethread vtable+18 method, loads world from threadContext+8
+at 2FE2714. It calls 2F18A4C at 2FE2C18 (embedded StPrepareMotions marker), then
+2F25870 at 2FE2C78 using world+628/+638 storage and +640 count. It later calls
+2F3AA70 at 2FE3068 for post-solve processing.
+2F25870 reads world+5A0 substeps at 2F259F4 and world+5A8 inner iterations.
+Nonpositive substeps bypass the outer loop. Earlier substeps can call 2F265BC
+at 2F25EE8, while final integration calls 2F269E0 at 2F25FDC or 2F26218.
+This work happens inside the virtual method BEFORE 2F3B120 examines graph counts.
+
+E. Multithread task path reaches the same integrator
+The multithread solve method 2F9158C calls 2FC3454 at 2F91A8C. Embedded markers
+include LtCreateSolverTask, StSetupSolverVelocities, StPopulateSolverStepInfo.
+It also selects graph generation through 2FC39C4 at 2F9202C, or cell task
+creation through 2FC3CC0 at 2F92414, depending on solver-data+118 and cell state.
+This is task construction, not proof that any particular body executes it live.
+
+Verified cell-task chain:
+  2F9158C -> 2FC3CC0 -> 2FC56D8
+  2FC56D8 assigns task vtable main+41B49E0 at 2FC5740 and 2FC5768
+  relocation at 41B49F8 (vtable+18) targets main+2FC6594
+  2FC6594 -> 2F27E80 at 2FC6924, 2FC6A14, or 2FC6A34
+  2F27E80 -> 2F269E0 at 2F27F00
+The task's primary loop reads solverInfo+10, then +70 substep count and +78
+iteration count (world+5A0 / +5A8 when that pointer is world+530). 2FC6924 is the
+last-substep branch. Alternative task modes use explicit substep/iteration and
+task+16 flags before the other final-integration calls. Some paths skip work.
+
+SolverInfo/world pointer provenance is independently visible:
+  2F9550C calls constructor 2FC2CF0 at 2F95764 and stores the created object into
+  simulation+178 at 2F95778.
+  2FC2CF0 derives world from the context (2FC2D88..2FC2D9C), allocates 0xA0
+  solverInfo bytes, forms world+530 at 2FC3144, stores it at solverInfo+10 at
+  2FC315C, and stores solverInfo into threadContext+4C0 at 2FC31A0 onward.
+  2FC3454 later populates motion/velocity pointers in this same solverInfo.
+  The actual task 2FC6594 loads threadContext+4C0 at 2FC66A4, forwards it via
+  2F27E80, and 2F269E0 loads its +10 pointer into X24.
+This establishes the dt storage -> multithread final-translation relationship.
+It does not establish graph invocation counts per rendered frame or per body.
+
+F. Exact final translation arithmetic
+In 2F269E0 (embedded TtSubIntegrateLast), motion records have 0x80-byte stride.
+X24 is solverInfo+10 = world+530, X28 is the current motion record.
+  2F26C84 LDR D0,[X24,+10] loads duplicated float dt at world+540/+544
+  2F26C88 repeats its pair into all four float lanes of V0
+The intervening quaternion update uses V0 but leaves it intact until:
+  2F26D54 loads old double Z at motion+20
+  2F26D5C loads supplied float linear vector at SP+130
+  2F26D60 FMUL V0.4S,V0.4S,V1.4S
+  2F26D64 loads old double X/Y at motion+10/+18
+  2F26D68..84 convert each float product to double and add to old XYZ
+  2F26D88/DA0 write updated double XYZ
+  2F26D8C..DAC also build a float XYZ cache at SP+C0
+Thus for this slice: new_position_i = old_position_i + double(float(dt*vector_i)).
+This is physical motion-position arithmetic, not merely a clock/StepInfo copy.
+The complete function also handles orientation, deactivation, velocity updates
+and body/range conditions. This slice does not reproduce all those behaviors.
+
+G. Local original-instruction JIT check
+make-fixture.py copies exactly 24 original AArch64 instructions from the main
+dump: 2F26C84, 2F26C88, 2F26D54 and 2F26D5C..2F26DAC inclusive. It appends RET.
+The omitted region is the quaternion calculation plus its orientation write.
+It supplies X24, X28, SP, dt, vector and original positions in synthetic guest
+memory. No instruction's arithmetic was rewritten into a substitute algorithm.
+The reference expected outputs are computed in host code and compared against
+the guest JIT results. Full source and exact PCs are local in motion-jit.c and
+motion-fixture.json; run-checks.ps1 rebuilds/runs against the existing local JIT.
+
+Inputs: 7 dt values (0,1/30,1/60,1/120,.007,.1,.25), 3 vector sets and 3 starting
+positions = 63 cases. Each checks balanced SP/return, 3 double positions and
+3 float cache values. Six repeated-call cases bring the total to447 checks.
+Result: physics translation guest checks=447 failures=0 compiled_functions=1.
+
+Repeated-call illustration, supplied vector (3,0,0), assumed one second:
+  Assumed invocations   dt              X displacement
+  30                    fixed1/30       3.000000268
+  60                    fixed1/30       6.000000536
+  120                   fixed1/30       12.000001073
+  30                    elapsed1/30     3.000000268
+  60                    elapsed1/60     3.000000268
+  120                   elapsed1/120    3.000000268
+IMPORTANT: Invocation counts here are deliberately supplied to the synthetic
+fixture. They are NOT observed live solver/body rates. The table demonstrates
+why effective per-body solve frequency must be measured before changing dt.
+
+H. Smallest useful next observation in the existing wrapper probe
+After the existing original 2F39630 call, while the wrapper still owns its normal
+locks/context, extend the current bounded world read with implementation metadata:
+  simulation = *(uint64*)(world+4A8)  [already within existing world span]
+  if readable(simulation,0x20): vtable=*(u64*)simulation; tag=*(u32*)(simulation+18)
+  if readable(vtable,0x20): solve_target=*(u64*)(vtable+18)
+  log vtable-main_base, solve_target-main_base and tag with existing selected dt.
+This needs no new physics hook and reads no task lists or changing body buffers.
+Expected identities: 41B5000 / 2FE2604 / 0; or 41B3AC8 / 2F9158C / 1.
+Only normalize pointers after range/underflow checks; do not assume every pointer
+belongs to main. Guard each dereference independently as the probe already does.
+This discriminates inline implementation versus task implementation. It does NOT
+prove completion of the subsequent 2F3B120 solve, since observation precedes it.
+
+If that confirms multithread, the next separate research need is an actual
+integration execution counter or stable per-body trace under a bounded test.
+Count actual final integration/ranges, not graph size alone; identify active body
+and substep boundaries, and compare 30/60/120 under the same scene. Sampling
+world StepInfo alone cannot show per-body solve frequency. Do not patch fixed dt
+globally on the basis of this static path or isolated arithmetic test.
+
+Artifacts / verification notes
+findings.txt: this report.
+motion-fixture.json/.h: exact extracted instruction provenance.
+motion-jit.c, make-fixture.py, run-checks.ps1: reproducible isolated fixture.
+motion-checks.txt: captured successful run (PowerShell UTF-16 text).
+task-refs.py: vtable relocation cross-checks; related function .txt files contain
+full annotated local disassembly, not just selected snippets.
+disasm.py has a display-only regex issue for negative large immediates: it may
+rewrite #-0x80000000 as #-main+...; retain the numeric comment/original bytes
+when reading those. Branch offsets and listed positive field offsets are valid.

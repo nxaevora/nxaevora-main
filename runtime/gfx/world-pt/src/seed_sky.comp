@@ -1,0 +1,20 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy), size=imageSize(motionImage);
+    if (!inside(p,size)) return;
+    vec2 uv=(vec2(p)+.5-pc.jitter)/vec2(size);
+    float z=texelFetch(sceneDepth,p,0).r;
+    if(z==0.)return; // Preserve the sky rotation computed by prepare.
+    vec2 velocity=vec2(0);
+    if(pc.historyValid!=0u && z>0.0 && z<=1.0){
+        vec2 clip=vec2(2.0*uv.x-1.0,1.0-2.0*uv.y);
+        vec4 q=pc.clipToPrevious*vec4(clip,z,1.);
+        if(q.w>0.0 && !any(isnan(q)) && !any(isinf(q))){
+            velocity=clamp((q.xy/q.w-clip)*vec2(.5,-.5)*vec2(size),-vec2(size),vec2(size));
+        }
+    }
+    imageStore(motionImage,p,vec4(velocity,0,0));
+}

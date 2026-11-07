@@ -1,0 +1,178 @@
+Arceus engine research, pass 6: physics ownership, elapsed preparation, and world postsolve serial
+2026-11-06. Offline static research; no game/process operations, runtime edits, package edits, asset/save writes, or network use by this agent.
+All code addresses below are main-relative. Main load base used by tools is 0x8005000.
+Private evidence directory: work/pass6-physics/.
+
+RESULT
+
+The main physics wrapper's default mode still selects 1/30, independently of the runtime's corrected clock channel 1. However, the surrounding component preparation explicitly consumes the corrected elapsed time, and a second family of Havok worlds directly uses supplied elapsed time. Therefore normal visible movement is not sufficient evidence that every world/body is stepping correctly, and applying another multiplier to the shared world or integration function would affect already-variable worlds.
+
+A useful existing cross-worker serial is world+0x5B8, equivalently StepInfo+0x88. It is initialized to zero and incremented by shared postsolve function 2F3AA70. The increment is reached through both single-threaded solve and a retained-RTTI hknpPostSolveTask in the multi-threaded path. Adding one read-only u32 field to the existing world-step log is the smallest useful next observation. This is a postsolve serial, not an integration/body count.
+
+A. FLAG +121 / MAIN CLOCK / PACKED-WRITE AUDIT
+
+1. Previously established selection, verified again in private 2af25b4.txt:
+   - Wrapper+121 !=0 selects incoming S0; zero selects the embedded 1/30 constant.
+   - Wrapper+124 multiplies the selected value.
+   - 2AF2A10..2AF2A24 only checks scaled dt against 2^-23.
+   - The normal path calls world preparation 2F39630, then 2F3B120 to solve.
+   The wrapper itself has no fixed-cadence accumulator or every-fourth-call selection.
+
+2. Constructor 2AFCD08 creates this wrapper with:
+   - 2AFD174: STRH WZR,[X24,#0x120], clearing BOTH bytes +120 and +121.
+   - 2AFD158 loads 0x3F800000 and 2AFD178 stores +124, initializing rate to 1.
+   This packed write explains why a search for STRB +121 alone misses the actual default initializer.
+
+3. Bounded writer/alias search:
+   - The whole-main direct unsigned-immediate STRB +121 search has 21 hits. None identifies a write to this physics wrapper's mode byte.
+   - Focused 2AE0000..2B10000 search for wider stores overlapping +120 and ADD +120/+121 found the constructor above plus unrelated fields/function objects.
+   - 2AEFAE0 is a stack config store; 2AF0B80 is a filter-table store; 2B011A8 is static metadata, not the wrapper.
+   - 2AF864C and 2AF8DD4 pass their object's embedded +120 function-object storage to a callback loaded from +110. 2AFB2D4 and 2AFB3F0 are destruction of the corresponding embedded function objects. These do not establish writes to physics mode.
+   - 2B0B500 / 2B0B6A4 form an acquire/release lock at another object's +120, with wait object +114. This is not a demonstrated setter of the wrapper's adjacent +121 mode and +124 rate.
+   - Manager+230 direct-load audit found constructor/destructor, 2AFE864 preparation, 2B00CA8 scheduler callback, and 2B06570 resource lookup. The latter calls lookup 2AF9418 using a hash; its +230 loads are not themselves mode writes.
+   Limit: this is not an exhaustive alias proof. Indexed stores, generic copies, setters reached through arbitrary pointers, and configuration/deserialization cannot be excluded by these instruction-pattern searches. No reliable in-game setter or game option for +121 was found.
+   Reproducible evidence: bootstrap.py / writers.txt, fields.py / fields.txt, and named private disassemblies.
+
+4. Runtime relationship, read-only source inspection:
+   arceus_clock.c's target-FPS correction replaces clock duration arguments for returns 278150C/2781540/2781574/27815A8 (channels 0..3). Its arceus_step supplies elapsed nanoseconds through X2. It does not set physics wrapper+121.
+   2B00CA8 reads channel 1 record+8, converts ns to seconds, and calls 2AF25B4. Correcting that clock therefore corrects the wrapper input, but mode=0 still selects fixed 1/30 for this world.
+   There is no claimed in-game dynamic-FPS flag. The relevant option is the runtime's existing SNX_ARCEUS_TARGET_FPS/main-clock substitution.
+
+B. ELAPSED COMPONENT PREPARATION EXISTS BESIDE THE FIXED WORLD STEP
+
+1. 2AFE864 gets clock channel 1 and computes elapsed seconds:
+   - 2AFE88C..2AFE89C: calls clock virtual method with W1=1.
+   - 2AFE8A0 loads clock-record+8 ns; 2AFE8B0..8C8 converts to float seconds.
+   - 2AFE8B8 loads wrapper from manager+230; 2AFE8BC loads rate+124.
+   - 2AFE8CC multiplies elapsed by rate, retaining the result in S8.
+   This function does not test wrapper+121 and does not substitute 1/30.
+
+2. Under the wrapper+128 lock it first invokes 2AF1E64. That function handles component state/enable transitions:
+   - 2AF1EC4 loads component+7C and handles state=2 / state=4 separately.
+   - State=2: 2AF1F48 loads +78, 2AF1F4C loads +79. Equal values skip transition.
+   - If different, 2AF1F5C copies +79 to +78; nonzero dispatches vtable+88, zero vtable+90.
+   This proves +78 is a synchronized component enable state, not a Havok "awake body count". Do not use it to claim sleeping bodies execute once every N frames.
+
+3. 2AFE864 then queues 24-byte records containing:
+   +0 component pointer; +8 float elapsed*rate (padding shares the next word); +10 pointer to manager+1F8.
+   - First wrapper list (+28) has 8-byte component entries, with enabled +78 and state +7C==2 filter.
+   - The corresponding records go to manager jobs +258 and +268 using 2AFFA44.
+   - Second wrapper list (+48) additionally handles states 1 and 3 through 2AE38A4 / 2AE435C; enabled state=2 records go to manager jobs +260 / +270 through 2AFFD70.
+   - 2B059CC and 2B05AB4 copy all 24 bytes into the vectors. No dt rescaling occurs in those copy helpers.
+
+4. The pre-physics callbacks are now identified:
+   - Constructor 2AFCD08 assigns callback 2B03604 to job+258 at 2AFDA38..40 and stores job at 2AFDAA4.
+   - Callback 2B03604 loads record+8 into S0, record+0 into X0 and record+10 into X1, then tailcalls 2AD30B8.
+   - Job+260 callback is 2B053B8, assigned at 2AFDB94..9C and job stored at 2AFDC04.
+   - 2B053B8 performs the same argument extraction then tailcalls 2AE27B8.
+   - Constructor establishes job+260 depends on +258 at 2AFDC70..7C; physics job+250 depends on +260 at 2AFDD00..0C.
+   Thus these elapsed component callbacks precede the physics job in the known graph.
+
+5. Concrete downstream dt usage, rather than merely observing a stored record:
+   a. 2AD30B8 preserves incoming dt in S8 at 2AD30DC. In one valid-target branch it computes S8=1/dt at 2AD375C..60, passes it to 2FF5650 at 2AD3EF8..3F00, then sends two output vectors to the object's world/body pair using world vtable+190 at 2AD3F04..1C.
+      2FF5650 saves the scalar at entry and multiplies its linear output vector by that scalar at 2FF5830..40; angular output also uses the scalar at 2FF5A5C..68. This is consistent with target-transform-to-velocity preparation. It is not proof that the player follows that branch in the test.
+   b. 2AE27B8 preserves incoming dt at 2AE27D8, builds a step record with it at 2AE2FCC..D4, and calls 2AE3150 at 2AE3004 or 2AE3044.
+      2AE3150 checks enabled +78 and state +7C==2 at entry, gates dt>2^-23 at 2AE31A0..B0, stores dt to component+478 at 2AE31D4, computes inverse dt at 2AE3200, and stores it at +47C at 2AE3238.
+      It passes this structure (X1=component+470) to 2FECB8C at 2AE32BC. The library routine retains the profiling string "TtcheckSupport".
+   These observations establish two independently elapsed-aware component paths. They do NOT establish all dynamic body trajectories or compensate fixed 1/30 in general.
+
+C. SECOND WORLD FAMILY CONFIRMED BY THE NEW USER TEST
+
+The parent independently captured and joined live logs from timing-20261106-163108-125. Their evidence reports:
+ - Completed capture: main caller return 2AF2AB8, world145172000,69 sampled steps, dt=1/30,4 substeps,multi simulation. The separate rigid-body wrapper probe observed mode0.
+ - Caller return2CD701C:15 sampled world addresses,234 sampled steps, variable input roughly0.00795..0.02916s,2 substeps,single simulation.
+ - Whole-run wrapper-entry cadence varied; it is not a count of this world's completed solves. Earlier live-snapshot counts are superseded by outputs/arceus-controller-test-pass6.json.
+ - At least one world address was observed with two simulation pointers, so raw world address is not a permanent lifetime identifier.
+These are parent observations, not a new measurement performed by this agent. The static findings below are independent corroboration.
+
+1. Constructor path:
+   2CB64B4 factory -> 2CD0CE0 -> 2CD1710 -> world ctor 2F28830 at 2CD17E4.
+   - 2CD0CE0 allocates a size-0x140 owner, installs vtable 419A958 and places it in the component's +90 owner field.
+   - Owner's world is +10.
+   - 2CD1710 builds config at SP+10 and explicitly writes zero to config+70 at 2CD1774 (SP+80), selecting single simulation.
+   - It writes 2 to config+FC at 2CD179C..A0 (SP+10C), selecting two solver substeps.
+   - The owner stores the constructed world at +10 at 2CD17F4.
+
+2. Update path:
+   - Component wrapper 2CD11EC loads owner from component+90. Adjusted-subobject wrapper 2CD121C uses +48, the corresponding location after the -48 adjustment.
+   - Both leave incoming S0 unchanged; they load/multiply three parameter pairs into S1/S2/S3 then tailcall owner update 2CD6D6C.
+   - 2CD6D6C saves S0 into S9 at 2CD6DB8.
+   - At 2CD6FEC it loads owner+10 world; 2CD6FF4..7000 gates S9>2^-23.
+   - 2CD7014 writes S9 to the step input; 2CD7018 calls 2F39630; 2CD7024 calls 2F3B120.
+   - No wrapper+121 test or 1/30 substitution is on this world-step branch.
+
+3. Ownership / intended-use evidence and its limit:
+   - Factory adds a component with vtable419A800 and child owner419A958 to another object; component+80 holds parameter storage.
+   - After solve, 2CD6D6C iterates body IDs from owner+78, indexes world+38 bodies with stride0xC0, and reads per-body +98/+9C indices at 2CD74AC..C0.
+   - It optionally computes transforms relative to a parent body. It obtains old indexed transforms through 2A6937C/2A694D4, blends, and sends new indexed values through 2A6B46C/2A6B630 at 2CD7478/7488.
+   - These four accessors synchronize around the target object's lock +470 and access indexed transform data.
+   This is sufficient to describe the second family as per-component, transform-coupled physics. It suggests model/secondary-motion ownership but does not identify an exact asset, cloth, hair, ragdoll, Pokemon or player. Do not label it conclusively from the address cluster alone.
+
+4. Patch implication:
+   A global multiplier in 2F39630 or 2F269E0 would also scale these already-variable worlds. Any future experiment must discriminate the specific wrapper/world ownership. The currently observed normal player motion does not establish which world supplies it.
+
+D. SHARED WORLD POSTSOLVE SERIAL: INITIALIZATION, ORDER, AND CAUTIONS
+
+1. world+5B8 is StepInfo+88:
+   - World ctor 2F28830 forms X24=world+530 at 2F2896C, passes it as X0 and calls 2F3E870 at 2F28990.
+   - 2F3EA04: STR WZR,[X0,#0x88] initializes this exact field to zero.
+   - Shared 2F3AA70 keeps input world in X19. At 2F3AC64 it loads W8=[X19+5B8], increments W8 at 2F3AC68 and stores it at 2F3AC6C.
+   - The increment occurs after its command/contact-cache dispatch and before simulation-context clearing and world+808 completion state. It is not the very end of the function, and entry/return alone is not the exact increment point.
+
+2. Both solve implementations reach this function:
+   - Single solve 2FE2604 calls 2F3AA70 at 2FE3068 after the inline solve/integration path (pass4 evidence).
+   - Multi constructor 2F8DB0C installs a task with vtable41B3C98, adjusted interface41B3CE0, into simulation+6C0 at 2F8DD78..AC.
+   - RTTI object41B3D18 has name pointer41B3D20->39A3D7C, string "17hknpPostSolveTask".
+   - Its adjusted virtual execute slot41B3CF8 is 2F94354. This subtracts0x20 and tailcalls2F94000.
+   - 2F94000 uses task+28 world to acquire a worker context from world+908, handles pending full-cast work from simulation+6B8, and tailcalls2F3AA70 at2F9411C.
+
+3. Graph ordering evidence:
+   - 2F9158C creates the full-cast task (simulation+6B8) at2F92420..34, records its ID at graph+4DC, and appends edge [graph+4DA, full-cast-ID] at2F92474/78.
+   - It sets postsolve task+28=world and +30=simulation at2F9247C..8C, appends postsolve task to graph at2F924CC..E4, records ID atgraph+4E0, and appends edge [full-cast-ID, postsolve-ID] at2F92514/18.
+   - 2FC3CC0 adds an integration task from2FC56D8 to the graph at2FC3D10; for non-FFFF endpoint IDs it appends [prerequisiteID, taskID] at2FC3D84/88 and [taskID, successorID] at2FC3DB4/B8.
+   - The other integration-task builder2FC39C4 forwards graph entry/exit IDs from2F9158C graph+4D8/+4DA to2FC3AEC.
+   - This supports the intended dependency ordering: integration-related graph work -> solver completion point -> full casts -> postsolve. I did not re-derive the complete generic task executor or every graph-import branch in this pass; it is not a proof that every possible malformed/error/reentrant path serializes identically.
+
+4. Existing consumer evidence:
+   Deactivation/island logic uses world+5B8 as an epoch. For example2F4F924 obtains world frommanager[0], readsworld+5B8 at2F4FA80, comparesisland+68 at2F4FA84..8C, and selectively resets/updates an island list based on this epoch.2F51F1C, which retains "LtDeactivation"/"StIslandActivation" profiling strings, also readsworld+5B8 at2F51F9C. This reinforces that the field is an engine step epoch, not a floating-point timing quantity or body count.
+
+5. False positives excluded in the direct +5B8 writer search:
+   - 2F3EF40 writes a stats/layout object, notworld: worldctorcalls2F3EE44 withworld+8A8's pointee.
+   - 2F8B5CC..D4 increments a collision-statistics object supplied on the stack, notworld. Nearby counters+540/+548 accumulate profiling values, and+738 is a profiling flag.
+   - 2FF1B6C is a stack-local+5B8 store.
+   Full alias/copy coverage remains unproven. Report this as a verified normal-path serial, not an unresettable global monotonic ID.
+
+E. EXACT MINIMAL OBSERVATION (IMPLEMENTED LATER; SEE FINAL REVIEW BELOW)
+
+In arceus_clock.c physics_world_step_probe, after engine_clock_original[3](c,entry), inside the existing `if (readable(object,0x650))`:
+ - Append `postsolve_serial=%u` to the existing arceus-physics-solver LOG format.
+ - Append `gr32(object+0x5b8)` to its arguments.
+ - Preserve the existing count/ns/object association, input/stored dt, substeps, alternate_world, and simulation metadata.
+The existing readable range already covers all4 bytes at5B8; this requires no new guest patch, JIT hook, writes, extra pointer traversal, synchronization primitive or wide object copy.
+
+Interpretation requirements:
+ - This probe is after collision/task preparation at2F39630, before the two known callers call2F3B120 for this step. The serial is normally the number of previously completed postsolve increments, not confirmation the just-prepared step has integrated.
+ - Only interpret primary-world serial with alternate_world=0. The alternate-world branch can own different data.
+ - Compare unsigned modular differences within the same tracked world/simulation lifetime. A counter decrease may be wrap/reset; changed simulation pointer or world reuse starts a new segment. Even an unchanged address/pointer can theoretically be reused, so also consider observed discontinuity and constructor lifetime evidence.
+ - Sampling is every300 calls globally across all worlds. A count delta is not that particular world's call count. Serial delta/time delta can estimate that world's postsolve rate across a stable sampled interval; it does not yield every individual step's dt sum when dt varies.
+ - A serial increment is not a body/substep/integration-range count. A valid solve can have zero active motions. It does not show which body the player uses or whether a body's velocity was externally overridden.
+
+If a later2F269E0 integration-range hook is approved, capture serial fromsolverInfo+10->StepInfo+88 (or guardedctx+8 world+5B8), worldidentity, simulationidentity, signedW2start andsignedW3count atentry beforeoriginal. Same(world lifetime, simulation, serial) can associate ranges executed on different workers. Retain pass5's exact function/instruction guards and countnormalreturns separately. Do not useTLS-only currentstep labels acrossworkers. Also do not multiply the serial bysubsteps to claimbodyexecution totals.
+
+F. WHAT EXPLAINS NORMAL MOTION, AND WHAT IS STILL UNKNOWN
+
+Established: elapsed component inputs coexist with a fixed-step main world; some components generate velocity-like outputs using1/dt; support-query components carrydtandinverse; separate transform-coupled worlds already useelapsed time. These are concrete mechanisms allowing visible movement/animation to appear normal while a differentworld's free dynamics could still be wrong.
+
+Not established: which component/world owns player locomotion, whether every motion in the fixed world is integrated each render, how often active ranges are nonempty, and whether a particular thrown ball/body is dynamic or externally driven. Sleeping/static bodies and transform overrides make wrapper-count inference insufficient. There is no basis for a blanket correction from current static evidence.
+
+Best next measurement after scalar serial: estimate primaryworld postsolve frequency fromstable serial samples; if it tracks120Hz withdt1/30, then capture actual integrationrange execution and a small trackedmotion cohort before decidingwhether/how to activate mode+121. Keep already-variable secondaryworlds out of that experiment.
+
+VALIDATION / TEST RESULTS
+
+This pass used local main.bin disassembly, the existing calls/refs/relocations index, packed-write and direct-load searches, and read-only runtime source review. All new disassemblies and scripts are private towork/pass6-physics. No new guest/JIT experiment was needed: the new facts are direct field assignments, call arguments and graph edges, and a partial stubbed test would not resolve live world/body ownership or scheduling. Priorpass4 integration-slice andpass5 dispatcher JIT tests were not rerun and are not being presented as new validation. Live log statistics above belong to the parent's independently joined read-only capture.
+
+Remaining uncertainty is explicitly preserved; no speculative timing patch has been made.
+
+LATE INDEPENDENT REVIEW OF ROOT'S SERIAL-LOG ADDITION
+
+After this report's recommendation was delivered, the parent implemented it while the game was closed. I independently compared work/pass6-runtime/arceus_clock-before-pass6.c to nvn-src/src/nx/runtime/arceus_clock.c using git diff --no-index. The complete diff adds only an explanatory comment, one postsolve_serial=%u format field and gr32(object+0x5B8) to the existing log call. The existing readable(object,0x650) range covers the four-byte read. No guest memory writes, new hook, altered original-call order, branch/counter change or timing correction appears in the diff. No material code-review findings. The parent reports a successful runtime build; I did not independently rebuild or execute the game. Parser output should retain raw exact-joined serial samples and avoid automatic lifetime/rate assumptions.

@@ -1,0 +1,134 @@
+ARCEUS 1.1.1 ENGINE RESEARCH — PASS 6
+2026-11-06. Controller test, completed capture, local engine research.
+
+Accepted test baseline
+The120FPS-target test was launched through a native Windows desktop helper.
+The log detected DualSense Edge Wireless Controller with accelerometer and
+gyroscope. Camera speed2.2, menu-repeat correction and the existing timing,
+blink,water,effect and event-camera fixes were enabled on the working Vulkan
+path. The user manually closed it; the helper recorded exit0. No game was
+reopened after that closure. Escape remains non-exiting in the runtime.
+
+User feedback: camera and menu scrolling all felt good and better than before.
+No visual problems; the scene remained below1440p without the earlier strange
+appearance. Saved resolution was used; automatic-governor bypass, screen-fetch
+candidate and resolution tracing were disabled. This was not a1440p test.
+Keep this camera/menu/timing configuration as the accepted baseline.
+
+Persistent controller launch route
+Use outputs/Arceus-Controller-Test.exe through the desktop launch_app API, or
+start it from the desktop manually. It directly launches the game in the
+interactive session; no shell child is involved. The earlier restricted-shell
+route failed to enumerate the controller and must not be reused for testing.
+The helper refuses overlapping tests, sets background gamepad input, captures
+logs and waits indefinitely for the user's close. It never kills the game.
+Existing Capture-Arceus-Timing.ps1 launchers also now pass gamepad_background=1.
+See controller-test-launch-notes.txt for exact persistent policy.
+
+What the completed run establishes
+Capture: C:\Users\brett\Documents\Codex\work\arceus-runs\timing-20261106-163108-125
+No refused timing guards or compile failures were found. The camera correction
+observed authored setting1 and multiplier2.2. The user also reported good feel.
+UI animation samples used33333333ns per authored frame and elapsed normalized
+progress; a frame-based-looking denominator does not itself mean sped-up UI.
+
+World-specific joins now distinguish physics policies:
+  main caller2AF2AB8:69 samples of one world, fixed1/30s,4 substeps,multi;
+  caller2CD701C:234 samples across15 world addresses, variable elapsed dt,
+    2 substeps,single.
+One address appeared with different simulation pointers; address alone is not
+a lifetime identity. The summary joins by exact(count,ns,world), not adjacent
+lines. Sample counts are globally shared; they cannot establish each world's
+solve rate. Runtime submission or wrapper cadence is not displayed FPS.
+The native capture did not run PresentMon; sustained120FPS is not claimed.
+Full machine-readable result: arceus-controller-test-pass6.json.
+
+New engine findings
+
+1. Physics has elapsed preparation beside the fixed-step main world.
+Component jobs before main physics use elapsed channel1 dt. One path converts
+target-transform differences to velocity-like outputs using1/dt; another passesdt and its
+inverse into support checks. Separately, the second world family directly uses
+supplied dt and updates indexed transforms. Its exact gameplay ownership is
+still unresolved. A blanket multiplier in the shared solver would also modify
+these already-variable worlds. Normal visible movement does not prove all free
+dynamic bodies have correct timing, either.
+
+World+5B8 is an existing32-bit postsolve serial shared across worker contexts.
+Constructor and both solve implementations establish its initialization and
+increment. One guarded read of that scalar is now appended to the existing
+sampled solver log. No extra hook, guest write or timing behavior was added.
+The parser preserves raw serial/count/time/simulation records and does not
+automatically infer lifetimes or rates. This field was NOT in the completed
+capture; the staged next candidate is needed to observe it.
+Detailed evidence: arceus-physics-research-pass6.txt.
+
+2. Dialogue has separate readiness, automatic advance and close-delay controls.
+The readiness field changes1->2 at the end of one ordinary text-wrapper call;
+it is not a seconds delay. Optional auto-advance bytes only govern specific
+modes, and one mode permits manual input to bypass that threshold. A timed
+message subtype has a separate signed countdown after state6, closing on the
+N+1th eligible visit when initialized toN. The base subtype has no such clock.
+
+An isolated fast-finish fixture can reuse one fresh button mask across two
+terminal text boundaries in one parent call; the one-shot flag is consumed.
+This does NOT demonstrate two queued NPC messages or live use of that mode.
+The field constructor enablesD8, notD9; it startsD9 at zero. No global dialogue
+throttle or speculative input cooldown was installed.
+Detailed evidence: arceus-dialogue-research-pass6.txt.
+
+3. AI turning needs coherent angular progress and completion.
+Turn/TurnKey retain authored degrees and frames. They apply one quaternion step
+per eligible callback even when their completion counter advances by more than
+one. Correcting only the counter would produce the wrong total rotation.
+The original yaw setter adds another issue: float rounding near zero heading
+can erase tiny fractional steps. A controlled1-degree turn stalled at120
+callbacks/s with naive fractional rotation. Carrying only the setter's small
+angular residual produced the intended endpoint and preserved an injected
+external orientation change. The original angle is also needed to preserve
+multi-revolution motion that a quaternion alone cannot represent.
+
+This is a candidate design tested around original arithmetic, not a live fix.
+Scheduler windows, entry/reentry, object lifetime and writer order need live
+evidence before rollout. Existing grouped callbacks can differ even at30FPS.
+Detailed evidence: arceus-ai-turn-research-pass6.txt.
+
+4. Resolution has explicit scene modes beyond the automatic governor.
+Original mode setters confirm custom width/height scale, half scale and a
+separate overriding mode. A transition saves requested mode and requests7,
+which applies(.5,.5) only if no override supersedes it; a later branch restores
+the saved request. It does not preserve all resolution state, and complete
+cancel/error-path restoration is unproven. No stuck-resolution defect is claimed.
+Disabling the automatic governor cannot by itself guarantee full scene size.
+Tests verify parameter writes, not final render dimensions or1440p quality.
+Detailed evidence: arceus-resolution-research-pass6.txt.
+
+Implementation and verification
+12,902 bounded assertions passed with zero failures across AI, messages and
+resolution;49 compiled guest entries. Stubs and extraction limits are recorded
+in arceus-research-provenance-pass6.json. Physics used static evidence and the
+completed capture; no prior tests were presented as newly run.
+The parser's exact joins/ambiguity/legacy/wrap checks passed. The observation-
+only runtime compiled successfully and received independent diff review.
+The native launcher received independent review against the successful test.
+Details: arceus-engine-checks-pass6.txt.
+
+Package state
+The completed test used candidate SHA256:
+c2b2be0b146d3c801a9e1e801243ca60d17965bdd363af8da5c746464b6753c1
+It remains installed and is preserved in work/ArceusEngineCandidate-before-pass6-runtime.exe.
+The staged candidate for the next controller launch adds only the diagnostic
+serial and has SHA256:
+c88b5a620f1f627a2a07bc695eca49dc05dfddebecddc708d020a2c7d610a5df
+The regular runtime is unchanged. Saves and game assets were not modified by
+research. Source and mirror match. No game data left this machine.
+
+Next useful work
+Keep the accepted camera/menu/timing settings. For physics, first observe the
+new serial on a stable world/simulation lifetime, then investigate actual body
+integration only if it shows excessive completed-step frequency. For1440p,
+correlate requested/effective scene scale with3D viewport, target and output
+dimensions before changing more rendering behavior. For dialogue/AI, observe
+the verified active owner and lifecycle rather than scaling shared functions
+from static constants alone. These are prepared next steps, not claims of
+background work after this report.

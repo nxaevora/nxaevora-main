@@ -1,0 +1,34 @@
+Lighting/shadow localization, 2026-11-06
+
+Capture175313 at present3020: pronounced repeating stripes are already in
+shadow-receiver output540a88000 (attachment32, R8_UNORM), and subsequently in
+scene-light5508c0000 (attachment48) and final553550000 (attachment00).
+Basecolor552a80000 lacks the pronounced stripes; step normals in552210000 are
+much smoother. This localizes the visible contribution to the receiver or its
+inputs, before final tone mapping/postprocessing. It does not prove every
+normal/material input is correct.
+
+New exact data check: sourceD32 attachments51/49 are1365x1365; receiver texture
+attachment62 has two1024x1024 layers. All2,097,152 destination texels are bitwise
+identical to nearest-neighbor reduction of those two sources. No upload or
+random memory corruption is needed to explain the copied values. Source code:
+texture.c copy_layers uses vk_sc(w/h) as source extent and nearest blit into
+native-size array layers. Shadow producer viewport is1365.333 at4/3 scale.
+
+Local planar estimates find periodic depth-position errors after this reduction.
+See arceus-shadow-resampling-evidence.json. These estimates are not full shadow
+shader replay, and do not prove how much receiver bias the game applies.
+The strongest current hypothesis is self-shadowing from mismatched sample
+positions during enlarged-shadow-to-native-array reduction.
+
+Correction work must keep the full shadow pass consistent. Candidate approaches:
+1. Keep shadow depth AND integer tag attachments at native1024, using matching
+   per-pass viewport/scissor and shader resolution constants, direct array copies.
+2. Retain scaled shadow arrays and compatible sampling dimensions throughout.
+Do not change only depth allocation, force linear Vulkan depth blits, or globally
+increase depth bias. Existing rendering assumes global scale at allocation,
+clear/scissor/viewport/frame_consts and copy extents; those dependencies must be
+addressed before a candidate is safe to stage.
+
+No new runtime fix staged in this investigation. Existing AAAD4627 candidate
+remains. No game launch, gameplay input, asset/save changes or TAA implementation.

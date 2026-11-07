@@ -1,0 +1,13 @@
+__pycache__/
+*.spv
+*.bin
+*.dll
+*.exe
+*.log
+*.land
+*.grove
+*.props
+*.splat
+reflection-production.h
+reflection-witness.h
+reflection-pair.h

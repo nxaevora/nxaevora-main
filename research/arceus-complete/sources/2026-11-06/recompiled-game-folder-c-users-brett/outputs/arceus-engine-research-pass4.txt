@@ -1,0 +1,220 @@
+ARCEUS 1.1.1 — FOURTH OFFLINE ENGINE RESEARCH PASS
+2026-11-06
+
+The strongest new evidence concerns physics displacement and mixed AI clocks.
+Additional field/attention work separates actual timers from misleading nearby
+names, and establishes expiration rules that future fixes must preserve.
+
+No new gameplay timing correction was enabled. The research candidate received
+one small observation-only addition identifying the physics implementation.
+The regular Vulkan package remains byte-identical. No game process was
+launched, closed, driven or hot-patched, and no save/game asset was modified or
+uploaded. All binary analysis and instruction execution stayed local.
+
+Addresses and field offsets below are hexadecimal and main-relative unless
+otherwise specified. Evidence applies to the local Arceus 1.1.1 build.
+
+PHYSICS: THE FIXED STEP REACHES POSITION INTEGRATION
+
+Previous work established that 2AF25B4 selects 1/30 when object+121 is zero and
+multiplies it by object+124. This pass found no accumulator or every-N-updates
+gate between that selection and the collision/solve setup calls. The selected
+positive timestep proceeds when it exceeds approximately 1.19e-7.
+
+The wrapper calls collision setup 2F39630 and solve builder 2F3B120. A task-list
+empty check exists downstream, but it cannot alone establish that no physics
+work happened: one simulation implementation performs solving inline before
+that check.
+
+World+4A8 selects the simulation object:
+  Single-threaded: vtable 41B5000, tag +18 = 0, solve method 2FE2604.
+  Multithreaded:   vtable 41B3AC8, tag +18 = 1, solve method 2F9158C.
+
+The game's world construction path 2AEFA20 writes configuration byte +70 = 1
+before invoking the world constructor, strongly predicting the multithreaded
+implementation for that path. The actual live world still needs observation.
+
+Both implementations reach motion integration at 2F269E0. The multithreaded
+chain includes 2F9158C -> 2FC3CC0 -> 2FC56D8, constructing a task whose vtable
+41B49E0 points to 2FC6594. That task reaches 2F27E80, which calls 2F269E0.
+The timestep source carried into this path is world+540 through world+530's
+solver structure.
+
+An isolated sequence of 24 original instructions from the motion function
+loads that timestep, multiplies a supplied linear vector by it, and adds XYZ
+into double-precision motion coordinates at +10/+18/+20.
+
+For input vector (3,0,0), starting at zero and assuming one elapsed second:
+
+  Assumed calls/sec    Fixed dt=1/30    Elapsed dt=1/call_rate
+          30             ~3 units             ~3 units
+          60             ~6 units             ~3 units
+         120            ~12 units             ~3 units
+
+These are actual isolated instruction results under specified inputs, not live
+body trajectories or displayed FPS. Active-body selection, task execution,
+contacts, damping and the source of the supplied vector were not simulated.
+The evidence substantially strengthens physics as the first live measurement
+priority, without proving that every object currently moves four times faster.
+
+AI: SOME ACTIONS MIX DIFFERENT TIME DOMAINS
+
+The context scheduler at 1050E00 reads clock channel 1, converts its nanoseconds
+to seconds, and updates context+84. Its separate context+88 value counts
+updates. The getter 1059A78 reads that frame count without consuming it.
+
+The direct-call inventory contains 15 callsites across 14 functions. Beyond
+waits and turning, these include look-around and internal actor/Pokemon rest,
+tiredness, vigilance, hunger and sleep adjustments. Most use floating rates;
+tiredness uses integer arithmetic with additional cap behavior. These are not
+evidence of a player hunger system. Repeated getter reads must reuse the same
+context value rather than advance a new accumulator on each read.
+
+WaitFrame at B35AE0:
+  - Positive remaining count at +13C is reduced by context+88.
+  - Completion is checked before subtraction. The call that reaches zero
+    still returns the running result; completion is reported on the next call.
+  - A duration of 30 with frame delta 1 therefore takes 31 callbacks including
+    the completion callback. This original behavior must be preserved.
+
+Turn / TurnKey at B338DC / B32CD4:
+  - Completion counters +134 / +144 advance by the frame getter's result.
+  - A precomputed quaternion step at +140 / +150 is applied once per callback,
+    independent of the returned frame count.
+  - Original math tests confirmed step * current quaternion order, then
+    transformation of the forward vector. Frame deltas 0, 1 and 4 produced
+    identical rotation for the same quaternion inputs.
+
+Consequently, normalizing the frame getter alone could lengthen a turn's
+completion time while leaving each rotation step unchanged. Even a zero
+returned tick does not suppress its rotation. A correction must handle both
+progress and the applied rotation.
+
+Adjacent WaitSecondKey / Wait actions at B35CB8 / B35EF8 already subtract
+context+84 seconds. JumpToTarget at AF22E8 likewise uses seconds for charge and
+jump motion, then uses frames for a post-jump hold at +184. Entry AF1C0C sets
+that hold to three via a paired 64-bit initialization at AF1CF4.
+
+This is concrete evidence against slowing the whole AI updater or changing
+all actions through a single getter. The earlier per-context floor(seconds*30)
+proposal also remains invalid because frequent context resets can produce zero
+forever. Any authored-tick accumulator must retain fractional progress across
+resets and use the same clock domain, while action-specific motion still needs
+its own analysis.
+
+FIELD TIMERS: MORE PRECISE MAPPINGS
+
+Climbing stopping blend, updater 2549FA0:
+  State +D00 = 2 uses elapsed count +D04 to decay saved motion vectors toward
+  zero through climbing_move_stop_ease_func. Initializer 254B254 snapshots the
+  vectors and sets state 2 with a 64-bit store at 254B2A4 that also zeros +D04.
+  Expiration compares the new count with climbing_move_stop_frame and clears
+  state/vectors. The updater also invokes a ride-blink helper, making whole-
+  function throttling inappropriate for this one timer.
+
+  A separate division by 30 at 254A8F4 forms a movement-to-control ratio:
+  length(vector+D50) / (configured scalar / 30). The same configured scalar
+  also supplies a /30 movement-vector multiplier elsewhere. Its precise units
+  and output property names remain unresolved; it is not interchangeable with
+  the stopping timer simply because both mention 30.
+
+Ride search voice versus dash effects, updater 2587684:
+  +D08, previously labeled a suspected dash timer, controls a search-voice
+  interval. It can trigger PLAY_PV_RD_217_00_SEARCH and then resets.
+  The real dash ramp is integer +D20, normalized into float +D00. That value
+  feeds both effect_dash_interval_scale_ease_func and effect_dash_scale_ease_func.
+  A normalized effect progress field can therefore remain callback-dependent
+  even when the particle engine's animation time has already been fixed.
+
+Wormhole update 1B5BBB8:
+  wormhole_out_keep_frame feeds the player facial-expression hold helper
+  24D35B8. It is not the initializer for the nearby countdown loop.
+  That separate loop processes a queue of 0x18-byte entries, each initialized
+  to 30 updates, and expires retained effects through cleanup function 2B90D40.
+  It does not establish that the whole space-time distortion duration is wrong.
+
+Respawn hold, updater 24EE204:
+  State 4 owns +2A0 and respawn_fade_keep_frame_count. It increments the field
+  but compares the OLD value, continuing while old <= threshold. From zero,
+  threshold N reaches the expiry decision on callback N+2: thresholds 0/1/30/120
+  used 2/3/32/122 callbacks in the instruction test.
+  This is original comparison behavior, not an off-by-one bug to remove.
+  The hold and common fade animation are separate clocks.
+
+LOOK-AT AND FACIAL HOLDS: EXPIRATION RULES TESTED
+
+The original look updater 19C2F80 was executed with null target handles and a
+test callback standing in for target restoration. The four countdown slots
+expire independently. Each expiration invokes restoration once and clears its
+active flag. Starting an active hold at zero still decrements to -1 and expires;
+zero is not a safe representation for 'no authored tick this callback'.
+
+The separate look-start count +670 increments only with +5F0 active and stops
+incrementing at 9,999,999. The short null-target path also clears +218, showing
+that non-timer state changes would be lost by skipping the whole updater.
+
+The face updater prefix 24D17DC has a low-two-bit gate at +250 that stops both
+the +280 expression hold and +2A4 vigilance delay. The semantic names of those
+bits remain unknown. The two counters have different expiration rules:
+  - Active +280 decrements and disables its hold when the result is <=0.
+  - +2A4 stores the decrement only when the result is nonnegative; zero and
+    negative initial values remain unchanged.
+Restoring counters after executing the original function cannot undo an event
+or target restoration that expiration has already triggered.
+
+RESEARCH CANDIDATE ADDITION
+
+The existing sampled post-collision probe now emits arceus-physics-simulation
+records. It reads world+4A8, the simulation tag, vtable and solve-method pointer.
+Classification requires all three to match the known implementation; otherwise
+it reports unknown. Alternate worlds remain separate in the summarizer.
+
+This adds no solver hook and makes no StepInfo, timestep, counter or game-state
+changes. It is gated by SNX_ARCEUS_TIMING_RESEARCH=1 and the existing build and
+function guards. It identifies implementation, not completed solver executions.
+Read-only review found no actionable issue with bounds or state preservation.
+
+VALIDATION
+
+1,813 new guest-instruction checks passed, zero failures, 15 compiled functions:
+  Physics position-update arithmetic:        447
+  AI wait and turn behavior:                 665
+  Field timer initialization/expiration:     310
+  Look-at and facial timer branches:         391
+
+The checks use controlled memory and documented external stubs or continuation
+returns. They do not execute a game scene, complete solver, live AI action,
+effects rendering, respawn or save operation. Fixtures and instruction blobs
+remain in local work directories.
+
+The log summarizer passed new/old-log fixtures. Eleven existing exact hook
+guards were reverified, and both simulation vtable method entries were checked
+against local relocation data. The runtime built successfully without compiler
+warnings or errors. Runtime source and mirror match. The previous candidate is
+retained, and the regular package's SHA-256 is unchanged.
+
+Package SHA-256:
+  Regular:   69B7C027FAFC35C2AF8270CDCBF01B666E8931CF0C81E39F170193A19F64DDAF
+  Previous:  E8CC679125F8BDEA8EC822DFD5112135F3DDAD98DAAB4CB22E80C30D12730480
+  Candidate: C2B2BE0B146D3C801A9E1E801243CA60D17965BDD363AF8DA5C746464B6753C1
+
+NEXT PRIORITIES
+
+1. Use the existing manual 30/120 research launchers to observe the live physics
+   implementation, selected timestep and active gameplay paths. This is the
+   strongest remaining engine-wide timing lead.
+2. Compare AI waits and turns separately; preserve seconds-based motion and
+   retime frame counters together with any per-callback motion they control.
+3. Exercise capture/fade probes already prepared in the previous pass, followed
+   by targeted ride/attention observations when those situations are available.
+
+The manual launchers keep Vulkan, no time limit and user-controlled closure.
+No input/Escape behavior, resolution setting or shader logic changed this pass.
+The separate 1440p image-quality comparison remains pending.
+
+Companion reports:
+  arceus-physics-research-pass4.txt
+  arceus-ai-research-pass4.txt
+  arceus-field-timers-pass4.txt
+  arceus-attention-timers-pass4.txt
+  arceus-engine-checks-pass4.txt

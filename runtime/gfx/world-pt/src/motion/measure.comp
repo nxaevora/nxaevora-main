@@ -1,0 +1,41 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+void main() {
+    ivec2 size = imageSize(motionImage);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy)*sampleStride + sampleStride/2;
+    if (!inside(p,size)) return;
+    uint material = materialAt(p);
+    if (material == 0u || material >= uint(materialCount) || texelFetch(sceneDepth,p,0).r<=0.0) return;
+    int id = int(material);
+    vec2 centered = vec2(p) - pc.jitter - .5*vec2(size);
+    ivec2 fixedPoint = ivec2(round(centered*4.0));
+    ivec3 currentBuckets = buckets(vec2(p)-pc.jitter,size);
+    for (int i=0;i<3;++i) {
+        int local=currentBuckets[i];
+        imageAtomicAdd(stats,statAt(local,countField,id),1);
+        imageAtomicAdd(stats,statAt(local,sumX,id),fixedPoint.x);
+        imageAtomicAdd(stats,statAt(local,sumY,id),fixedPoint.y);
+        imageAtomicMax(stats,statAt(local,maxX,id),p.x);
+        imageAtomicMax(stats,statAt(local,maxY,id),p.y);
+        imageAtomicMax(stats,statAt(local,invX,id),size.x-1-p.x);
+        imageAtomicMax(stats,statAt(local,invY,id),size.y-1-p.y);
+    }
+    vec2 projected = centered + imageLoad(motionImage,p).rg;
+    if (any(greaterThan(abs(projected),.5*vec2(size)))) return;
+    ivec2 previous = ivec2(round(projected*4.0));
+    vec2 prevPixel=projected+.5*vec2(size);
+    ivec2 q=clamp(ivec2(round(prevPixel)),ivec2(0),size-1);
+    ivec3 previousBuckets=buckets(prevPixel,size);
+    for(int i=0;i<3;++i) {
+        int local=previousBuckets[i];
+        imageAtomicAdd(stats,statAt(local,visibleCount,id),1);
+        imageAtomicAdd(stats,statAt(local,projectedX,id),previous.x);
+        imageAtomicAdd(stats,statAt(local,projectedY,id),previous.y);
+        imageAtomicMax(stats,statAt(local,projectedMaxX,id),q.x);
+        imageAtomicMax(stats,statAt(local,projectedMaxY,id),q.y);
+        imageAtomicMax(stats,statAt(local,projectedInvX,id),size.x-1-q.x);
+        imageAtomicMax(stats,statAt(local,projectedInvY,id),size.y-1-q.y);
+    }
+}

@@ -1,0 +1,156 @@
+ARCEUS 1.1.1 ENGINE RESEARCH — PASS 5
+2026-11-06. Local offline analysis and original guest-instruction tests.
+
+New result
+This pass established the active field-message processing chain, identified
+four event catch-up clocks, and traced AI/physics dispatch far enough to separate
+worker scheduling from elapsed-time accounting. It did not add a gameplay fix.
+The runtime, both test executables, Vulkan path, save and rendering settings are
+unchanged. No game was launched, driven or closed, and no game data left this PC.
+
+The most actionable finding is dialogue: advancement consumes fresh button
+presses, not the menu autorepeat mask. Embedded message waits and reveal delays
+are separate counters. Moreover, the game has an explicit repeat-until-finished
+text operation. A global30Hz throttle around that text function could stall that
+operation instead of fixing ordinary dialogue. The next change should establish
+live owner/state coverage before changing its timing.
+
+1. Dialogue: concrete path and a better explanation of missing logs
+The parent updateC92C50 reaches field manager24858F4. Its active+58 object updates
+through2484ED8 ->27379B8 ->text virtual+50 ->FBFBD0. The older2482818 probe belongs
+to a separate optional+60 branch and therefore cannot establish coverage of this
+active-message path. Its old zero-callback logs were not evidence that dialogue
+had no relevant updates.
+
+The concrete text object comes fromFBEFE4, vtable40F0150. Its methods establish:
+- Held-input bits can accelerate reveal by reducing a byte delay or doubling a
+  per-call quota temporarily. The normal defaults are restored afterwards. Nonzero processing statuses can
+  also repeat the inner text loop without consuming that quota.
+- Advance checks use fresh-press bits and lock/automatic/one-shot flags; they do
+  not read the autorepeat slot modified by the menu scrolling fix.
+- A BE02 embedded message token initializes a separate wait at+188. Depending on
+  an existing mode, its original decrement is1 or2 per invocation. The next-call
+  boundary is significant: count30 resumes text on call31 or16 respectively.
+- The parent has an explicit repeat path2737ABC. When enabled, one outer call can
+  consume the entire embedded wait by repeatedly calling the text processor.
+  Returning a synthetic running result without progress there could stall it.
+
+Tests executed these selected original methods and confirmed these distinctions.
+They did not run full glyph rendering or reproduce the user's dialogue scene.
+No claim that a particular counter caused the remaining live skipping is made.
+
+Named false leads were separated: InputSkip in the107... region belongs to
+expedition results; the131... region belongs to Pokédex results. Its30-count
+waits are result sequencing. SingleInputEnableFrame belongs to tips configuration,
+not a demonstrated shared NPC-dialogue debounce setting.
+Detailed evidence: arceus-dialogue-research-pass5.txt.
+
+2. Four fixed1/30 clocks now have a verified event owner
+Script registration identifies event_script::RealTimeEventManager and names
+IsWaitCatchUp. Navigator/fade registration supplies independent operation names.
+Its four fields have distinct roles:
+  +190 configurable capped delay while the catch-up predicate stays true;
+  +1A0 cumulative time spent within a distance threshold, stopping navigation
+       after nominal2seconds; the far branch does not reset it;
+  +198 overall nominal6second navigation-recovery timeout;
+  +19C nominal1second hold after a fade/reposition attempt and before fade-in.
+The recovery sequence temporarily disables control, fades out for30authored
+frames, requests repositioning, holds, then requests fade-in for30frames. Fade
+animation and the scalar hold timers are separate clocks. Placement failure
+can still advance the state because its return is ignored by this caller.
+Exit cleanup restores control/resets recovery clocks only when the first
+navigator reference resolves; missing references return without those effects.
+
+Original float arithmetic and old-value comparisons first take the1/2/6second
+threshold actions on eligible visits31/62/182 from zero. These are original
+rounding/boundary semantics to preserve, not newly declared off-by-one defects.
+
+The warning helper also submits descriptors to the same active message manager.
+That is a concrete subsystem relationship. It does not make the four event timers
+typewriter clocks or prove normal NPC dialogue enters a catch-up sequence.
+Detailed evidence: arceus-event-timers-pass5.txt.
+
+3. AI bucket scheduling and frame accounting are separate
+1050E00 is a bound member callback attached to a generic task wrapper. Its input
+record contains both the clock pointer and a32-bit dispatch epoch. The epoch is
+shared by workers in one dispatch, with worker index stored separately.
+
+Five named categories rotate through these bucket counts:
+  WildAI4, WildAIPerception8, NsAI1, NpcAI6, PokePlateCheckVisible16.
+Each callback selects one bucket per category and advances the round-robin index.
+All contexts accumulate seconds and an integer frame count even when unselected;
+the previous bucket selection and explicit override flags govern their resets.
+The+81 override is set/cleared by actions including Step and RushMove; a special
+WildAI initialization writes+82. Neither should be treated as a generic pause flag.
+
+Zero duration still advances indices/frame counts if1050E00 itself runs. Upstream
+task dispatch can instead suppress the callback when its selected clock is zero.
+A future authored-tick accumulator needs scheduler/clock identity, lifecycle and
+epoch, and a cached delta reused by consumers. Duration equality or a resettable
+context frame count cannot identify an epoch. Whole-scheduler throttling would
+also change AI decision/perception cadence; it is not a narrow timer correction.
+Pass4's Turn/TurnKey motion issue still requires coupled motion/completion work.
+Detailed evidence: arceus-ai-scheduler-pass5.txt.
+
+4. Physics dispatch has gates, but the traced chain is not a30Hz accumulator
+The physics task goes through readiness296863C, worker routing/queues, final
+callback gate29684DC and callback2B00CA8 before the previously traced world step.
+Readiness checks task state, selected-clock duration!=0 and dependency fan-in.
+Final dispatch also applies owner/lifetime skip behavior. Task+380 is worker
+eligibility; context+C is worker index. They are not frame phase/frequency flags.
+
+Dispatcher296ADC8 increments an epoch once per invocation and workers record it
+on completion. The traced functions do not reject repeats merely because that
+epoch was already recorded. Higher-level graph rules may prevent repeats in
+normal execution; the isolated repeated-call tests do not establish a live bug.
+
+A precise prospective probe at final integration2F269E0 is documented. It would
+count range calls and requested motion slots, with selected step data and caller,
+not label each call a body or a physics frame. Multiple worker ranges and the
+separate intermediate-substep function prevent that shortcut. No such hook was
+installed. Actual integration cadence remains the missing live measurement.
+Detailed evidence: arceus-physics-scheduler-pass5.txt.
+
+Verification
+Four isolated fixtures executed original guest instructions via the existing
+local JIT. Total85,470 passing assertions, zero final failures,24compiled entries:
+  dialogue344 /9entries;
+  AI scheduler83,449 /3entries;
+  event clocks750 /10entries;
+  physics dispatch927 /2entries.
+The large AI count is a matrix across buckets/cycles/flags, not a count of bugs
+or a performance benchmark. Some fixtures are bounded instruction slices; others
+execute whole functions with explicit external stubs. Individual reports and
+arceus-research-provenance-pass5.json describe these limits. They do not replace live30/60/120comparisons.
+Captured results: arceus-engine-checks-pass5.txt.
+
+Package preservation, SHA256
+Regular Vulkan experiment:
+69B7C027FAFC35C2AF8270CDCBF01B666E8931CF0C81E39F170193A19F64DDAF
+Research candidate (still pass4 build):
+C2B2BE0B146D3C801A9E1E801243CA60D17965BDD363AF8DA5C746464B6753C1
+Runtime and mirror arceus_clock.c match:
+004B4BD35DEC9C6031359B5E33E3D08A8B0D8E912C403EFB13E17E591FACA61A
+No rebuild was necessary because runtime source was not changed in this pass.
+Existing manual-close launchers, controller support and Escape behavior remain.
+This pass does not resolve the earlier1440p world-blur question.
+
+Next work, ordered by how much uncertainty it removes
+1. Add paired read-only parent/text observations for27379B8/FBFBD0. Correlate
+   owner updates, repeat mode, held/fresh input, wait/reveal states and return
+   values. Keep fast-finish calls separate from ordinary progress. Confirm an
+   active NPC conversation at30and120before changing a minimum-delay policy.
+2. Add the narrow final-integration range observation specified in the physics
+   report. Group by world/caller and completed ranges; do not infer physics speed
+   from a task-submission count alone.
+3. Observe AI(scheduler,clock,epoch) multiplicity and creation/pause/resume, then
+   design authored tick accounting without altering bucket selection or hiding
+   the unscaled Turn/TurnKey motion path.
+4. Observe the newly named event timers during an actual scripted walking/catch-up
+   sequence. Change scalar elapsed increments only if live cadence warrants it;
+   preserve geometry, pathfinding and player-control work every normal update.
+
+These are proposed observation/correction stages, not changes already enabled.
+The current launchers still use the unchanged candidate and existing probes.
+All disassembly, raw instruction fixtures and game-derived data stay in private
+local work directories. User-facing reports contain derived findings and limits.

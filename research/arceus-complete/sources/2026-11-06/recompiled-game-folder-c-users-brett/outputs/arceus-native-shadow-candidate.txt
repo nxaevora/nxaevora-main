@@ -1,0 +1,73 @@
+Native-shadow candidate for independent review, 2026-11-06
+
+Status: private runtime compiled and linked; offline validation passed.
+NOT installed, NOT connected to a launcher, NOT launched, NOT visually proven.
+Claude can review this alongside outputs/Claude-Arceus-Handoff.txt.
+
+Evidence motivating the change:
+The repeated stone pattern is present in captured shadow receiver540a88000,
+before scene lighting. Both sampled1024-square shadow layers exactly match
+nearest downsampling of1365-square producer depths. This introduces a sample
+position mismatch; self-shadowing remains the leading hypothesis, not a proven
+complete explanation of all stone/wood artifacts.
+
+Candidate:
+work/native-shadow-candidate/ArceusNativeShadow-runtime.exe
+SHA256 B32D40B03CEE8ADAF34DA9150A657E97F25F9950E4CA25FBAD7F641CF8CAF019
+Opt-in environment flag: SNX_ARCEUS_NATIVE_SHADOWS=1. Disabled by default.
+No launch is authorized by this report.
+
+The experiment selects render targets with guest dimensions1024x1024 and
+format keys1000a(D32) or f6(R8_UINT). Both depth and tag maps remain at native
+1024x1024. Draw and clear viewport/scissor/clip coordinates use pass-local
+scale1. Fragment SNX_RS constants use the same scale, and their staging cache
+now includes scale as well as submission number. Main scene passes retain
+global4/3 scale, including2560x1440 scene color/depth and shadow receiver.
+The existing native copy_layers branch copies shadow layers without a resize.
+Texture crops honor native source dimensions; draw-texture destinations honor
+the selected native targets. No global scale mutation or depth-bias changes.
+
+Unexpected mixed native/scaled attachment sets are logged and skipped in this
+experimental candidate, rather than rendered with incompatible coordinates.
+This is a diagnostic safeguard, not a production solution for mixed passes.
+The shape/format predicate is evidence-based but not a semantic identification
+of every possible shadow pass; other areas could use the same shape/formats.
+Native1024 shadow maps may have less edge detail than correctly implemented
+scaled shadow maps. Scene resolution stays1440p. A coherent higher-resolution
+shadow-array implementation remains a possible subsequent improvement.
+
+Validation:
+- Three modified C translation units compile with actual runtime build options.
+  Warnings are existing aggregate initializers: render.c scissor and texture.c
+  UpLevel/VkFmt fields; none of those initializer sites were changed.
+- Private objects link against existing runtime libraries; no shared output or
+  source is replaced. Full argument vector is saved in link-arguments.json.
+- C fixture extracts actual candidate predicate, target-scale, frame-constant
+  and viewport functions, plus original viewport for comparisons.
+  67,107 assertion groups pass, predominantly65,552 format exclusions.
+  Includes1,536 viewport comparisons across3 scales,16 viewport indices,
+  both origins, Y swizzle, small viewport mode and signed Y scale; shader
+  constant reuse, scale switches within a submission, new submission and
+  allocation failure/retry; mixed attachment rejection and empty-pass fallback.
+-260 captured attachment records across four snapshots: exactly four shadow
+  producer surfaces selected in each; all full scene targets stay2560x1440.
+  This is selection auditing of old captures, not a capture of the new runtime.
+- Shared source hashes still match the candidate compilation inputs.
+- Accepted staged candidate stays AAAD4627683A6218594A7E0952E1E0EF2C748487C8B1F476271EA36DA07C06B3.
+- Timing source stays3339E9E1FCC88932A4D1C1761360F2C6152E5BC6DE3ADC7B7B337290184C7F0D.
+  No timing, controller, resolution configuration or launcher edits.
+
+Review files under work/native-shadow-candidate:
+surface.c.patch, render.c.patch, texture.c.patch; private C sources and .before
+copies; provenance.json; validation-provenance.json; capture-scope.json;
+offline-fixture.c and offline-validation.txt; compile and link logs.
+Reproduction scripts under work:
+prepare-native-shadow-candidate.py, validate-native-shadow-candidate.py,
+audit-native-shadow-captures.py.
+
+Remaining: independent review and later user-authorized controller visual test.
+The headless fixture does not execute Vulkan render passes or replay the full
+shadow receiver. Check future captures for1024 producers/direct array copies,
+unchanged2560x1440 scene viewports, no mixed-pass diagnostics, and reduction of
+the stone/wood pattern. Preserve120FPS timing fixes, camera2.2, Vulkan, manual
+closure and controller support. Do not launch automatically.

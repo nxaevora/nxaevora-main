@@ -851,6 +851,11 @@ static void h_sampler_initialize(CPU* c, u64 entry) {
     c->x[0] = 1;
     pm_unlock(&objs_lock);
 }
+/* The library's function is one `ret` (d83a5b0): the object stays readable, so the host keeps its record too. */
+static void h_sampler_finalize(CPU* c, u64 entry) {
+    (void)c;
+    (void)entry;
+}
 static void h_sampler_compare(CPU* c, u64 entry) {
     (void)entry;
     pm_lock(&objs_lock);
@@ -2565,6 +2570,34 @@ static void h_vertex_stream_state_get_stride(CPU* c, u64 entry) {
     c->x[0] = w[0];
     pm_unlock(&objs_lock);
 }
+static void h_vertex_stream_state_get_divisor(CPU* c, u64 entry) {
+    (void)entry;
+    pm_lock(&objs_lock);
+    const uint32_t* w = vertex_stream_words(c->x[0]);
+    c->x[0] = w[1];
+    pm_unlock(&objs_lock);
+}
+/* The library stores the format as 32 bits and the relative offset as 64 bits (a ptrdiff_t). */
+static void h_vertex_attrib_state_get_format(CPU* c, u64 entry) {
+    (void)entry;
+    if (!native_guest_writable(c->x[1], sizeof(uint32_t)) || !native_guest_writable(c->x[2], sizeof(uint64_t))) {
+        LOG_LIMIT(8, "nvn-native: nvnVertexAttribStateGetFormat unwritable output\n");
+        return;
+    }
+    pm_lock(&objs_lock);
+    uint32_t format;
+    uint64_t offset;
+    nvn_vertex_attrib_state_get_format(vertex_attrib_words(c->x[0])[0], &format, &offset);
+    pm_unlock(&objs_lock);
+    gw32(c->x[1], format);
+    gw64(c->x[2], offset);
+}
+static void h_vertex_attrib_state_get_stream_index(CPU* c, u64 entry) {
+    (void)entry;
+    pm_lock(&objs_lock);
+    c->x[0] = nvn_vertex_attrib_state_get_stream_index(vertex_attrib_words(c->x[0])[0]);
+    pm_unlock(&objs_lock);
+}
 
 /* G4: draw, dispatch, program bind and the rest of the raster setters. A draw and a dispatch are recorded, not
    executed: the pipeline stage reads the table later. */
@@ -2684,6 +2717,8 @@ COMMAND_RASTER_HANDLER(set_polygon_offset_clamp, "nvnCommandBufferSetPolygonOffs
 COMMAND_RASTER_HANDLER(set_depth_clamp, "nvnCommandBufferSetDepthClamp", NVN_RASTER_DEPTH_CLAMP,
                        (u32)c->x[1], 0, 0)
 COMMAND_RASTER_HANDLER(set_line_width, "nvnCommandBufferSetLineWidth", NVN_RASTER_LINE_WIDTH,
+                       SNX_VS(c->v[0], 0), 0, 0)
+COMMAND_RASTER_HANDLER(set_point_size, "nvnCommandBufferSetPointSize", NVN_RASTER_POINT_SIZE,
                        SNX_VS(c->v[0], 0), 0, 0)
 #undef COMMAND_RASTER_HANDLER
 
@@ -2947,6 +2982,37 @@ static void h_command_buffer_report_counter(CPU* c, u64 entry) {
     }
     pm_unlock(&objs_lock);
 }
+/* Begin and End record the control address. The words are built at replay (nvn_xfb_words). */
+static void command_xfb(CPU* c, const char* name, NvnXfbKind kind) {
+    pm_lock(&objs_lock);
+    CommandBufferRec* cb = command_buffer(c->x[0], name);
+    NvnOpTransformFeedback op = {(uint32_t)kind, 0, c->x[1]};
+    if (cb) command_record(cb, c->x[0], name, NVN_OP_TRANSFORM_FEEDBACK, &op, sizeof op);
+    pm_unlock(&objs_lock);
+}
+static void h_command_buffer_begin_transform_feedback(CPU* c, u64 entry) {
+    (void)entry;
+    command_xfb(c, "nvnCommandBufferBeginTransformFeedback", NVN_XFB_BEGIN);
+}
+static void h_command_buffer_end_transform_feedback(CPU* c, u64 entry) {
+    (void)entry;
+    command_xfb(c, "nvnCommandBufferEndTransformFeedback", NVN_XFB_END);
+}
+static void h_command_buffer_reset_counter(CPU* c, u64 entry) {
+    (void)entry;
+    static const char* const name = "nvnCommandBufferResetCounter";
+    pm_lock(&objs_lock);
+    CommandBufferRec* cb = command_buffer(c->x[0], name);
+    NvnOpResetCounter op = {(uint32_t)c->x[1], 0};
+    uint32_t word;
+    if (cb) {
+        if (!nvn_reset_counter_word(op.type, &word))
+            command_dropped(cb, name, "counter type", op.type);
+        else
+            command_record(cb, c->x[0], name, NVN_OP_RESET_COUNTER, &op, sizeof op);
+    }
+    pm_unlock(&objs_lock);
+}
 /* One BindImage or BindImages call. A NULL host_handles reads the guest array at guest_handles. */
 static void command_bind_image(CommandBufferRec* cb, u64 addr, const char* operation, uint32_t stage, uint32_t first,
                                int32_t count, u64 guest_handles, const uint64_t* host_handles) {
@@ -3018,6 +3084,19 @@ static int replay_host_bind_texture(void* ctx, uint32_t stage, uint32_t slot, ui
     host->texture_dirty[stage][slot] = NVN_BIND_DIRTY;
     return 1;
 }
+static void replay_bind_refuse(NvnNativeReplayHost* host, const char* group, int32_t stage, int32_t slot, uint32_t word);
+static int replay_bind_send(NvnNativeReplayHost* host, const uint32_t* words, uint32_t count);
+/* The library writes a transform feedback bind at once, before the Begin that may read it, so it is not deferred to
+   the draw as the other binds are. */
+static int replay_host_send_xfb_bind(NvnNativeReplayHost* host, const NvnOpBindBuffer* op) {
+    uint32_t words[NVN_BIND_XFB_WORDS_MAX];
+    uint32_t count = nvn_bind_xfb_words(op->slot, op->addr, (uint32_t)op->size, words);
+    if (!count || !replay_bind_send(host, words, count)) {
+        replay_bind_refuse(host, "transform feedback", -1, (int32_t)op->slot, (uint32_t)op->addr);
+        return 0;
+    }
+    return 1;
+}
 /* The replay stores addr and size even when the bind is not active, so that a bind that disables the slot replaces the
    old one. The host refuses a kind, stage or slot that its bind table cannot hold. */
 static int replay_host_bind_buffer(void* ctx, const NvnOpBindBuffer* op) {
@@ -3051,6 +3130,7 @@ static int replay_host_bind_buffer(void* ctx, const NvnOpBindBuffer* op) {
     entry->size = op->size;
     entry->bound = (uint8_t)nvn_bind_buffer_active((NvnBindKind)op->kind, op->addr, op->size);
     if (dirty) *dirty = NVN_BIND_DIRTY;
+    if (op->kind == NVN_BIND_TRANSFORM_FEEDBACK) return replay_host_send_xfb_bind(host, op);
     return 1;
 }
 /* The replay stores the words of a state bind. The host refuses a kind or word count that its table cannot hold. */
@@ -3632,6 +3712,16 @@ static int replay_host_clear_depth_stencil(NvnNativeReplayHost* host, const NvnO
     return 1;
 }
 
+static int replay_host_transform_feedback(NvnNativeReplayHost* host, const NvnOpTransformFeedback* op) {
+    uint32_t words[NVN_XFB_WORDS_MAX];
+    uint32_t count = nvn_xfb_words(op->kind, op->address, words);
+    if (!count || !replay_bind_send(host, words, count)) {
+        replay_bind_refuse(host, "transform feedback", -1, -1, op->kind);
+        return 1;
+    }
+    return 1;
+}
+
 /* The texture record is copied under the lock, so that the words are made without it. */
 static int replay_host_clear_texture(NvnNativeReplayHost* host, const NvnOpClearTexture* op) {
     if (!host->clip_limit) {
@@ -3701,7 +3791,6 @@ static int replay_host_copy_texture(NvnNativeReplayHost* host, const NvnOpCopyTe
     return 1;
 }
 
-/* The replay thread counts the op, sends the four group 6 words, and keeps the last report and image bind. */
 static int replay_host_gpu_op(void* ctx, NvnOpCode code, const void* payload) {
     NvnNativeReplayHost* host = ctx;
     if (code >= NVN_OP_COUNT) return 0;
@@ -3716,6 +3805,8 @@ static int replay_host_gpu_op(void* ctx, NvnOpCode code, const void* payload) {
     }
     if (code == NVN_OP_CLEAR_DEPTH_STENCIL)
         return replay_host_clear_depth_stencil(host, (const NvnOpClearDepthStencil*)payload);
+    if (code == NVN_OP_TRANSFORM_FEEDBACK)
+        return replay_host_transform_feedback(host, (const NvnOpTransformFeedback*)payload);
     if (code == NVN_OP_CLEAR_TEXTURE)
         return replay_host_clear_texture(host, (const NvnOpClearTexture*)payload);
     if (code == NVN_OP_COPY_TEXTURE)
@@ -4395,6 +4486,7 @@ static const NativeProc native_procs[] = {
     {"nvnTextureBuilderGetStorageAlignment", h_texture_builder_get_storage_alignment},
     {"nvnTextureBuilderGetStorageSize", h_texture_builder_get_storage_size},
     {"nvnSamplerInitialize", h_sampler_initialize},
+    {"nvnSamplerFinalize", h_sampler_finalize},
     {"nvnSamplerPoolRegisterSampler", h_sampler_pool_register_sampler},
     {"nvnSamplerCompare", h_sampler_compare},
     {"nvnTextureInitialize", h_texture_initialize},
@@ -4560,6 +4652,9 @@ static const NativeProc native_procs[] = {
     {"nvnVertexStreamStateSetStride", h_vertex_stream_state_set_stride},
     {"nvnVertexStreamStateSetDivisor", h_vertex_stream_state_set_divisor},
     {"nvnVertexStreamStateGetStride", h_vertex_stream_state_get_stride},
+    {"nvnVertexStreamStateGetDivisor", h_vertex_stream_state_get_divisor},
+    {"nvnVertexAttribStateGetFormat", h_vertex_attrib_state_get_format},
+    {"nvnVertexAttribStateGetStreamIndex", h_vertex_attrib_state_get_stream_index},
     {"nvnCommandBufferSetRenderTargets", h_command_buffer_set_render_targets},
     {"nvnCommandBufferSetViewports", h_command_buffer_set_viewports},
     {"nvnCommandBufferSetScissors", h_command_buffer_set_scissors},
@@ -4575,6 +4670,7 @@ static const NativeProc native_procs[] = {
     {"nvnCommandBufferSetPolygonOffsetClamp", h_command_buffer_set_polygon_offset_clamp},
     {"nvnCommandBufferSetDepthClamp", h_command_buffer_set_depth_clamp},
     {"nvnCommandBufferSetLineWidth", h_command_buffer_set_line_width},
+    {"nvnCommandBufferSetPointSize", h_command_buffer_set_point_size},
     {"nvnCommandBufferSetDepthRanges", h_command_buffer_set_depth_ranges},
     {"nvnCommandBufferSetDepthRange", h_command_buffer_set_depth_range},
     {"nvnCommandBufferClearDepthStencil", h_command_buffer_clear_depth_stencil},
@@ -4583,6 +4679,9 @@ static const NativeProc native_procs[] = {
     {"nvnCommandBufferClearTextureui", h_command_buffer_clear_textureui},
     {"nvnCommandBufferCopyTextureToTexture", h_command_buffer_copy_texture_to_texture},
     {"nvnCommandBufferReportCounter", h_command_buffer_report_counter},
+    {"nvnCommandBufferResetCounter", h_command_buffer_reset_counter},
+    {"nvnCommandBufferBeginTransformFeedback", h_command_buffer_begin_transform_feedback},
+    {"nvnCommandBufferEndTransformFeedback", h_command_buffer_end_transform_feedback},
     {"nvnCommandBufferBindImage", h_command_buffer_bind_image},
     {"nvnCommandBufferBindImages", h_command_buffer_bind_images},
     {NULL, NULL},

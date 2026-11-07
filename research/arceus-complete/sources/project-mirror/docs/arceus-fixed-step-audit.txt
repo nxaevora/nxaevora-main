@@ -1,0 +1,55 @@
+Arceus 1.1.1 fixed-step audit (all offsets relative to main)
+
+40 exact contiguous float 1/30 MOV/MOVK sites found. This scan does not cover
+literal-pool loads, nonadjacent constant construction, integer counters, or other rates.
+No blanket replacements were applied.
+
+main+8eedb4: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+13b339c: Timer +48c += 1/30; scene/type not established.
+main+167ff0c: Timer +190 += 1/30, capped; owner/update cadence not established.
+main+16832c0: Timer +1a0 += 1/30 with 2-second threshold; owner not established.
+main+16832e4: Timer +198 += 1/30 with 6-second threshold; owner not established.
+main+16836d0: Timer +19c += 1/30; owner not established.
+main+17177b4: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1728054: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+191d2b8: Seconds-to-integer-frame conversion (FDIV then FCVTZS): leave unchanged.
+main+1982930: Paired physics conversion; nearby inverse approximately 30. Review pair before editing.
+main+1983760: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+198e020: Vector increment multiplied by 1/30; physics owner/cadence not established.
+main+198ec6c: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a0baf0: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a0bee4: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a0da20: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a0eea0: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a0f304: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a0f498: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a0f55c: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a17b10: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a17f3c: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a19104: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1a196c4: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1b48a48: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1b48a94: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1b49004: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1b493f4: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1d1b7cc: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+1d5d684: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+257ac30: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+257c9f4: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+257ce38: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+2795230: Conditional fixed dt versus input S0: owner/update mode must be identified.
+main+29faf8c: WaterCurrentTime increment: corrected and user-confirmed.
+main+2af25f4: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+2f3e8c4: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+3002a04: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+301439c: Unclassified; keep unchanged until consumer and call cadence are verified.
+main+3014d24: Unclassified; keep unchanged until consumer and call cadence are verified.
+
+Additional verified frame-dependent paths:
+main+194f110/+194f20c: Blink state machine; integer countdown -=1. New optional 30-Hz candidate.
+main+193c04c: controller yaw/pitch acceleration/deceleration; per-call state change. New fractional-step candidate.
+main+19b2140: event camera normalized progress += nominal increment. User-confirmed correction.
+main+2b90040: effect elapsed time truncated to integer; fractional correction user-confirmed.
+
+Dialogue advance: field manager main+2482818 -> main+27314e8 -> live message-tree update at vtable+80.
+New read-only probe records actual live update targets. No dialogue/input behavior changed this round.

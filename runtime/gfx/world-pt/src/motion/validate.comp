@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+void main() {
+    ivec2 size = imageSize(motionImage);
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy)*sampleStride + sampleStride/2;
+    if (!inside(p,size) || pc.historyValid == 0u) return;
+    uint id = materialAt(p);
+    if (id >= uint(materialCount)) return;
+    vec2 base = imageLoad(motionImage,p).rg;
+    ivec3 keys=buckets(vec2(p)-pc.jitter+base,size);
+    float z = expectedDepth(p,size,texelFetch(sceneDepth,p,0).r);
+    vec3 color = tone(texelFetch(sceneColor,p,0).rgb);
+    float a = cameraCost(p,base,size,id,color,z);
+    for(int i=0;i<3;++i) {
+        int bucket=keys[i];
+        vec4 proposal=imageLoad(candidates,ivec2(bucket,int(id)));
+        if(proposal.z==0. || length(proposal.xy)<1.45)continue;
+        float b=matchCost(lookupPixel(p,base+proposal.xy),size,id,color,z);
+        if(b<.09 && a-b>.025)imageAtomicAdd(stats,statAt(bucket,wins,int(id)),1);
+        if(a<.09 && b-a>.025)imageAtomicAdd(stats,statAt(bucket,losses,int(id)),1);
+    }
+}

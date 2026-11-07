@@ -1,0 +1,116 @@
+# Local Arceus testing preferences
+
+All game files, extracted modules, saves and research fixtures stay local.
+Use the established Vulkan path (`--nvn_native=0`).
+
+Every test launch must support the user's controller. Agent launches use the
+native `outputs/Arceus-Controller-Test.exe` through the desktop computer-use
+`launch_app` API, following that skill. The restricted shell launch route
+previously enumerated no controllers. The helper has no window: a launch API
+warning about no targetable helper window does not mean launch failed. Check
+the desktop window inventory and the new game log before considering a retry.
+The successful test detected DualSense Edge Wireless Controller and sensors.
+See `outputs/controller-test-launch-notes.txt` for the verified launch policy.
+
+The user saves and closes the game themselves. Do not kill, time-limit, restart,
+hot-patch or send gameplay input during their test. Escape must not quit.
+Capture logs read-only while the user plays. After closure, source/build/offline
+research can continue without launching another test automatically.
+
+The user accepted camera multiplier2.2 and menu-repeat correction in the
+completed163108 controller run. Keep target 120 FPS and accepted timing fixes
+as the baseline. Do not mistake allocated image size or sharp UI for native3D
+render resolution.
+
+Latest completed test is timing-20261106-172820-124, game_exit=0.
+This was the BC comparison (--native_bc=0), confirmed by 245 observed BC5
+bindings using conversion 22/RG16. User says bumps remain and change somewhat
+while moving. Installed game EXE is still 550757A3..., not the new candidate.
+
+Pass10 found a separate half-resolution lighting coordinate defect: exact
+FMUL.FTZ-by-2 screen coordinates were quantized/rescaled instead of reading
+2*physical FragCoord. Correction is staged with cache token direct_flow=3.
+52 regressions, 30,774 emitted-coordinate assertions, 931 shipped fragments and
+334 captured+CB replay shaders pass. OFF output identical; ON changes 6 shipped
+light/probe shaders. Visual sufficiency is unconfirmed; do not call the entire
+stone/wood artifact fixed until the user's next test.
+
+Staged work/ArceusEngineCandidate-runtime.exe and
+work/ArceusSurfaceCapture-runtime.exe are AAAD4627... . Previous FBE5A06B candidate
+is preserved as work/ArceusEngineCandidate-before-pass10-runtime.exe; older
+before-pass8 and before-pass6 backups remain. Source and mirror include pass10.
+No game was launched by the agent this pass. Do not automatically launch.
+
+Prepared outputs/Arceus-Surface-Capture.exe is the next manual controller test:
+Vulkan, native_bc=1, docked 4/3 scaling, fullscreen, target 120 FPS, camera 2.2 and
+accepted timing/menu/blink/effects fixes. Native helper retains manual closure.
+It adds SNX_MATERIAL_SNAPSHOT=1: user's F3 saves the ordinary screenshot and
+queues a separate raw-buffer capture at next completed game present. Max 4
+extra captures. Ask for stone/bridge F3 captures if artifacts persist; a brief
+stall is expected. All files go to local game captures. Do not send input.
+
+Use *_buffers_N_final.ppm plus *_pair.tsv as attachment pairing, not the earlier
+ordinary F3 image. *_attachments.tsv has format/dimensions/gva/age/raw filenames.
+Some surfaces may be 2 presents old; final excludes runtime postfx/letterbox/UI.
+D24 raw highbyte is undefined: mask0x00ffffff. Helper passed 12 GPU fixtures,
+20 bound/eligibility checks and the 96-surface cap. No live-game capture tested yet.
+work/decode-surface-capture.py MANIFEST [--normal-address HEX] uses stdlib only;
+normal decode requires an address confirmed by the material trace/output slot.
+Previous trace normal 552210000 is a clue, not a hardcoded future identity.
+
+Authoritative latest notes:
+outputs/arceus-1440p-lighting-fix.txt
+outputs/arceus-1440p-lighting-fix-provenance.json
+outputs/arceus-material-investigation.txt
+Old pass8 evidence remains valid but did not resolve the whole visual issue.
+Latest follow-up: timing-20261106-175234-874 CLOSED, game_exit=0.
+User reports pass10 pattern remains. Four F3 detailed captures succeeded,
+64 attachments each, zero failures; later F3 requests saved ordinary screenshots
+only after the four-capture cap. Capture prefixes175250,175257,175310,175313.
+Fourth capture decoded under work/pass10-captures/screenshot_20261106_175313_buffers_4_attachments.
+Initial visual comparison: pronounced step striping is in final attachment00;
+basecolor attachment45 (552a80000) lacks that striping, and decoded normal44
+(552210000) has much smoother step faces. This suggests lighting/later pass;
+not proof that all normal data or all reported objects are correct. Next inspect
+lighting/shadow/material intermediate buffers and compare other captured views.
+No new game launch or runtime edits in this follow-up.
+User prefers fixing cause without TAA, but wants eventual TAA, FSR/DLSS,
+then exploratory ray tracing/path tracing. Preserve this roadmap; do not treat
+these ambitions as permission to replace current rendering wholesale.
+Shadow follow-up: pattern positively visible in shadow-receiver540a88000
+(attachment32) before main scene lighting5508c0000. Exact captured D32 copy:
+all2,097,152 samples match nearest1365->1024 reduction for both shadow layers.
+See outputs/arceus-shadow-buffer-investigation.txt and
+outputs/arceus-shadow-resampling-evidence.json. Strong hypothesis: shadow
+sample-position mismatch/self-shadowing, not yet proven by receiver replay.
+No new runtime staged. Audit full per-pass scaling before native-shadow fix;
+depth and R8_UINT tags, viewport/scissor/SNX_RS and copies must remain matched.
+
+Later private experiment: work/native-shadow-candidate/ArceusNativeShadow-runtime.exe
+SHA256 B32D40B03CEE8ADAF34DA9150A657E97F25F9950E4CA25FBAD7F641CF8CAF019.
+See outputs/arceus-native-shadow-candidate.txt for scope and limitations.
+SNX_ARCEUS_NATIVE_SHADOWS=1 selects native1024 D32+R8_UINT shadow producers,
+matching per-pass raster/constants and native copies; scene remains1440p.
+Private render/surface/texture objects only; shared source and launchers unchanged.
+Offline compilation/link, actual-function C fixture and260 captured attachment
+selection checks passed. NOT installed, NOT launched, NOT visually validated.
+Accepted AAAD runtime and all timing fixes remain intact. User explicitly says
+no new test yet. Claude is independently reviewing; keep private patches isolated.
+
+User subsequently authorized launch. Native desktop helper
+outputs/Arceus-Shadow-Controller-Test.exe launched timing-20261106-181617-047.
+Game PID10032; installed B32D40B0 candidate hash verified. Test ACTIVE at handoff.
+Logs confirm DualSense Edge + sensors, target120, camera2.2, native1024 shadow
+pair, and2560x1440 depth-tested scene viewports. No mixed-scale diagnostic seen
+at startup. Do not modify installed runtime, send input, close or restart game.
+User saves/closes. F3 captures remain enabled. Regular staged AAAD unchanged.
+
+Latest run181617-047 now CLOSED, game_exit=0. User confirms original stone/wood
+pattern fixed; captured finals agree for steps, bridge and wheel. B32D40B0 is
+the tested shadow baseline; preserve it. Pink/purple highlights on crafting box
+remain, captured181800 buffers4 and ordinary181810. Four full captures succeeded
+64/66/66/64 attachments. All16 depth/tag source-array comparisons byte-exact.
+Pink absent in base color552a80000, present in scene lighting5508c0000 before
+final postprocessing, aligned with normal-map scratches/edges. Root cause not
+proven; investigate material/specular/environment lighting without reverting
+shadow fix. See outputs/arceus-shadow-test-results.txt. No new launch this review.

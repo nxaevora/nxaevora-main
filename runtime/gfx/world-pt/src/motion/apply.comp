@@ -1,0 +1,65 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=8,local_size_y=8) in;
+// Flat patches can inherit a material's supported motion. A textured patch
+// whose same-material neighbours already align exactly with camera reprojection
+// is positive evidence for keeping the camera estimate.
+bool anchoredToCamera(ivec2 p,ivec2 size,uint id,vec3 color,vec2 base) {
+    const ivec2 offsets[4]=ivec2[4](ivec2(5,0),ivec2(-5,0),ivec2(0,5),ivec2(0,-5));
+    int compared=0,detail=0;
+    for(int i=0;i<4;i++){
+        ivec2 k=p+offsets[i];
+        if(!inside(k,size) || materialAt(k)!=id)continue;
+        vec3 adjacent=tone(texelFetch(sceneColor,k,0).rgb);
+        float z=expectedDepth(k,size,texelFetch(sceneDepth,k,0).r);
+        if(matchCost(lookupPixel(k,base),size,id,adjacent,z)>.0025)return false;
+        vec3 delta=abs(adjacent-color);
+        detail+=int(max(delta.r,max(delta.g,delta.b))>.003);
+        compared++;
+    }
+    return compared>=2 && detail>=1;
+}
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy), size = imageSize(motionImage);
+    if (!inside(p,size)) return;
+    uint id = materialAt(p);
+    float z = texelFetch(sceneDepth,p,0).r;
+    vec3 color = tone(texelFetch(sceneColor,p,0).rgb);
+    uint packedDepth = uint(round(clamp(z,0.0,1.0)*1048575.0)) | (id<<20u);
+    imageStore(nextHistory,p,uvec4(packUnorm4x8(vec4(color,1)),packedDepth,0,0));
+    float reactive = 0.0;
+    if (pc.historyValid != 0u && z>0.0 && id<uint(materialCount)) {
+        vec2 base = imageLoad(motionImage,p).rg;
+        float expected = expectedDepth(p,size,z);
+        float cost = cameraCost(p,base,size,id,color,expected);
+        ivec3 keys=buckets(vec2(p)-pc.jitter+base,size);
+        float baselineCost=cost;
+        float best=cost+.008;
+        vec2 bestMotion=base;
+        for(int i=0;i<3;++i) {
+            int bucket=keys[i];
+            vec4 proposal=imageLoad(candidates,ivec2(bucket,int(id)));
+            if(proposal.z==0.)continue;
+            int support=imageLoad(stats,statAt(bucket,wins,int(id))).r;
+            int opposed=imageLoad(stats,statAt(bucket,losses,int(id))).r;
+            int visible=imageLoad(stats,statAt(bucket,visibleCount,int(id))).r;
+            if(support<max(4,visible/100) || support<=2*opposed)continue;
+            vec2 motion=base+proposal.xy;
+            float error=matchCost(lookupPixel(p,motion),size,id,color,expected);
+            float ranked=error+.002*float(i!=0);
+            if(error<.09 && ranked<best) {
+                best=ranked;
+                bestMotion=motion;
+                cost=error;
+            }
+        }
+        if(baselineCost<=.0025 && cost+.001>=baselineCost && any(notEqual(bestMotion,base)) &&
+           anchoredToCamera(p,size,id,color,base)){
+            bestMotion=base;cost=baselineCost;
+        }
+        imageStore(motionImage,p,vec4(bestMotion,0,0));
+        reactive = .8*smoothstep(.10,.40,cost);
+    }
+    imageStore(reactiveMask,p,vec4(reactive));
+}

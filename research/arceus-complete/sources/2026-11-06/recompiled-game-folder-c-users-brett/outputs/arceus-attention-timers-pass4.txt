@@ -1,0 +1,87 @@
+ARCEUS 1.1.1 — ATTENTION TIMER EXECUTION CHECKS
+Offline research, 2026-11-06. All code addresses and field offsets are hexadecimal.
+
+This pass tested the timer branches identified in the previous static trace.
+It establishes expiration, enable and saturation behavior under controlled
+memory. It does not establish live scheduling or a current gameplay speedup.
+
+LOOK-AT HOLDS
+
+The original, unmodified function 19C2F80 was compiled and executed locally.
+The target handle at object+5D0 was null, selecting the short update path.
+Virtual restore slot +100 was replaced by a host test callback that validates
+its arguments and returns. No real target, actor or rendering object was used.
+
+Four slots have active bytes +3D0/+450/+4D0/+550, signed countdown fields
++440/+4C0/+540/+5C0 and saved target data +3E0/+460/+4E0/+560.
+The 0x80 stride matches initializer 19C6760, which takes index W1 and duration W2.
+
+Observed with original instructions:
+  - Only active slots decrement.
+  - The decrement happens before the signed >0 expiration test.
+  - Starting an active slot at zero produces -1 and invokes restoration in that
+    callback. A zero count is not a 'do nothing this update' representation.
+  - Expiration invokes virtual slot +100 exactly once with the slot index and
+    that slot's saved target address, then clears the active byte.
+  - All four slots can expire independently in the same updater.
+  - Later calls do not repeat restoration once the active flag is cleared.
+
+The distinct look-start counter +670 advances only while +5F0 is active. It
+stops incrementing at 9,999,999. The compare literal is 9,999,998, followed by an
+increment when the old count is at or below that value. This is saturation,
+not a frame-rate normalization mechanism.
+
+Even on the short null-target path, the updater clears object+218. Skipping
+the whole function to slow its timers would also skip this non-timer behavior.
+The test confirms this field still changes alongside the countdowns.
+
+PLAYER FACIAL-EXPRESSION TIMERS
+
+The tested original prefix is 24D17DC through 24D1998. At the beginning of the
+vigilance-ending event setup (24D199C), a test-only branch returns through the
+original epilogue at 24D183C. Object handles +240 and +1F0 were null.
+Thus event setup, configuration lookups and actor expression changes were not
+executed. The fixture provenance records the single continuation substitution.
+
+  - If either of object+250's low two bits is set, the prefix returns without
+    advancing the expression hold +280 or vigilance delay +2A4. The semantic
+    names of those two bits remain unresolved; do not call them pause flags.
+  - While +258 is active, +280 decrements once. A result <=0 clears +258.
+    Inactive holds retain their value, including zero and negative values.
+  - The +2A4 vigilance delay stores its decremented value only if the result is
+    nonnegative. Zero and negative initial values remain unchanged. A value of
+    one becomes zero and takes the event-setup boundary described above.
+
+These adjacent timers therefore have different zero/negative semantics.
+An indiscriminate 'replace all decrements' operation would not preserve them.
+Restoring a countdown after the whole original function runs is also too late
+to undo a restoration/event that was already triggered by expiration.
+
+OWNER EVIDENCE
+
+Look-at vtable 413C288 has update 19C2F80 at slot +90 and initializer 19C6760
+at slot +108. Secondary-base update thunk 19C65B8 also reaches the same updater.
+Constructor 19C1A00 installs the primary vtable.
+
+The face updater 24D17DC appears in vtable 41600E0 at slot +88. The player
+construction path 1C56008 installs this vtable at 1C59460; that path references
+player_controller, right_attach_off and PlayerAudioComponent. Together with
+the updater's player_face configuration group, this strengthens the player
+facial-expression classification. The secondary-base thunk 24D3900 subtracts
+0x48 from X0 before entering the same updater.
+
+TEST RESULTS
+
+391 checks passed with zero failures; two guest functions compiled.
+Checks cover individual and simultaneous hold expirations, arguments to the
+restore callback, no repeated restoration, active/inactive counters, initial
+values -2/-1/0/1/2/30/120, look-start saturation boundaries, the low-two-bit
+face update gate, balanced stacks and preserved callee-saved registers.
+
+The restore callback is a test double. No complete look-target change,
+vigilance-ending expression, game scene, save or interactive process was run.
+No new face/look runtime hook or timing correction was added in this pass.
+
+Reproduction: work/pass4-attention/run-checks.ps1.
+Local instruction provenance: work/pass4-attention/fixture-provenance.json.
+Result log: work/pass4-attention/attention-checks.txt.

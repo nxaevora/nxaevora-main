@@ -1,0 +1,19 @@
+PINK BOX CANDIDATE - NEUTRAL RIM TINT
+
+Open Arceus-Pink-Box-Candidate.exe with the game closed. Keep outputs/rim-runtime in place.
+Return to the crafting box, inspect its edges and scratches, and press F3 once.
+Move the camera and capture a second angle. Also inspect nearby wood, stone and characters for unwanted changes.
+Save and close normally. Report whether the purple is reduced and whether other surfaces look worse.
+
+This is an opt-in visual workaround candidate, NOT a proven correction to the original game's rendering. The captured game lighting contains an explicit purple color. The candidate neutralizes that specific color while retaining its linear luminance and alpha/strength. It only matches the two known lighting shaders and the exact captured pair of category1 color entries. Other materials in that same category and matching lighting setup may also change. It does not target the box by object identity. Visual results are unverified.
+
+The candidate copies the lighting constants into a private GPU upload buffer and modifies only RGB at byte0x150 (12 bytes). Guest memory, assets, saves, shaders, normal maps, reflection textures, shadow bias and other constant bytes are not edited. Pending GPU constants or allocation failure retain the original binding. F3 diagnostics remain enabled; constant snapshots are labeled as CPU copies with the enabled rim transform.
+
+Installed accepted runtime B32D40B0 is unchanged. The desktop launcher runs outputs/rim-runtime/ArceusTest.exe separately with --game pointing at the existing game folder, retains the controller settings, Vulkan, native-shadow correction, 1440p settings,120 FPS target,camera2.2 and accepted timing/menu fixes. It verifies executable hashes and refuses duplicate game launches. No game has been started during preparation.
+
+Validation: compilation/link passed; exact candidate helper tested against all3 captured constant buffers. Only12 bytes modified; luminance0.28463954 preserved; alpha and all other bytes unchanged. Wrong shader/stage/bank/signature/short-size rejection passed; GPU-pending and allocation-failure fallback passed. Launcher --verify-only passed. One pre-existing scissor initializer warning remains.
+
+Latest test path will be outputs/current-rim-test.txt. Captures remain in the existing game captures directory.
+To return to baseline afterward, use the normal launcher or the previous reflection test; the installed executable was never replaced.
+
+Follow-on order requested: resolve/accept pink-box result, then TAA, then DLSS, then latest available FSR3 release. Temporal work needs a separate assessment of jitter, motion vectors, depth/history validity, camera cuts and UI exclusion; SDK/hardware/version requirements will be verified when each integration begins. No temporal feature is implemented by this candidate.

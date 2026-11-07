@@ -1,0 +1,203 @@
+ARCEUS 1.1.1 — ENGINE RESEARCH, THIRD OFFLINE PASS
+2026-11-06
+
+Follow-up: arceus-engine-research-pass4.txt traces actual physics translation,
+AI mixed clocks, and timer expiration rules. The package hash in this report
+identifies the historical third-pass candidate.
+
+The main new finding is a split between elapsed-time UI animation and integer
+transition timers. Common fades and capture stages contain real per-update
+clocks. The general UI animation player already uses elapsed time. Facial
+expression holds and look-at delays have additional independent integer clocks.
+
+The code identifies timing risks; it does not establish how frequently each
+active path executes during gameplay. New optional diagnostics are built into
+the research candidate to measure that distinction in the next manual test.
+No new gameplay timing correction was enabled in this pass.
+
+All addresses below are relative to main, for the local 1.1.1 build only.
+
+COMMON FADES
+
+Constructor C20348 installs vtable 40EA428. Its update slot +38 points to C21490;
+start slot +50 points to C21D00. The relevant object fields are:
+
+  +500  mode: 0 uses color stepping, 2 uses the crossfade helper
+  +504  transition state
+  +538  elapsed update count
+  +53C  authored duration
+  +540  current RGBA vector
+  +550  per-update RGBA increment
+  +560  target RGBA vector
+
+C21D00 clears +538, stores duration from W4 in +53C, and computes
+(target - start)/duration. A zero duration uses a divisor of one.
+
+C21490 mode 0 increments +538 by exactly one at C21560 and adds the configured
+RGBA step at C2156C. Mode 2 helper C21790 does the corresponding operations at
+C217BC/C217C8. Mode 1 instead queries animation completion through C21994 and
+C23148; it must not automatically receive an integer-fade correction.
+
+For state 3 with null pane handles, executing the original update and helper
+instructions gave duration+1 calls until state 1, for durations 0, 1, 2, 10, 30,
+60 and 120, in both modes 0 and 2. Each active step advanced the counter and
+alpha once. Completion snapped to the target color and reset the clock pair.
+This checks the original CPU behavior, not GPU output or live callback rate.
+
+The common wrapper C264CC forwards a requested frame duration to start slot +50.
+It has 22 identified callers. One is skip processing at 1458300: configuration
+demo.skip_fade_frame is passed through C264CC at 14589D0. Thus this is a shared
+transition mechanism, not a timer unique to a particular menu.
+
+Correction to the previous triage: +3BC in 1458300/145E1C0 is a substate number.
+Its increments advance through operations. It is not the fade's elapsed clock.
+
+GENERAL UI ANIMATION ALREADY USES ELAPSED TIME
+
+2B433BC reads clock channel 1 at return address 2B4344C. It takes a mode index
+from the object returned by FB6D94, field +C8. It then calculates:
+
+  normalized step = elapsed nanoseconds / (duration_table[mode] - 1)
+
+The first five table entries at 39848E0 are:
+  16666667, 33333334, 50000000, 66666667, 83333334 nanoseconds.
+
+Animation entries have a +38 rate field; the advance at 2B43540 multiplies that
+rate by the normalized elapsed step. The animation array uses a 0x48 stride.
+
+The isolated original arithmetic, using mode 1 and one elapsed second split
+into 30, 60 or 120 calls, produced approximately 30 authored animation units in
+all three cases. This supports leaving this path elapsed-based. It does not
+prove that every menu uses it, nor establish the live mode value.
+
+The candidate now samples the actual mode, elapsed duration and table-derived
+denominator at that exact clock-reader call site. The parser does not sum
+repeated UI-owner reads as if they were separate elapsed time.
+
+CAPTURE DIRECTOR: PARAMETER-TO-STAGE MAP
+
+The service chain traced statically is:
+  1D537FC -> 1D539D0 -> 1D5D59C -> 186B5CC -> 180BA2C -> 180C338
+
+The capture object is loaded from [X1] at entry to 180C338; X0 is its manager.
+Object +F0 selects one of 19 stages. The jump table is at 397C6AA.
+Object +1D8 stores initial duration; +1DC stores remaining updates.
+
+Configuration / setup              Waiting stage     Relevant arithmetic
+--------------------------------  ----------------  ---------------------------
+kBallOpenEffectFrame, stage 2      3                 decrement at 180C954
+kPokeCaptureFrame, stage 4         5                 decrement at 180D7D4
+Fixed initial 3 / remaining 2, 6   7                 decrement at 180D05C
+kMoveToGroundFrame or kSpinFrame,7 8                 decrement at 180DE08
+kWaitBeforeJudgeFrame, stage 8     9                 decrement at 180CBAC
+kSuccessWait, stage 13             14                decrement at 180DB54
+kFailureWait, stage 15             16                decrement at 180CB08
+
+The stage-7 choice uses object byte +A1 and selects the spin setting when nonzero;
+the move/spin duration is clamped to at least one. Stage 8 uses its remaining
+count for transform interpolation, then loads the wait-before-judgment setting.
+Several setup stages fall through into the first waiting step in the same call.
+Success/failure setup also performs the first decrement before returning.
+
+This matters for a later correction: changing stage increments would corrupt
+the sequence. Changing only its visual effects would leave the wait and
+interpolation clocks inconsistent. The whole object updater also handles
+lifetime and other events, so simply skipping it is not yet justified.
+
+An isolated original wait branch was executed with remaining counts 0 through
+120: positive values decremented once and zero stayed zero. The test replaces
+only the continuation boundaries with returns; it does not execute an actual
+capture or determine capture outcomes.
+
+The new probe observes stage, initial duration and remaining count before and
+after the original callback. The parser excludes stage/mode/duration changes
+from its same-stage delta summary. Aggregate wrapper counts are not treated as
+one object's update rate.
+
+FACIAL EXPRESSIONS AND LOOK-AT HOLDS
+
+The previously broad "buddy reaction" label can now be narrowed. 24D17DC reads
+the player_face configuration group and controls expression holds, with buddy
+interaction expressions among its cases. It is not established as a dialogue
+skip lockout or as the eyelid blink timer.
+
+  +280: expression override remaining count. Helper 24D35B8 stores it at
+        24D368C. With an explicit duration flag, it takes request+10; otherwise
+        it resolves face_change_event_default_frame. While +258 is active,
+        24D1860 subtracts one and expiration clears the active flag.
+        vigilance_end_keep_frame, look_player_mode_buddy_keep_frame and
+        buddy_talk_end_defalut_keep_frame feed this helper via 24D1B74,
+        24D2758 and 24D298C respectively. The spelling "defalut" is in the data.
+
+  +2A4: vigilance_end_delay_frame, stored at 24D2500. The decrement at 24D181C
+        is stored only when the result is nonnegative. Reaching zero enters
+        the vigilance-ending expression setup. A separate branch clears it.
+
+  +298: surprise elapsed count. Incremented through the X26 alias at 24D201C,
+        compared with surprise_keep_frame at 24D2160 and clamped to that
+        threshold at 24D2174 before expression-transition handling.
+
+  +29C: rejoice elapsed count. Incremented at 24D1E04, compared with
+        rejoice_keep_frame at 24D1F48 and clamped at 24D1F5C.
+
+The separate look-at updater 19C2F80 has four countdown slots with 0x80 stride.
+Initializer 19C6760 takes a slot index in W1 and duration in W2, sets the slot's
+active flag and stores its countdown. The four counters are +440/+4C0/+540/+5C0;
+expiration restores the saved target through virtual slot +100.
+
+There is also a distinct look-start counter at +670, incremented at 19C30F8
+when +5F0 is active and compared with look_start_keep_frame, for example at
+19C396C. This parameter is not the initializer for the four countdown slots.
+Do not conflate these two mechanisms or equate either with eyelid blinking.
+
+These face/look mappings are static findings. They have no new live probe or
+timing modification in this candidate. Their scheduling remains to be measured.
+
+IMPLEMENTATION AND VALIDATION
+
+Runtime source and its existing mirror have matching arceus_clock.c changes.
+SNX_ARCEUS_TIMING_RESEARCH=1 enables the additions; otherwise they are inactive.
+
+  arceus-sequence-clock kind 0: common fade C21490
+  arceus-sequence-clock kind 1: capture director 180C338
+  arceus-ui-clock:             UI elapsed-clock reader at return 2B4344C
+
+The sequence hooks check the game build, exact function boundaries and selected
+instruction words. They substitute equivalent MOV/ADD instructions to select
+independent JIT bodies, call the original function once, and observe its fields.
+They do not change game-state timers. Logging samples ordinary calls and
+preserves transitions. UI sampling observes an existing clock hook.
+
+Validation completed:
+  - 1,779 guest-instruction checks, zero failures, seven compiled functions.
+    Includes fade update/helpers, capture wait, UI elapsed arithmetic and the
+    new X22 guard substitution across six inputs and every NZCV flag pattern.
+  - Eleven source-matched function/instruction guards verified against main.bin.
+  - Summary fixtures cover transitions, timer reloads, inactive calls, multiple
+    objects, unknown UI denominators and earlier logs without the new probes.
+  - Runtime build succeeded; no compiler warnings or errors in the build log.
+  - Regular package remains byte-identical. Candidate and built executable
+    match; the previous candidate is backed up before replacement.
+
+These checks do not replace an in-game startup, visual comparison or an active
+capture/fade test. No game was launched, closed, driven or hot-patched this pass.
+No save or game asset was changed or uploaded. Vulkan remains --nvn_native=0.
+The existing manual test launchers retain Seconds=0 and user-controlled closure.
+No input/Escape behavior was changed.
+
+Package SHA-256:
+  Regular:   69B7C027FAFC35C2AF8270CDCBF01B666E8931CF0C81E39F170193A19F64DDAF
+  Previous:  837FE18FA97C5B252534B7E8DFE175A49602D6CCDE39291178F2EBCD3A8325E1
+  Candidate: E8CC679125F8BDEA8EC822DFD5112135F3DDAD98DAAB4CB22E80C30D12730480
+
+NEXT COMPARISON
+
+Use the existing Test-Arceus-Engine-Research-30FPS.cmd and
+Test-Arceus-Engine-Research-120FPS.cmd when manual testing is available.
+One ordinary capture and a few menu/scene fades should exercise the new probes.
+The previously prepared physics and script-clock probes remain higher-priority
+engine-wide measurements. Choose corrections from observed active cadence,
+rather than replacing every integer or every 1/30 constant globally.
+
+The separate 1440p screen-fetch candidate remains pending visual comparison.
+No resolution or shader adjustment was added in this pass.

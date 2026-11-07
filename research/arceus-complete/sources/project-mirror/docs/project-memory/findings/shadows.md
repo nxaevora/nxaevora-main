@@ -1,0 +1,24 @@
+# Rendering: shadow scaling and lighting
+
+Updated: 2026-11-06. Evidence imported from existing local reports, not newly reproduced during memory setup. Paths relative to research workspace in ENVIRONMENT.
+
+## SHADOW-001 — confirmed within captured scenes
+Arceus 1.1.1; Vulkan; global 4/3 scene scaling. Prior D32 shadow arrays sampled at 1024 square exactly matched nearest reduction from 1365-square producers (2,097,152 compared samples). Pattern was visible in receiver 540a88000 before main scene lighting. Evidence: outputs/arceus-shadow-buffer-investigation.txt and arceus-shadow-resampling-evidence.json.
+
+Private candidate SNX_ARCEUS_NATIVE_SHADOWS=1 keeps paired 1024x1024 D32 and R8_UINT tag producers native, with matching pass-local viewport/scissor/constants and copies, while scene color/depth remain 2560x1440. Candidate predicate uses guest dimensions and format keys 1000a/f6; semantic identification of every future pass is not proven. See outputs/arceus-native-shadow-candidate.txt for private source/link inputs and limitations.
+
+Test timing-20261106-181617-047, runtime SHA256 B32D40B03CEE8ADAF34DA9150A657E97F25F9950E4CA25FBAD7F641CF8CAF019: user confirmed stone/bridge/wheel pattern fixed; captured finals agree. Four snapshots 181707/181736/181740/181800 contain paired native shadows; 16 full-layer depth/tag comparisons, 41,943,040 bytes, zero mismatches. Normal closure exit 0. Evidence: outputs/arceus-shadow-test-results.txt, work/shadow-test-review/copy-verification.json, work/review-shadow-test.py. This proves the tested correction/scope, not all-scene correctness or sustained 120 FPS. Do not revert baseline to investigate remaining highlights.
+
+## LIGHT-001 — confirmed coordinate defect; insufficient symptom fix
+Pass10 found an exact FMUL.FTZ-by-2 screen-position chain quantized/rescaled incorrectly for packed-normal fetches at 4/3 scale. direct_flow=3 correction preserves physical coordinate mapping. Reported checks: 52 regressions; 30,774 coordinate assertions; 931 shipped fragments; 334 captured+CB replay shaders. Six shipped lighting/probe shaders changed; disabled output identical. Evidence: outputs/arceus-material-investigation.txt and arceus-1440p-lighting-fix.txt. Compilation/expression checks are not full GPU visual proof. Later run 175234-874 still showed the stone pattern: this correction alone was insufficient. Retry only with a distinct mapped shader/input discrepancy, not as the already-failed complete explanation.
+
+## EXP-BC-001 — failed as a sufficient explanation
+Run 172820-124 switched native_bc=0; 245 observed BC5 bindings used conversion 22/RG16. User still saw bumps that changed with movement. Evidence: outputs/arceus-material-investigation.txt. Observed BC5 mip/upload/sampler checks passed within reported fixtures. This rules out that decoder switch as a sufficient fix, not all possible texture defects. Retry only with a new texture-specific mismatch.
+
+## LIGHT-BOX-001 — observation confirmed; cause hypothesis
+Capture 181800 shows pink highlights in scene lighting 5508c0000, absent in base color 552a80000; scratches/edges align with normal detail 552210000. Postprocessing is not their first appearance. Material/specular/environment/probe contribution is a working hypothesis. No matched original-game reference or pre-shadow box capture establishes whether it is unintended or a new regression. See [active task](../tasks/2026-11-06-lighting-box.md). GPU addresses apply to these captures only.
+
+Earlier follow-up 2026-11-06: user recalled purple appeared after the shadow fix, prompting a controlled comparison. This suspicion is superseded by EXP-BOX-SHADOW-OFF below. Offline samples found emission-like551130000 and half-resolution54e030000/54e4e0000/54ddd0000 zero at six tabletop pixels while scene lighting contains purple. Those samples narrow the contribution but do not establish the exact shader/term. Trace deduplication means first-occurrence bindings are not a per-pixel/per-frame history.
+
+## EXP-BOX-SHADOW-OFF — failed as a pink-box fix; confirmed persistence
+Run184235-253 uses the same verified B32 binary with native shadows OFF, closed exit0, controller+sensors verified. User and both captures184316/184325 show purple. Raw shadow producers actually switch from1024 ON to1365 OFF, confirming the path changed. Comparable approximate tabletop ROI has2.31% classified-purple pixels ON vs2.21% OFF with near-equal mean lighting RGB; views are not pixel-registered. Purple persists in scene lighting before postprocessing. Disabling the native-shadow correction does not resolve this symptom; keep the accepted shadow baseline. This does not prove every shared B32 code change is unrelated. Do not repeat the toggle absent new causal evidence. See active task and work/pink-box/shadow-comparison.json in the memory-setup chat for scripts, manifest hashes and numerical scope.

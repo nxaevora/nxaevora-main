@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D beforeTransparency;
+layout(binding=1) uniform sampler2D afterTransparency;
+layout(binding=2,r8) uniform writeonly image2D reactive;
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(p,imageSize(reactive)))) return;
+    vec3 before=texelFetch(beforeTransparency,p,0).rgb;
+    vec3 after=texelFetch(afterTransparency,p,0).rgb;
+    vec3 peak=max(before,after);
+    vec3 difference=abs(after-before)/(peak+vec3(.0625));
+    float weight=clamp(max(max(difference.r,difference.g),difference.b),0.,1.);
+    imageStore(reactive,p,vec4(weight));
+}

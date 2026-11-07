@@ -1,0 +1,68 @@
+Arceus persistent project memory — installed 2026-11-06
+
+START A FRESH CHAT
+Open the actual repository as the Codex project folder:
+C:\Users\brett\Documents\Codex\2026-11-06\files-pasted-by-the-user-project\work\nxaevora-main
+
+Then say: Continue the project.
+
+The existing research workspace also has instructions pointing to that memory:
+C:\Users\brett\Documents\Codex\2026-11-06\recompiled-game-folder-c-users-brett
+The outputs folder you supplied sits inside that workspace.
+The separately built runtime source has the same pointer:
+C:\Users\brett\Documents\Codex\work\nvn-src
+
+CANONICAL FILES (inside the repository)
+AGENTS.md — concise startup, checkpoint, collaboration and user constraints
+CLAUDE.md — imports the same AGENTS instructions
+docs/project-memory/START.md — read order
+docs/project-memory/STATE.md — current state and exact next action
+docs/project-memory/WORKFLOW.md — ongoing updates, evidence, handoff protocol
+docs/project-memory/ENVIRONMENT.md — source/mirror/build/install locations
+docs/project-memory/INDEX.md — topic and legacy evidence map
+docs/project-memory/findings/ — scoped confirmed findings, hypotheses, failures
+docs/project-memory/tasks/ — separate task status, ownership and handoffs
+docs/project-memory/templates/ — task and finding formats
+tools/check-project-memory.cjs — dependency-free structural checker
+
+DEFAULT NEXT OBJECTIVE
+Investigate crafting-box purple highlights using existing capture 181800.
+Preserve successful native-shadow B32D40B0 baseline. Root cause of the pink
+highlights is unproven. No new game launch is needed or automatically scheduled.
+
+WORKFLOW
+Agents checkpoint meaningful discoveries, experiments and changes during work,
+before objective switches and before substantive completions/blockers. They
+preserve failed attempts and distinguishing evidence, update current state when
+it changes, and save a verified handoff before recommending a fresh chat.
+Separate task ownership and isolated patches reduce Codex/Claude interference.
+No manual journal or repeated handoff prompt is expected from you.
+
+VERIFICATION
+998 words across AGENTS + START + STATE at installation; 316 in STATE.
+Required files, Markdown links, task metadata/status and word budgets passed.
+Negative checks rejected broken links, invalid status and oversized startup.
+Key legacy report, candidate, capture and evidence paths exist.
+Installed EXE SHA256 independently matches the accepted shadow baseline:
+B32D40B03CEE8ADAF34DA9150A657E97F25F9950E4CA25FBAD7F641CF8CAF019
+No ArceusTest process found at verification. Always re-check before changes.
+The prior long AGENTS file was archived byte-for-byte in repository memory.
+
+SCOPE AND LIMITS
+Memory updates are integrated agent instructions, not a background recorder.
+Unsaved observations cannot survive an abrupt interruption. New chats must open
+the project or be told its path; unrelated projectless chats do not load it.
+Existing chats may need to read their changed AGENTS file once when resumed.
+The setup leaves all changes uncommitted and preserves the existing dirty tree.
+Root .gitignore exceptions make AGENTS/CLAUDE eligible for normal version control.
+No game code, binaries or existing staged changes were changed. No launch or
+publication. Full diff check reports an existing blank line at arceus_clock.c:939;
+the memory change does not touch it. Scoped .gitignore diff check passes.
+Old reports are indexed, not exhaustively revalidated; old current-state claims
+are historical. Raw captures/game data stay local and outside repository memory.
+Clones/worktrees need the committed/merged memory and their own environment map;
+committing the notes does not back up separate local captures and experiments.
+
+OFFICIAL INSTRUCTION-FILE REFERENCES
+https://developers.openai.com/codex/guides/agents-md
+https://code.claude.com/docs/en/memory

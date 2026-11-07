@@ -1,0 +1,85 @@
+--- spirv_translate.c
++++ spirv_translate.c
+@@ -987,7 +987,7 @@
+    size over the scale. The texture's bit is in the push constants' uvec4, x for slots 0-31, y for 32-63 */
+ _Static_assert(SH_MAXTEX <= 64, "the scaled textures' mask has a bit a slot");
+ static void scaled_coords(DirectCtx* c, u32 push, int slot, int size, u32 i32_type, u32* x, u32* y,
+-                          u32 screen_position, u32 position_type) {
++                          u32 screen_position, u32 position_type, int screen_multiplier) {
+     u32 one = spv_emit_constant_u32(&c->emit, c->u32_type, 1);
+     u32 bits = spv_emit_push_component_f32(&c->emit, spv_emit_type_pointer(&c->emit, 9, c->u32_type), push, one,
+                                            slot >= 32 ? one : c->zero, c->u32_type); /* PushConstant */
+@@ -1023,6 +1023,13 @@
+                samples. For a scaled image, use the actual framebuffer pixel;
+                unscaled textures retain the game's integer coordinate. */
+             u32 coord = spv_emit_vec4_extract(&c->emit, c->f32_type, position, (u32)k);
++            if (screen_multiplier == 2) {
++                /* A proven 2*FragCoord fetch selects a full-resolution texel
++                   from a half-resolution pass before integer quantization. */
++                coord = spv_emit_fmul(&c->emit, c->f32_type, coord,
++                    spv_emit_constant_f32(&c->emit, c->f32_type, 2.0f));
++                spv_emit_no_contraction(&c->emit, coord);
++            }
+             coord = spv_emit_glsl_unary(&c->emit, c->f32_type, c->glsl, SPV_GLSL_FLOOR, coord);
+             u32 exact = spv_emit_convert_f_to_s(&c->emit, i32_type, coord);
+             *v[k] = spv_emit_select(&c->emit, i32_type,
+@@ -1950,13 +1957,20 @@
+             (B(w, 39, 2) != 1 && B(w, 39, 2) != 3)) return 0;
+         return direct_screen_axis(insn, n, (u32)j, B(w, 20, 8), axis, 0, depth + 1);
+     }
++    /* Exact shipped FMUL.FTZ Rdest,Rsource,2 encoding, with only the two
++       register fields variable. Reject modifiers, predication, other factors,
++       post-F2I arithmetic, and repeated multiplication. */
++    if (op == O_FMUL_I && (w & ~0xffffull) == 0x3868104000070000ull)
++        return direct_screen_axis(insn, n, (u32)j, B(w, 8, 8), axis, 0, depth + 1) == 1 ? 2 : 0;
+     return op == O_IPA && !B(w, 38, 1) && !B(w, 51, 1) && B(w, 54, 2) != 1 &&
+            B(w, 30, 8) * 4 == 0x70 + 4 * axis;
+ }
+ 
+ static int direct_screen_fetch(const u64* insn, u32 n, u32 index, u32 x, u32 y) {
+-    return g_shader_screen_fetch && direct_screen_axis(insn, n, index, x, 0, 1, 0) &&
+-           direct_screen_axis(insn, n, index, y, 1, 1, 0);
++    if (!g_shader_screen_fetch) return 0;
++    int xm = direct_screen_axis(insn, n, index, x, 0, 1, 0);
++    int ym = direct_screen_axis(insn, n, index, y, 1, 1, 0);
++    return xm == ym ? xm : 0;
+ }
+ 
+ static int direct_track_const(const u64* insn, u32 n, u32 index, u32 reg, u32* value, int depth) {
+@@ -7777,9 +7791,10 @@
+             }
+             if (type == 0 && !array) texel_row_coord(c, i32_type, &x, &y);
+             if (type == 1 && needs_texel_scale) {
+-                u32 position = fragcoord && packed_reg == 255 &&
+-                    direct_screen_fetch(insn, n, i, a + array, a + array + 1) ? fragcoord : 0;
+-                scaled_coords(c, push, slot, 0, i32_type, &x, &y, position, vec4);
++                int screen_multiplier = fragcoord && packed_reg == 255 ?
++                    direct_screen_fetch(insn, n, i, a + array, a + array + 1) : 0;
++                u32 position = screen_multiplier ? fragcoord : 0;
++                scaled_coords(c, push, slot, 0, i32_type, &x, &y, position, vec4, screen_multiplier);
+             }
+             u32 coord = z ? spv_emit_vec3_construct(&c->emit, vec3_i32, x, y, z)
+                           : spv_emit_vec2_construct(&c->emit, vec2_i32, x, y);
+@@ -7907,9 +7922,10 @@
+                 u32 xr = array ? b : a;
+                 u32 yr = array ? b + 1 : encoding == 4 || encoding == 5 || encoding == 6 ||
+                          encoding == 7 || encoding == 12 ? a + 1 : b;
+-                u32 position = fragcoord && encoding != 4 && encoding != 12 &&
+-                    direct_screen_fetch(insn, n, i, xr, yr) ? fragcoord : 0;
+-                scaled_coords(c, push, slot, 0, i32_type, &x, &y, position, vec4);
++                int screen_multiplier = fragcoord && encoding != 4 && encoding != 12 ?
++                    direct_screen_fetch(insn, n, i, xr, yr) : 0;
++                u32 position = screen_multiplier ? fragcoord : 0;
++                scaled_coords(c, push, slot, 0, i32_type, &x, &y, position, vec4, screen_multiplier);
+             }
+             u32 coord = type == 2 ? spv_emit_vec3_construct(&c->emit, vec3_i32, x, y,
+                                                             reg_read_as(c, b, i32_type))
+@@ -8175,7 +8191,7 @@
+                 third ? spv_emit_vec4_extract(&c->emit, c->u32_type, dimensions, 2)
+                       : spv_emit_constant_u32(&c->emit, c->u32_type, 1),
+                 spv_emit_image_query_levels(&c->emit, c->u32_type, c->sampled_type[slot], c->sampler[slot])};
+-            if (qtype == 1 && needs_texel_scale) scaled_coords(c, push, slot, 1, i32_type, &values[0], &values[1], 0, 0);
++            if (qtype == 1 && needs_texel_scale) scaled_coords(c, push, slot, 1, i32_type, &values[0], &values[1], 0, 0, 0);
+             u32 dst = d;
+             for (u32 k = 0; k < 4; k++)
+                 if (B(w, 31 + k, 1)) {

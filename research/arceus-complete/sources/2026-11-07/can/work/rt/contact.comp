@@ -1,0 +1,82 @@
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_ray_query : require
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D sceneDepth;
+layout(binding=2) uniform sampler2D sceneColor;
+layout(binding=3, rgba16f) uniform writeonly image2D shadedColor;
+layout(buffer_reference, std430, buffer_reference_align=16) buffer Vertices { vec4 points[]; };
+layout(buffer_reference, std430, buffer_reference_align=4) buffer Stats { uint rays; uint hits; };
+layout(push_constant) uniform Params {
+    vec4 camera; // inverse focal lengths and reverse-depth linearization
+    Vertices vertices;
+    uvec2 scene;
+    uvec2 statsAddress;
+} rt;
+
+vec3 positionAt(ivec2 p) {
+    ivec2 size=textureSize(sceneDepth,0);
+    p=clamp(p,ivec2(0),size-1);
+    float depth=texelFetch(sceneDepth,p,0).r;
+    if(depth<=0.) return vec3(0.);
+    vec2 clip=(vec2(p)+0.5)/vec2(size)*2.-1.;
+    return vec3(clip*rt.camera.xy,1.)/max(1e-7,depth*rt.camera.z+rt.camera.w);
+}
+#ifdef BUILD_MESH
+void triangle(uint first,vec3 a,vec3 b,vec3 c) {
+    float nearZ=min(a.z,min(b.z,c.z)), farZ=max(a.z,max(b.z,c.z));
+    // Reject triangles across silhouettes and background pixels.
+    if(nearZ<=0. || farZ-nearZ>nearZ*.09) { a=vec3(0); b=a; c=a; }
+    rt.vertices.points[first]=vec4(a,1);
+    rt.vertices.points[first+1]=vec4(b,1);
+    rt.vertices.points[first+2]=vec4(c,1);
+}
+void main(){
+    ivec2 tile=ivec2(gl_GlobalInvocationID.xy), size=textureSize(sceneDepth,0);
+    ivec2 grid=(size+7)/8;
+    if(any(greaterThanEqual(tile,grid)))return;
+    ivec2 p=tile*8;
+    vec3 a=positionAt(p),b=positionAt(p+ivec2(8,0));
+    vec3 c=positionAt(p+ivec2(0,8)),d=positionAt(p+8);
+    uint first=uint(tile.y*grid.x+tile.x)*6;
+    triangle(first,a,b,c); triangle(first+3,b,d,c);
+}
+#else
+vec3 closestDerivative(vec3 a,vec3 center,vec3 b) {
+    return abs(a.z-center.z)<abs(b.z-center.z)?center-a:b-center;
+}
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(p,imageSize(shadedColor))))return;
+    vec4 color=texelFetch(sceneColor,p,0);
+    vec3 pos=positionAt(p);
+    if(pos.z<=0.)return; // preparation pass has already copied the input
+    vec3 dx=closestDerivative(positionAt(p-ivec2(1,0)),pos,positionAt(p+ivec2(1,0)));
+    vec3 dy=closestDerivative(positionAt(p-ivec2(0,1)),pos,positionAt(p+ivec2(0,1)));
+    vec3 n=cross(dx,dy);
+    if(dot(n,n)<1e-20)return;
+    n=normalize(n); if(dot(n,pos)>0.) n=-n;
+    vec3 tangent=normalize(cross(abs(n.z)<.85?vec3(0,0,1):vec3(0,1,0),n));
+    vec3 bitangent=cross(n,tangent);
+    float bias=max(0.0001,pos.z*.0015);
+    float radius=clamp(pos.z*.08,bias*6.,max(bias*6.,1.25));
+    float occlusion=0.; uint hits=0;
+    for(int i=0;i<4;i++){
+        float angle=float(i)*1.5707963+.3926991;
+        vec3 direction=.60*n+.8*(cos(angle)*tangent+sin(angle)*bitangent);
+        rayQueryEXT ray;
+        rayQueryInitializeEXT(ray,accelerationStructureEXT(rt.scene),gl_RayFlagsOpaqueEXT,255,
+                              pos+n*bias,bias,direction,radius);
+        while(rayQueryProceedEXT(ray)) {}
+        if(rayQueryGetIntersectionTypeEXT(ray,true)==gl_RayQueryCommittedIntersectionTriangleEXT){
+            occlusion+=1.-smoothstep(0.,radius,rayQueryGetIntersectionTEXT(ray,true));hits++;
+        }
+    }
+    if(any(notEqual(rt.statsAddress,uvec2(0))) && all(equal(p%8,ivec2(0)))){
+        Stats stats=Stats(rt.statsAddress); atomicAdd(stats.rays,4); atomicAdd(stats.hits,hits);
+    }
+    imageStore(shadedColor,p,vec4(color.rgb*(1.-.32*occlusion*.25),color.a));
+}
+#endif
+

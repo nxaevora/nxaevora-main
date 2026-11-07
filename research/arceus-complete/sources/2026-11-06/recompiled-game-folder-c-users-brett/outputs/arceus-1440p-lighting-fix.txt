@@ -1,0 +1,76 @@
+1440p stone/wood artifacts: pass10, 2026-11-06
+
+Current result
+The BC texture comparison run timing-20261106-172820-124 closed normally with
+game_exit=0. The user still sees the bumps, changing somewhat while moving.
+The log confirms native_bc=0 really changed observed BC5 textures to the
+software-decoded RG16 path. That decoder difference is not a sufficient cause.
+
+Concrete correction now staged
+A half-resolution lighting shader reads full-resolution packed normals using
+2*screenPosition, but reads its half-resolution depth using screenPosition.
+The existing resolution fix recognized only the latter. At 4/3 scaling the
+normal fetch selected x=0,3,4,7,8,11,... instead of 1,3,5,7,9,11,... . The same
+error affected Y. The new narrow recognizer follows the exact unmodified
+FMUL.FTZ-by-2 instruction before integer conversion and preserves its mapping
+in physical pixels. It keeps existing guards and unscaled/disabled behavior.
+Cache token direct_flow=3 prevents reuse of old translated lighting shaders.
+
+This is a demonstrated coordinate defect, not proof that it explains every
+reported artifact. The observed shader contributes to a half-resolution light
+buffer later sampled by main lighting. Its coverage at the pictured moments
+has not been established. Five additional shipped light/probe shaders use the
+same exact chain and receive the correction; they were not seen in this trace.
+
+Validation
+- Runtime build and production-linked 52 shader regression cases passed.
+- 30,774 emitted-coordinate assertions passed; existing 76 fixture outputs
+  remain byte-identical. These evaluate coordinate expressions, not full GPU
+  shaders or the game's visual result.
+- 931 shipped fragments and 334 captured shaders with constant-buffer replay
+  translated with zero unsupported/failures. Flag-off output is byte-identical;
+  flag-on changes only six shipped shaders and no captured-replay shaders.
+- All 245 captured BC5 bindings have complete declared mip chains and valid
+  uploads. The known environment normal binding has linear/trilinear filters,
+  no bias and no accidental sRGB. All observed raster depth bias is zero.
+- A real local BC5 asset passed actual texture upload/deswizzle/conversion
+  checks across 11 mips. Finite sampler checks also passed documented device
+  interpolation precision bounds. No sampler/upload defect reproduced.
+- New capture helper passed 12 real-GPU synthetic format/layer/depth fixtures,
+  20 eligibility/overflow checks and the 96-surface bound. Meaningful raw bytes,
+  source image/stencil and tracked image state were preserved. No Vulkan
+  validation layer or live-game capture was exercised.
+- Independent review of helper and completed-present renderer integration
+  found no blocking issue. All accepted gameplay timing source remains intact.
+
+Next manual test
+Open outputs/Arceus-Surface-Capture.exe. It uses the new staged runtime,
+native BC enabled, Vulkan, the 1440p profile, target 120 FPS, camera 2.2, accepted
+timing fixes and controller background input. It retains manual saving/closure.
+The agent has not launched it and did not alter the installed closed-game EXE.
+
+At affected stone, press F3 once. At the bridge, press F3 once again. Ordinary
+screenshots are saved immediately. A separate capture is queued for the next
+completed game present, with raw lighting/normal/depth buffers and a matching
+*_buffers_N_final.ppm plus *_pair.tsv. A short stall is expected while copying
+and writing locally. Save and close normally when done; Escape does not quit.
+
+Capture limits and interpretation
+Files stay under the game's local captures directory. At most 4 extra captures
+per run; at most 96 surfaces, 64 MiB per image and 384 MiB raw data per capture.
+The capture reads base mip/all array layers of recently used RTs and textures
+copied from RTs, not every material texture or an entire replayable GPU frame.
+Use each attachment's drawn_at/last_used metadata: some can be up to 2 presents
+old. The paired final is the guest final surface; it excludes runtime scaling,
+letterboxing and overlay/UI. The ordinary earlier F3 screenshot is not its pair.
+Raw buffers retain guest orientation; pair metadata records crop/transform.
+D24 depth is low 24 bits only; upper 8 bits are undefined, not stencil.
+Capture adds read copies and synchronization, not a new guest-writeback path;
+ordinary completion may still land already pending game storage writes.
+
+Build SHA256: aaad4627683a6218594a7e0952e1e0ef2c748487c8b1f476271ea36da07c06b3
+Installed tested EXE remains: 550757a3d6451fb3c5e2007d99f9946eb4b2d979cb1aca2ddeff513425540a60
+Preserved previous candidate: work/ArceusEngineCandidate-before-pass10-runtime.exe
+Normal 1440p launcher now points to the staged corrected candidate with capture
+disabled. The dedicated Surface-Capture helper enables capture only for its run.
+Visual confirmation is pending. All game assets, saves and fixtures stay local.

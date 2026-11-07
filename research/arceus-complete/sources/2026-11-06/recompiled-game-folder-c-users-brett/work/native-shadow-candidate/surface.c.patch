@@ -1,0 +1,30 @@
+--- surface.c
++++ surface.c
+@@ -166,6 +166,15 @@
+ 
+ static u64 g_rt_made; /* for the stats line */
+ u64 vk_rt_made(void) { return g_rt_made; }
++
++/* Explicit Arceus experiment: the observed 1024-square D32/tag shadow pair.
++   Disabled by default; no scene color/depth format is selected. */
++static int native_shadow_shape(u32 w, u32 h, u32 fkey) {
++    const char* flag = getenv("SNX_ARCEUS_NATIVE_SHADOWS");
++    return flag && !strcmp(flag, "1") && w == 1024 && h == 1024 &&
++           (fkey == 0x1000a || fkey == 0xf6);
++}
++
+ static Surf* surf_create(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 bh, u32 pitch, int is_rt, u32 layers) {
+     Surf* s = calloc(1, sizeof *s);
+     if (!s) return NULL;
+@@ -174,6 +183,11 @@
+     s->h = h;
+     s->sw = is_rt ? vk_sc(w) : w;
+     s->sh = is_rt ? vk_sc(h) : h;
++    if (is_rt && native_shadow_shape(w, h, fkey)) {
++        s->sw = w; s->sh = h;
++        LOG_LIMIT(8, "arceus-native-shadow: target=%llx format=%x native=%ux%u\n",
++                  (unsigned long long)gva, fkey, w, h);
++    }
+     s->layers = layers;
+     s->levels = 1;
+     s->fkey = fkey;

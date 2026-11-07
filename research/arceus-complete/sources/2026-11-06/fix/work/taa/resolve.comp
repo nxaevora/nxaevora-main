@@ -1,0 +1,57 @@
+#version 450
+// Native-resolution temporal resolve. History is on a stable output grid.
+// Input scene RGB is linear and rendered with subpixel projection jitter.
+// No guest HUD, menus or runtime overlays should enter the history.
+layout(local_size_x=8,local_size_y=8) in;
+layout(set=0,binding=0) uniform sampler2D scene;
+layout(set=0,binding=1) uniform sampler2D depth;
+layout(set=0,binding=2) uniform sampler2D oldScene;
+layout(set=0,binding=3) uniform sampler2D oldDepth;
+// Optional geometry motion: xy=current to previous UNJITTERED pixel displacement,
+// z=expected previous device depth, w=valid. Negative w rejects camera fallback.
+layout(set=0,binding=4) uniform sampler2D geometryMotion;
+layout(set=0,binding=5) uniform sampler2D reactive;
+layout(rgba16f,set=0,binding=6) uniform writeonly image2D resolved;
+layout(r32f,set=0,binding=7) uniform writeonly image2D historyDepth;
+layout(push_constant) uniform Params {
+    mat4 currentClipToPreviousClip; // unjittered; multiply column clip vectors
+    vec2 currentJitterPx;           // displacement of geometry in the framebuffer
+    float maxWeight, relativeDepthEpsilon;
+    uint historyValid, hasGeometryMotion, hasReactiveMask;
+} pc;
+bool finite4(vec4 c){return !any(isnan(c)) && !any(isinf(c));}
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy), n=imageSize(resolved);
+    if(any(greaterThanEqual(p,n)))return;
+    vec4 c=texelFetch(scene,p,0); float z=texelFetch(depth,p,0).r;
+    imageStore(historyDepth,p,vec4(z)); imageStore(resolved,p,c);
+    if(pc.historyValid==0u || !(z>0. && z<=1.) || !finite4(c))return;
+    vec2 uv=(vec2(p)+.5)/vec2(n), sampleUV=uv-pc.currentJitterPx/vec2(n);
+    vec2 oldPx;float expected;
+    vec4 mv=vec4(0.);if(pc.hasGeometryMotion!=0u)mv=texelFetch(geometryMotion,p,0);
+    if(!finite4(mv)||mv.w<0.)return;
+    if(pc.hasGeometryMotion==1u && mv.w>0.){oldPx=vec2(p)+mv.xy;expected=mv.z;}
+    else {
+        vec4 q=pc.currentClipToPreviousClip*vec4(sampleUV.x*2.-1.,1.-sampleUV.y*2.,z,1.);
+        if(!finite4(q)||q.w<=0.)return;
+        vec3 ndc=q.xyz/q.w;vec2 prevUV=vec2(ndc.x*.5+.5,.5-ndc.y*.5);
+        vec2 motion=pc.hasGeometryMotion==2u ? mv.xy : (prevUV-sampleUV)*vec2(n);
+        oldPx=vec2(p)+motion;expected=ndc.z;
+    }
+    if(!(expected>0. && expected<=1.) || any(lessThan(oldPx,vec2(0))) || any(greaterThan(oldPx,vec2(n-1))))return;
+    ivec2 cell=ivec2(floor(oldPx)); vec2 f=fract(oldPx); vec3 history=vec3(0);float total=0.;
+    for(int y=0;y<2;y++)for(int x=0;x<2;x++){
+        ivec2 k=min(cell+ivec2(x,y),n-1);float past=texelFetch(oldDepth,k,0).r;
+        if(!(past>0. && abs(past-expected)<=max(.00002,pc.relativeDepthEpsilon*expected)))continue;
+        vec4 h=texelFetch(oldScene,k,0);if(!finite4(h))continue;
+        float w=(x==0?1.-f.x:f.x)*(y==0?1.-f.y:f.y); history+=w*h.rgb;total+=w;
+    }
+    if(total<=.001)return;
+    vec3 lo=c.rgb,hi=c.rgb;
+    for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){
+        vec3 s=texelFetch(scene,clamp(p+ivec2(x,y),ivec2(0),n-1),0).rgb;lo=min(lo,s);hi=max(hi,s);
+    }
+    float react=pc.hasReactiveMask!=0u?clamp(texelFetch(reactive,p,0).r,0.,1.):0.;
+    float weight=clamp(pc.maxWeight,0.,.95)*total*(1.-react);
+    imageStore(resolved,p,vec4(mix(c.rgb,clamp(history/total,lo,hi),weight),c.a));
+}

@@ -1,0 +1,15 @@
+Validation on this PC
+
+1. Double-click Capture-Arceus-Timing.cmd. It runs the installed instrumented runtime until you close the game with nvn_native=0 and fps_limit=game, using the existing isolated test save/settings location.
+2. Play normally. For a useful baseline, time a repeatable walking route, camera rotation, roll, throw/encounter, and one battle animation with a stopwatch or recording. Record the scene and durations. Reach a save point and save in-game before closing the game window. There is no automatic timeout by default.
+3. The console prints the local arceus-runs\timing-* folder. submissions.csv measures Vulkan API calls. display.csv, when PresentMon succeeds, is the separate display evidence. Check displayed/dropped frames in a PresentMon-compatible viewer. Do not treat the submission rate as display FPS.
+4. If display.csv is missing, run Capture-Arceus-Timing.ps1 -CaptureDisplay from an Administrator PowerShell and retain PresentMon's exit/error output. The automated capture failed silently here, so elevation is a troubleshooting step, not a confirmed fix.
+5. This build is a 30 FPS diagnostic baseline. It has no validated normal-speed 60 FPS mode. Do not raise fps_limit and interpret that as a corrected simulation.
+6. Normal launches leave tracing disabled. To restore the previous executable, close the game and copy:
+C:\Users\brett\Documents\Codex\2026-11-06\recompiled-game-folder-c-users-brett\work\ArceusTest-before-trace.exe
+to:
+C:\Users\brett\Documents\Codex\work\arceus-games\ArceusTest\ArceusTest.exe
+
+The new capture launcher was syntax checked. Its underlying game, tracing and PresentMon commands were exercised by the bounded smoke tests. The revised manual-close workflow is syntax checked and remains for user testing. Pass -Seconds 120 only if you explicitly want a timed run.
+
+Once a timing hook exists, repeat identical scenes at 30 and 60 and under deliberate frame-rate drops. Compare real elapsed durations, travel distance, physics, menus, encounters, battle timing and input response. A steady FPS number alone is not a pass.

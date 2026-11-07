@@ -1,0 +1,34 @@
+Arceus temporal rendering tests
+
+Playable test builds
+Arceus-TAA-Test.exe resolves the 2560 x 1440 scene before the HUD.
+Arceus-DLSS-Test.exe and Arceus-FSR-Test.exe reconstruct a 1920 x 1080 scene at 2560 x 1440. The AMD runtime selected FSR 3.1.6.
+All three carry the neutral-rim change previously checked in both crafting-box screenshots. The stock game executable stays installed.
+
+Controlled Vulkan replay on the RTX 5090
+A character from a saved capture was moved independently across another captured scene through a walk, stop, reversal and cut. The camera also panned and the sampling jitter changed each frame.
+The metric is the mean absolute display-mapped RGB difference on character pixels across five sampled frames. Each backend is compared with its own output using the known motion. Lower is closer.
+
+Backend     Camera only     Candidate     Reduction
+TAA         0.005885       0.003114      47.1%
+DLSS        0.006053       0.002592      57.2%
+FSR         0.006761       0.001987      70.6%
+
+Isolated estimator timing on the RTX 5090
+1920 x 1080 motion pass took 0.186 ms at the median and 0.193 ms at the 95th percentile.
+2560 x 1440 motion pass including native camera-vector generation took 0.269 ms at the median and 0.272 ms at the 95th percentile.
+GPU timestamps span the estimator in 40 warm moving-character samples. Uploads, vendor reconstruction and the rest of the game are outside this timing.
+
+The stationary jitter and camera-pan controls had zero measured false background corrections larger than one input pixel. Two actors sharing materials and moving in opposite directions reached 99.77% within one input pixel. About 0.008% of the unchanged background received a false correction in that case.
+Fast turns are harder. On the 12-degree rotation test the mean character-vector error fell from 43.9 to 24.2 input pixels. Motion beyond the 64-pixel search radius falls back to camera reprojection with reduced history confidence where matching fails.
+
+History resets
+NGX evaluates the new scene twice on a reset. Comparing identical new frames after two different histories gave identical output on the cut and on the following three frames. Ordinary frames use one NGX evaluation. Native TAA and FSR also passed their reset comparisons.
+
+In-game verification
+The game stayed closed during these tests. Live character animation, HUD appearance and gameplay frame times still need observation. The renderer estimates opaque object motion from camera, depth, material IDs and previous color. No game-supplied skeletal or particle motion buffer has been confirmed.
+Open a test launcher and press F3 while the player or an NPC moves. Save and close normally. The screenshot includes current/previous packed scene features, the estimated vectors, the confidence mask and a temporal manifest when adjacent material history is available.
+
+Runtime SHA-256
+taa-runtime/ArceusTest.exe    475e4aecaeb3d765225352a3f3ec7a2c7fba64a4ca4fa28405fc7ab0b8c4b09b
+upscale-runtime/ArceusTest.exe    53379fc93072642d96e242cfbafd246d83d71e763648753c5a237d10937c71d8

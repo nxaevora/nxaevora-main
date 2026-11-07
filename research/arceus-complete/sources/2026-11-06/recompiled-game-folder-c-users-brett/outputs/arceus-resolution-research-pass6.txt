@@ -1,0 +1,105 @@
+ARCEUS 1.1.1 RESOLUTION MODE RESEARCH — PASS 6
+2026-11-06. Local static analysis and isolated original-instruction execution.
+Addresses are hexadecimal main-relative; original main load base is0x8005000.
+
+Result
+The engine has separate automatic and explicit controls for3D buffer scale.
+The automatic governor is not the only possible reason for a smaller viewport.
+An event transition can request half scale, and a script-bound callback can set
+custom width/height scales. A separate signed override takes precedence over
+the stored mode. None of this establishes the actual scene resolution in the
+latest user run: resolution tracing and both rendering experiments were off.
+The user reported good visual quality, below1440p, without the previous distortion.
+
+Mode application, CC3888 (complete size0x5B4)
+This writes the named parameters3DBufferWidthScale and3DBufferHeightScale through
+the original parameter service. Mode selection is:
+  if signed(owner+28)<8: use that override;
+  else: use owner+0, the requested mode.
+Negative overrides do not fall back to requested mode; they take the default
+full-scale branch after the unsigned switch-range check.
+
+Effective mode    Width       Height       Source
+other/0/1        1           1            constants3978758/5C
+2                .90         .85          constants3978740/44
+3                .85         .80          constants3978748/4C
+4                .80         .70          constants3978750/54
+5                ~.00090000004 ~.00085000007 immediates3A6BEDFB/3A5ED28A
+6                owner+2C    owner+30     custom floats
+7                .5          .5           constants3978760/64
+
+Mode5's unusual tiny values are verified original constants. Their purpose and
+whether this mode is used live remain unidentified. They are each one float ULP
+above the corresponding decimal .0009f/.00085f; do not label that a new defect.
+The jump table3978732 maps2..7 toCC3B3C/CC3BE4/CC3CB0/CC3D7C/CC3A8C/CC38D8.
+
+Static side effects: every application clears owner+40. The default branch also
+clears +34 and history fields+10..27. Mode3 writes+34=2, mode4 writes3, and the
+other explicit branches reach+34=1. The isolated tests check+40, not the other
+side effects; these latter claims are static instruction observations.
+
+Setters and ownership
+CC386C applies a requested W1 when it differs from owner+0 or W2 bit0 is set.
+The indexed startup callerC8AE6C sets mode1 atC8BB94. This manager owns the
+resolution object through+110. CC3E3C simply returns requested mode+0.
+
+CC3E44 stores S0 at+2C and S1 at+30, sets requested mode6, and callsCC3888.
+Its indexed caller144D8FC gets the resolution owner usingC8C974, supplies its
+own fields+484 as S0 and+480 as S1.144D5F4 binds this callback at object+D0.
+Constructor147EC78 installs vtable411BC70 and initializes both float fields to1.
+The exact authored command name is unresolved; do not call this a gameplay
+resolution option based solely on the function-object shape.
+
+CC3E58 resets stored custom values to(.90,.85) and changes requested mode to1.
+It only reapplies parameters if the previous requested mode was not1; when it
+does reapply with no active override, the immediate result is(1,1), not(.90,.85).
+148FF9C's cleanup calls this reset only when requested mode==6.
+
+Temporary event mode, inside1DF4178
+At1DF5074..5098, a field/event state branch reads the resolution owner's
+requested mode. If it is not already7, it saves that mode to event object+258,
+then stores requested mode7 through1DF5B14 and callsCC3888 at1DF5B18.
+At1DF5B04..18, a later branch compares saved+258 against current requested mode
+and restores/applies it when different.
+
+This is a requested-mode save/restore, not a snapshot of effective resolution:
+- owner+28 override can supersede mode7, so half scale is not inevitable.
+- The path does not save/restore override or custom float values.
+- Already-mode7 bypasses the save in the observed branch.
+- These branches do not prove every abort/cancel/error reaches the restoration.
+No claim of a stuck half-resolution bug is justified by this static path alone.
+
+Relationship to the existing optional governor bypass
+CC35A4's update selects requested/override mode using the same signed comparison,
+then only accepts effective modes1..3 into its update branch. The existing
+SNX_ARCEUS_FIXED_RESOLUTION experiment changes its range check to take the
+ordinary early return. It leavesCC3888 and explicit scene modes intact.
+That experiment therefore does not itself force all scenes to full scale or
+prove1440p output. It was disabled in the completed controller test.
+
+The prior optional screen-fetch shader candidate is also still disabled. It
+addresses host render-scale coordinate quantization, which is separate from
+these game-side scale choices. No visual success at1440p is claimed for it.
+
+Verification
+work/pass6-resolution/resolution-jit.c executes unchangedCC3888, CC386C,
+CC3E44 andCC3E58, with the original mode jump table/constants/names. External
+parameter service calls are controlled stubs that record actual descriptor
+names and float values; there is no renderer, GPU allocation or live event.
+1,307 assertions passed, zero failures,10 dynamically compiled entries.
+The cases cover132 mode/override combinations, signed negative and large
+overrides, force-bit reapplication, custom values, override precedence and
+conditional reset. Every tested full-function return balances its stack.
+Initial failures exposed expected-value rounding for mode5; expected values
+were corrected to the independently verified original immediates. Guest code
+was not changed. Independent review confirmed fixture bytes and scope limits.
+
+Next useful resolution test
+Correlate CC3888 caller and object identity with requested mode, signed override,
+effective mode, custom floats and actual named parameter writes. At transitions,
+also capture event state+70 and saved mode+258. In the same frame, record the
+3D draw target dimensions, viewport/scissor, output image and host render scale.
+Allocated large images or sharp UI alone cannot establish native3D resolution.
+This will separate automatic reductions, explicit half/custom modes and host
+coordinate scaling before a further1440p visual test. Keep the accepted camera,
+menu and timing settings during that comparison.

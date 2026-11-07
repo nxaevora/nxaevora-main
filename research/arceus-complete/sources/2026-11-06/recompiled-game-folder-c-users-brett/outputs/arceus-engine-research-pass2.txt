@@ -1,0 +1,199 @@
+ARCEUS 1.1.1 — ENGINE RESEARCH, SECOND OFFLINE PASS
+2026-11-06
+
+Follow-up: arceus-engine-research-pass3.txt adds fade/capture diagnostics,
+UI elapsed-clock evidence and more precise facial-expression timer mappings.
+The candidate hash below is the historical second-pass package.
+
+RESULT
+
+The strongest remaining engine-wide suspects are the rigid-body timestep and
+the behavior-tree frame accumulator. This pass traced their actual arithmetic,
+executed isolated game instructions locally, and expanded optional diagnostics.
+It also identified additional integer timers that a search for 1/30 cannot find.
+
+No new timing correction was enabled in the regular build. The research
+candidate has observation-only additions. No game was launched, closed, driven,
+or hot-patched during this pass. Existing logs were read. Save files and game
+assets were not modified or uploaded. The Vulkan path remains the test path.
+
+RIGID-BODY PHYSICS: STRONGER EVIDENCE
+
+main+2AF25B4 selects the incoming duration when object+121 is nonzero; otherwise
+it selects 1/30. It multiplies that value by object+124 and passes the result in
+StepInfo to main+2F39630. Selection is at main+2AF2620; rate multiplication is at
+main+2AF2A18; the downstream call is at main+2AF2AB4.
+
+In the normal world path (world+648 == 0), collision/task setup stores:
+  world+540/+544: selected timestep, duplicated
+  world+548/+54C: reciprocal timestep, duplicated
+  world+568:      timestep / number of substeps
+  world+5A0:      integer number of substeps
+It also multiplies the vector at world+870 by the timestep and stores its XYZ
+components at world+5D0. This report calls it a per-step vector; its semantic
+identity was not independently established as gravity.
+
+Existing wrapper-entry log evidence:
+  timing-20261106-125820-850:
+    569 sampled intervals, median 119.99849 calls/sec; mode 0, rate 1 throughout.
+  timing-20261106-132828-807 (running-log snapshot):
+    2,980 sampled intervals, median 119.99998 calls/sec; mode 0, rate 1 throughout.
+These are callback rates, not displayed FPS or a count of actual solver steps.
+The wrapper may take conditional paths. We must measure the downstream call
+and stored fields before treating every wrapper invocation as a physics step.
+
+The candidate now observes input StepInfo before the original call and solver
+storage afterward. Alternate-world samples are marked and excluded from the
+summarizer's normal-world comparisons. No timestep, substep count, or world flag
+is changed. This is the first priority for a 30/120 live comparison.
+
+SCRIPT / AI CLOCK: RESET SEMANTICS CONFIRMED
+
+The scheduler at main+1050E00 updates each context's paired values:
+  context+84: elapsed seconds
+  context+88: integer update count
+The block at main+1051830 resets both together when the previous group was
+selected or either force flag is set. It then adds the elapsed duration to +84
+and exactly one to +88, even for contexts skipped by that round's AI selection.
+Current group selection and the force flags determine context+80 eligibility.
+Context construction at main+10543B4 clears +80/+81/+82 and the paired clocks.
+
+Tests executed the real branch/reset block for all 16 combinations of previous
+selection, current selection, flag +81, and flag +82. Repeated schedules at
+30/60/120 Hz with selection periods of 1/2/4 callbacks preserved the same ratio
+of accumulated frames to seconds as the update frequency.
+
+This affects callers of main+1059A78, including WaitFrame, turning/look-around
+actions, and internal Pokemon rest/tiredness/vigilance/hunger/sleep adjustments.
+These are AI values, not a player hunger mechanic. Actual active consumers and
+their live cadence still need the existing script getter probe.
+
+Important rejected correction: floor(context_seconds * 30) every time.
+With an eligible context resetting every callback at 60 or 120 Hz, that yields
+zero ticks forever. The isolated instruction test demonstrates this failure.
+A future correction must retain fractional progress across context resets,
+preserve scheduler eligibility, and account for pauses/clock scaling. Merely
+changing the getter result or skipping whole AI updates is not justified yet.
+
+THROWABLE COMPONENT: THREE TIMED STATES
+
+The previously unnamed motion component is constructed by main+1BEF964 through
+main+1BEF77C, called by a path containing ThrowableObject, ThrowableModelObject,
+my_poke_ball, kPlayerThrowInertial, and kBasuraoThrowInertial. Its update callback
+main+1D48268 calls three state-specific routines and checks enable flags first.
+
+  State 1: main+1D482B0, progress +328 increments by 1/120 at main+1D4893C.
+  State 2: main+1D49144, progress +328 increments by 1/60  at main+1D49848.
+  State 3: main+1D498B4, progress +328 increments by 1/90  at main+1D49F08.
+
+Each state writes a transform component at target+0xD0 and marks it dirty at
+target+0xE0. Activation at main+1D4A0DC sets +324, selects state +320, and clears
+progress when entering a different state. One activation caller handles event
+type 0x18 and maps two event hashes to states 2/3; exact event names remain
+unresolved. Related paths stop projectile flyby audio and use throwable_after_hit.
+This establishes a throwable-related visual component, not proof that these
+three updates alone implement ordinary projectile flight or Pokemon release.
+
+Executing the actual increment instructions until progress first exceeded 1:
+  State    Callbacks    At assumed 30 Hz    At assumed 120 Hz
+    1         121          4.03333 sec          1.00833 sec
+    2          61          2.03333 sec          0.50833 sec
+    3          90          3.00000 sec          0.75000 sec
+These are arithmetic thresholds under assumed cadence, not measured animation
+durations. Completion branches and scene activation were not executed. The
+callback counts include the game's single-precision accumulation behavior.
+
+New optional probes observe before/after progress and state for all three
+routines. The confirmed release-effect correction was not changed.
+
+CAMERA RECENTER AND BATTLE IDLE
+
+main+193633C increments camera+414 at main+193644C. For positive duration +45C,
+it converts the count and duration to floats and divides them to feed easing.
+This is recenter/reset-turn progression, separate from the corrected controller
+stick acceleration and sensitivity. The original slice was executed for 315
+counter/duration cases. A new probe observes active counter changes.
+
+main+9BAD68 decrements object+238 when +220 is active and branches at expiration.
+main+9BB904 initializes it using battle_view IdleAnimationMinWaitFrames and
+Trainer_IdleAnimationMin/MaxWaitFrames configuration. This controls battle idle
+waits; it is separate from eyelid blinking. A new probe observes its countdown.
+
+CAVE LIGHT BLENDING
+
+main+1E1A25C uses cave_light_change_easing. On a new transition, the block at
+main+1E1B278 initializes a 1/120 increment; main+1E1B2B0 adds it to progress and
+the following code clamps the value. Its actual callback cadence is still
+unmeasured. No cave-light patch or probe was added in this pass.
+
+NEW INTEGER-TIMER AUDIT
+
+A strict local instruction scan found 5,180 load/increment-or-decrement/store
+patterns across 2,972 functions. Most are not timing logic. Only 34 had timing
+words in the same function or a direct caller. Manual follow-up found additional
+useful timer families and rejected several tempting false positives.
+
+See arceus-integer-timer-triage.txt for the classified list. Important additions:
+  - Capture-director remaining frame counts at +1DC, separate from stage +F0.
+  - Four directly confirmed look-at hold countdowns (+440/+4C0/+540/+5C0).
+  - Buddy-reaction hold/delay counters.
+  - Respawn fade hold count +2A0.
+  - Climbing movement-stop count +D04.
+This is a candidate inventory, not an assertion that all these systems currently
+run too fast. Whole-function scheduling and live activation remain to be checked.
+
+IMPLEMENTATION AND VERIFICATION
+
+Runtime changes are gated by SNX_ARCEUS_TIMING_RESEARCH=1, the existing exact
+Arceus build-ID gate, function lengths, and exact instruction guards.
+
+New timer probes use MOV Xd,X0 -> ADD Xd,X0,#0 to force the existing JIT dispatch
+path without changing architectural results or flags. Tests execute both forms
+for X19/X20/X21, six 64-bit inputs, and all 16 NZCV combinations: 288 checks.
+The timer probes record changed values only, with bounded log sampling; no
+counter correction or whole-callback throttling is performed.
+
+Completed checks:
+  - 1,954 isolated guest-instruction checks, zero failures, 14 compiled functions.
+    Includes physics duration/rate selection and solver arithmetic, script reset
+    branches, three throwable increments, recenter ratios, battle branch flags,
+    and equivalent-instruction probe substitutions.
+  - Nine source-matched function/byte guards and substitution checks passed.
+  - Log summarizer fixtures passed: missing probes, old logs, multiple timing
+    families, invalid/zero script time, normal/alternate solver paths, and an
+    intentionally mismatched stored timestep.
+  - Runtime build passed. Source and mirror synchronized.
+
+Test limitations: isolated slices do not execute full Havok solving, contacts,
+complete AI behavior, animation events, gameplay, or GPU rendering. Live probe
+installation, callback coverage, and graphics validation remain pending. No
+claim is made that the new findings are already fixed in gameplay.
+
+RESEARCH PACKAGE
+
+Candidate:
+  work/ArceusEngineCandidate-runtime.exe
+  SHA256 837FE18FA97C5B252534B7E8DFE175A49602D6CCDE39291178F2EBCD3A8325E1
+Previous candidate retained:
+  work/ArceusEngineCandidate-before-pass2-runtime.exe
+  SHA256 EA2566FBC33DEC658F62A3E242D225D5760D99EA446B7344D3F87B1957A6B0DB
+Regular package unchanged:
+  work/ArceusClockExperiment-runtime.exe
+  SHA256 69B7C027FAFC35C2AF8270CDCBF01B666E8931CF0C81E39F170193A19F64DDAF
+
+The earlier optional screen-fetch shader candidate is still included, with no
+shader changes in this pass. The 1440p blur investigation still needs a visual
+comparison; this pass does not establish improved image quality.
+
+NEXT MANUAL TEST, WHEN AVAILABLE
+
+The existing Test-Arceus-Engine-Research-30FPS.cmd and
+Test-Arceus-Engine-Research-120FPS.cmd now use the updated candidate. Both keep
+Vulkan and manual closing. Run comparable scenes: NPC interaction, camera
+recenter, throwing an item/ball, and a battle if convenient. These research
+launchers use the saved resolution and leave the optional shader change off.
+
+Priority: compare actual solver input/storage, then script frame/seconds ratios,
+then the newly observed active counters. Keep the elapsed-time fixes already
+confirmed by the user. The additional integer timers should receive targeted
+cadence measurements before any gameplay correction is enabled.

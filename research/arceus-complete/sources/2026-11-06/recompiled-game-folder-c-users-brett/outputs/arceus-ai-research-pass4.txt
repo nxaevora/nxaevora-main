@@ -1,0 +1,256 @@
+Arceus 1.1.1 offline engine research: AI frame consumers (pass 4)
+Date: 2026-11-06
+
+Scope and address convention
+All code/data addresses below are main-relative offsets in the local main.bin.
+Original virtual address = offset + 0x8005000.
+Source SHA-256: d13df31aef8e3bdf9dce8fcb12518900218091b8f33a6880b36cfaaf2acf44c0.
+No game process was launched, closed, or automated. No runtime, game package,
+save, asset, or Vulkan-path settings were changed. Research files remain local.
+
+Main conclusions
+1. The AI context has separate elapsed-seconds (+0x84, float) and integer frame
+   (+0x88, u32 load) channels. Fifteen direct calls to the frame getter belong
+   to fourteen functions. This is a direct-call inventory, not proof that no
+   other code reads the field inline.
+2. WaitFrame tests completion before subtracting this update's frame delta,
+   so the update reaching zero still returns running. A later callback returns
+   completion. Guest instruction execution confirms this, including zero ticks.
+3. Turn and TurnKey increment a completion counter by frame delta but apply one
+   whole precomputed angular step regardless of that delta, even at zero. Merely
+   normalizing the getter to 30 Hz ticks would not fix these actions correctly.
+4. JumpToTarget already advances charge/jump motion with seconds, then has a
+   three-frame completion hold. Whole-AI throttling would mix clock domains.
+5. Most other direct consumers multiply a float rate by the integer frame delta.
+   Tiredness instead uses integer multiply-add and has extra cap semantics.
+
+Clock/scheduler evidence and repeated reads
+Scheduler: 0x1050E00. The clock virtual call at 0x1050E38 uses channel argument
+W1=1. At 0x1050E3C it loads the returned record's +8 nanoseconds. The conversion
+through 0x1050E54 divides by double 1,000,000,000, then converts to float S8.
+The existing context reset logic around 0x1051830 clears both +0x84 and +0x88
+according to prior selected-group / force state. At 0x1051868 the scheduler adds
+one to integer +0x88; 0x105186C adds S8 seconds to +0x84. The values therefore
+accumulate across eligible scheduler intervals until the existing reset logic.
+
+Frame getter 0x1059A78 is exactly LDR W0,[X0,#0x88]; RET. It neither resets nor
+consumes the count. Repeated readers observe the same context count. A correction
+must not advance its clock/remainder in the getter on every read. Seconds getter
+0x1059A70 loads S0 from +0x84 and has 40 indexed direct callsites, but WaitSecond
+and JumpToTarget demonstrate direct/inlined field reads too.
+
+Complete indexed direct frame-getter caller inventory
+Updater   Getter call(s)       Consumer and arithmetic
+AF22E8    AF2498               JumpToTarget: decrement integer post-jump hold.
+AF5438    AF5890               Look-around: float frame delta times angular rate.
+B32CD4    B32DFC               TurnKey: integer elapsed counter; independent step.
+B338DC    B33A9C               Turn: integer elapsed counter; independent step.
+B35AE0    B35B14               WaitFrame: integer remaining -= frame delta.
+B39184    B391FC               AddRestValue: float rate times frame delta.
+B39998    B39A14               AddTirednessValue: integer rate times frame delta.
+B3A3B0    B3A40C               AddUpVigilance: float rate times frame delta.
+B40E48    B40EB8               DecreaseHungryValue: negative float rate * frames.
+B416EC    B4175C               DecreaseSleepValue: negative float rate * frames.
+B41F90    B42004               Minimum-clamped vigilance decrement; name unresolved.
+B530E0    B53154               IncreaseHungryValue: float rate times frames.
+B55380    B553F4               IncreaseSleepValue: float rate times frames.
+B55CB8    B55D80 OR B55E60     IncreaseVigilance: alternate branch callsites.
+
+WaitFrame details
+Initialization 0xB35A74 reads the configured integer and stores initial +0x138
+and remaining +0x13C at 0xB35AA4 / 0xB35AA8. Update 0xB35AE0 does:
+  if (signed remaining < 1) return completion;
+  remaining -= context.frame_count;
+  return running;
+The signed comparison is 0xB35AF4..0xB35AFC. Context acquisition is 0xA5F8A8,
+called at 0xB35B0C. Getter call is 0xB35B14; subtraction/store 0xB35B18..20.
+There is no second comparison after subtraction.
+Completion helper 0xBD4380 points to 0x40E7BF8, whose actual local value is 1.
+Running helper 0xBD43A4 points to 0x40E7C04, whose actual local value is 4.
+These numeric values were verified in main.bin; they are not harness markers.
+
+Thirty ticks at delta=1 require 31 callbacks, including the callback that returns
+completion. Under an assumed callback rate of 30/60/120 Hz, calls/rate is
+1.033333333 / 0.516666667 / 0.258333333 seconds. These are controlled arithmetic
+examples, not measured in-game duration. Actual first-callback phase, eligibility,
+scheduler frequency, and any outer action delay remain unmeasured. With zero frame
+delta, a positive counter remains unchanged and still returns running; subsequent
+positive ticks can advance it normally. An elapsed-time replacement should decide
+explicitly whether to preserve the original next-callback completion behavior.
+
+Seconds-based neighboring waits
+WaitSecondKey / WaitKey updater 0xB35CB8 subtracts context +0x84 seconds from float
+remaining +0x138 (load 0xB35D20, subtraction 0xB35D28). WaitSecond / Wait updater
+0xB35EF8 uses remaining +0x134 (context load 0xB35F60, subtraction 0xB35F68).
+Both test the remaining value before subtraction, analogous to WaitFrame's extra
+completion callback. These direct seconds reads reinforce the mixed-clock model.
+
+Turn / TurnKey: motion and counter must be corrected together
+TurnKey initialization 0xB32814:
+  authored frames +0x140 stored at 0xB32A68; angle +0x148;
+  converted angle divided by frame count at 0xB32ACC;
+  half-angle used at 0xB32AF8; quaternion built by trigonometric approximation;
+  elapsed integer +0x144 cleared at 0xB32C64;
+  fixed per-frame quaternion +0x150 stored at 0xB32C80.
+Turn initialization 0xB3330C:
+  authored frames +0x130; elapsed +0x134; fixed quaternion +0x140;
+  angle/frame division 0xB33640; half-angle 0xB3364C;
+  elapsed clear 0xB33740; quaternion store 0xB3375C.
+
+Exact two update orderings:
+  TurnKey 0xB32CD4:
+    0xB32DFC getter -> 0xB32E00/04/08 elapsed +0x144 += W0;
+    0xB32E48 loads fixed quaternion +0x150;
+    0xB32E34..0xB32FB8 computes updated forward direction;
+    0xB32FBC calls direction/orientation helper 0x19853A8;
+    0xB32FC0..0xB32FCC compares elapsed +0x144 against duration +0x140.
+  Turn 0xB338DC:
+    0xB33A9C getter -> 0xB33AA0/A4/A8 elapsed +0x134 += W0;
+    0xB33AE8 loads fixed quaternion +0x140;
+    0xB33AD4..0xB33C58 computes updated forward direction;
+    0xB33C5C calls 0x19853A8;
+    0xB33C60..0xB33C6C compares elapsed +0x134 against duration +0x130.
+Both comparisons happen AFTER applying the angular step; completion is selected
+when elapsed >= duration. No zero-frame gate occurs between count and motion.
+
+Guest execution of both math blocks proves the Hamilton-convention composition
+q_result = q_step * q_current (pre-multiplication), then transformation of the +Z
+basis into the forward vector. Noncommuting X-current/Y-step test cases distinguish
+this from q_current * q_step. The downstream 0x19853A8 receives a direction vector;
+it should not be described as a raw-quaternion setter.
+
+For frame deltas 0, 1, and 4, the elapsed count advances by 0, 1, or 4, while the
+computed direction applies exactly the same single angular step. If a high-FPS
+getter is changed to yield a 0,0,0,1 pattern, these actions still rotate four full
+steps per nominal authored tick. They may complete later while over-rotating.
+Conversely, merely producing 4 ticks after a hitch advances the deadline by four
+but applies only one step. These are distinct counter/motion units in one action.
+
+Possible designs, not implemented:
+  - Gate zero ticks and apply q_step raised to tick count for integer authored
+    steps, preserving q_step * q_current ordering. This retains 30 Hz angular
+    stepping, and endpoint/clamping behavior still needs deliberate treatment.
+  - For smooth native-FPS turning, derive a fractional step from elapsed channel-1
+    time, advance a fractional progress value, and clamp the final step to the
+    remaining authored angle/duration. Preserve the original multiplication order
+    and inspect other orientation changes before replacing this with interpolation
+    from a fixed initial pose. The original action reads the current orientation.
+In either design, motion progress and completion progress must remain consistent.
+
+JumpToTarget: a mixed-clock action with a three-tick terminal hold
+Configuration 0xAF1A58 references TargetPositionKey, DurationKey, JumpHeight, and
+ChargeTime. Entry 0xAF1C0C stores float duration +0x170 at 0xAF1C50, clears jump
+elapsed +0x178 at 0xAF1CEC, then 0xAF1CE4 loads 0x300000000 and 0xAF1CF4 stores it
+at +0x180: float charge elapsed +0x180=0 and integer hold +0x184=3.
+Update 0xAF22E8:
+  - Charge elapsed +0x180 vs charge setting +0x17C at 0xAF230C..20.
+  - Charge progress adds context +0x84 seconds at 0xAF2520..2C.
+  - Jump ratio +0x178 / +0x170 at 0xAF2330/34, clamped to [0,1].
+  - Jump progress adds context +0x84 seconds at 0xAF23C0..CC.
+  - When ratio reaches 1, branch 0xAF2458 reaches getter 0xAF2498 and decrements
+    integer +0x184 at 0xAF24A0/A4. The NEW remaining value is tested at
+    0xAF24CC/D0, completing when <=0 in the same callback.
+The frame count therefore controls a post-jump hold, not charge or airborne speed.
+Unlike WaitFrame, this action tests completion after decrementing.
+
+Other consumers: arithmetic and limits
+Look-around 0xAF5438 (configuration strings MinLookAroundDegree,
+MaxLookAroundDegree, MinSpendFrame, MaxSpendFrame): frame getter 0xAF5890 converts
+to float at 0xAF58EC. Mode +0x13C, yaw progress +0x140, rate +0x144, total angle
++0x138. Blocks starting 0xAF58F4, 0xAF5930, 0xAF5968 move through angular phases,
+multiply rate by frames, clamp phase bounds, and change mode. Unlike Turn, the
+actual angular amount is already scaled by the getter. Phase transition behavior
+at large deltas is not equivalent to replaying arbitrary substeps automatically.
+
+Rest: B39184 -> 1AA03F4. Float stat +0x8A4 adds float(frames)*supplied rate from
+action +0xB0; clamps to [0,max +0x8A8].
+Tiredness: B39998 -> 1AA07E8. Integer frames in W2 and integer rate from action
++0xB0 in W1 form MADD into old integer +0x8B0. Clamp lower 0 and upper max +0x8B4.
+If flag W3 bit0 (from action +0xB4) is false and at max, subtract one. Zero ticks
+can therefore still trigger clamp/cap logic for some initial states. The helper
+also has a direct caller at 1A7EB78, outside this traced action; patching the helper
+globally on the assumption it only serves the AI action would be unjustified.
+AddUpVigilance: B3A3B0 -> 1AA0174. Float +0x804 adds rate +0x810 * float(frames),
+upper-clamped to +0x80C.
+Hunger: B40E48 / B530E0 -> 1AA033C. Float +0x88C adds rate*float(frames), clamped
+to [0,max +0x890]. Decrease negates action rate +0xB0 at B40EA8.
+Sleep: B416EC / B55380 -> 1AA0398. Float +0x898 adds rate*float(frames), clamped
+to [0,max +0x89C]. Decrease negates action rate +0xB0 at B4174C.
+Minimum-clamped vigilance decrement: B41F90 -> 1AA0150. Float +0x800 becomes
+max(supplied minimum, old - rate +0x808 * frames). Constructor B42154 references
+BlackboardKey and MinValue; exact action-name association not yet established.
+IncreaseVigilance B55CB8 -> 1AA011C uses amount +0x804 * frames, optionally scaled
+by +0x814 when flag W2 bit0 is set, then upper-clamps +0x800 to action MaxValue.
+The two getter calls are mutually exclusive branch sites, not two sequential
+consumptions: B55D80 passes flag0; B55E60 passes flag1. Config includes
+IsCrouchMoveOnGrassKey and IsCrouchThrowOnGrassKey.
+These are actor/Pokemon internal stats; no evidence here establishes player hunger.
+
+Scheduler design: shared channel-1 ticks versus per-context fractions
+A candidate correction could replace scheduler +1 with a cached count of authored
+30 Hz ticks from the same channel-1 elapsed clock, preserving context reset and
+eligibility behavior. For nonnegative integer nanoseconds dt:
+  remainder += dt * 30
+  ticks = remainder / 1,000,000,000
+  remainder %= 1,000,000,000
+Use sufficiently wide arithmetic. The persistent remainder must live outside the
+context fields cleared by the existing reset logic. Once computed for a scheduler
+epoch, all contexts/readers in that epoch must reuse the same ticks. Do not advance
+the shared accumulator once per context or once per getter. Do not repeatedly add
+the already accumulated context +0x84 total as though it were a fresh delta.
+
+This can preserve integer action parameters and the non-consuming getter, and
+avoid a per-context map. But it depends on unproven execution facts: how often
+1050E00 runs per clock update, whether multiple instances share the same channel-1
+clock identity, whether scheduler objects represent independent timelines, thread
+ownership, and the precise eligibility/reset relationships. These need live,
+read-only cadence evidence before changing runtime behavior.
+
+Use the game's channel-1 delta, not host wall time. Pause, time scale, zero deltas,
+clock discontinuities, and negative deltas must follow the actual channel's
+semantics. Existing blinking/channel-0 remainder storage cannot safely be reused
+without proving identical time scale, pause behavior, and epoch identity.
+
+A shared phase also changes context-creation behavior: a new context may receive
+its first authored tick almost immediately or almost 33.3 ms later, depending on
+the shared phase. Per-context fractions give each new context its own phase but
+require stable lifecycle tracking, handling reused addresses, and a deliberate
+decision about which resets clear only accumulated values versus the fraction.
+Any per-context fraction must survive ordinary consumption resets if it is meant
+to avoid truncation. floor(context_seconds*30) after each reset can repeatedly
+yield zero at high FPS, indefinitely stalling integer waits. A persistent fraction
+solves that specific loss; it does not settle creation or rescheduling semantics.
+
+Neither shared ticks nor per-context fractions alone fixes Turn / TurnKey's
+counter/rotation coupling. Other consumers have clamping, mode transitions, and
+integer cap semantics that also need testing at zero and multi-tick deltas. This
+report supports a bounded clock-plus-consumer design, not a blanket AI patch.
+
+Offline guest checks and provenance
+Harness: ai-jit.c, executed by run-checks.ps1 against the existing SnxJitService.
+Result: AI guest checks=665 failures=0 compiled_functions=8.
+WaitFrame: 36 cases (remaining -1,0,1,2,10,30 by frame delta 0,1,2,4,30,120),
+checking remaining, status, non-consuming context, acquisition only when positive,
+and balanced return stack; plus three 31-callback repeated-update cases.
+Turn/TurnKey: 50 total quaternion pairs across both math implementations, each at
+frame delta 0,1,4. Checks cover counter advance, expected transformed forward vector,
+and balanced stack. Thirty-two noncommuting pairs distinguish pre-multiplication.
+
+fixture-provenance.json records main hash, all eight extracted ranges, constants,
+RET substitutions, real status globals, and stubs. Complete WaitFrame code and its
+real frame getter/status helpers run. The context acquisition and non-final
+reference release are controlled stubs. The two counter slices and two quaternion
+slices run separately; final actor direction calls are replaced by RET. Consequently
+the tests prove instruction arithmetic and output direction, not actor integration,
+resource lifetime, live callback cadence, render timing, or downstream animation.
+The fixture header contains locally extracted game instructions/constants and
+must stay local; safe report/test outputs do not require distributing that header.
+
+Next evidence to collect before a patch
+- Channel-1 delta identity and scheduler entries per clock epoch at 30/60/120 Hz.
+- Context +0x84/+0x88 before and after resets, plus action update counts, including
+  suspended/low-frequency groups, pause/menu state, and time-scale transitions.
+- Turn/TurnKey progression and external orientation changes on a controlled actor.
+- WaitFrame and JumpToTarget hold durations with action-entry and completion epochs.
+- Inlined +0x88 readers and other scheduler writers beyond the direct-call index.
+No live evidence for these cadence questions was collected in this offline pass.

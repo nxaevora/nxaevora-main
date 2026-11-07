@@ -1,0 +1,53 @@
+Pink crafting-box investigation — 2026-11-06
+
+The user reports the purple scratches appeared only after the native-shadow fix.
+This makes a regression a stronger suspect; a matched comparison is still needed.
+No claimed fix has been applied. The accepted shadow baseline remains installed.
+
+NEW OFFLINE EVIDENCE
+Raw capture181800 confirms purple in the main lighting buffer before final
+postprocessing. At six sampled tabletop pixels the emission-like buffer and
+three relevant half-resolution lighting inputs are zero. Example purple pixel
+(875,795): lighting RGB .25390625, .115234375, .3671875; brown/gold basecolor
+bytes126,98,57. Normal/material data vary with scratches. This narrows the
+contribution without identifying its exact shader or proving its cause.
+
+The existing material trace records distinct binding configurations, not every
+draw. It does not prove which lighting variant touched these pixels. A source
+audit of the private shadow patch found no newly demonstrated scale defect.
+Default probe source-asset decoding is exploratory; active box probes are not
+matched. Do not interpret these checks as a complete renderer validation.
+
+PREPARED CONTROLLED COMPARISON
+Arceus-Pink-Box-Shadow-OFF.exe — same installed B32 runtime, native shadows OFF.
+Arceus-Pink-Box-Shadow-ON.exe — same installed B32 runtime, native shadows ON.
+
+Both are in this outputs folder. Open from the desktop to retain the established
+controller launch route. Both retain Vulkan, native BC, 1440p scaling, 120 FPS
+target, camera2.2, accepted timing/menu/effect fixes, background controller input
+and F3 buffer capture. Only native-shadow mode differs.
+
+1. Open OFF, visit the crafting box, and press F3 once with the purple-scratch
+   area visible. Observe whether purple remains. Save/close normally yourself.
+2. Open ON, return to the same view and lighting as closely as possible, press
+   F3 once, and close normally yourself. The new capture will pair the baseline
+   with the OFF observation. No automatic restart or test chaining.
+
+OFF intentionally restores the old shadow behavior during that test; the
+original stone/wood pattern may return. It does not replace or patch the EXE.
+ON restores the accepted setting for its process. The helpers do not edit saved
+configuration files. Both refuse an unrecognized runtime or overlapping test.
+
+Builds and --verify-only preflight checks passed. Neither game mode was launched
+by Codex; live controller/visual behavior of these derived helpers is untested.
+Installed EXE hash still matches:
+B32D40B03CEE8ADAF34DA9150A657E97F25F9950E4CA25FBAD7F641CF8CAF019
+
+Logs are under C:/Users/brett/Documents/Codex/work/arceus-runs/timing-... .
+This outputs/current-controller-test.txt records the selected run and mode;
+test-settings.json records native_shadows true/false. Each launch permits four
+full F3 snapshots; later F3 requests save ordinary screenshots only.
+
+Analysis/build source and machine-readable evidence are retained locally under
+this chat's work/pink-box/. Persistent repository memory was updated with user
+feedback, new evidence, limitations and the exact next comparison.

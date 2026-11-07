@@ -1,0 +1,82 @@
+
+2026-11-06: User confirmed water speed correct in timing-20261106-040611-538.
+Water and effect patches both applied, two JIT functions compiled with zero failures.
+Pokemon release effect was NOT tested. Manual camera acceleration, blinking, dialogue
+advance timing, and scripted camera movement remain reported high-FPS issues.
+
+New OPTIONAL EventCameraMove candidate (not visually verified):
+SNX_ARCEUS_EVENT_CAMERA_FIX=1 together with elapsed clocks and TIMING_FIXES.
+main+19b2140 reads camera state+3e4; when active, adds the fixed nominal rate
+at +4b4 to normalized progress +4bc. EventCameraMove main+17fb774 delegates to
+main+19b24ec to populate this state. Scale the increment by measured step/33333334,
+restore nominal rate after the update, and trace active callbacks. No blanket
+scheduler throttling. Gameplay/controller camera acceleration is a separate path.
+Force the 408-byte AOT function stale (including inlined/direct callers). Its final
+B at +194 becomes equivalent CBZ XZR to +70, preventing original AOT variant hash
+reuse; compile the equivalent original body before installing the wrapper.
+Full build ID, four instruction words and AOT metadata/function extent are guarded.
+This only runs before guest threads start. If compilation fails, log and leave
+normal JIT dispatch without the correction.
+
+Validation: incremental build passed; local module metadata confirms exact function
+start and 408-byte span; LLVM assembler independently confirms CBZ encoding b4fff6ff.
+Float simulation of a nominal 3-second move: 30/60 FPS=3.000s,120 FPS=3.00833s
+(one-frame rounding tolerance). Launcher PowerShell syntax passed. No game launched
+or closed by agent; runtime behavior and hook coverage still need user test.
+Runtime SHA256 A40CE54F39431AEA9B5D926681018A1FC46F6B1E7C282008F33C39C5D6051689.
+Test-Arceus-Camera-120FPS.cmd / -60FPS.cmd include existing water/effect fixes.
+Earlier Timing-Fixes launchers explicitly disable the new camera flag for comparison.
+All launchers retain Vulkan, controller setup, manual closing, and Escape protection.
+Next test: release Pokemon and observe effect progress; scripted camera move if
+available. Inspect arceus-event-camera callback lines before claiming correction.
+Still unresolved: controller camera acceleration, blinking, dialogue skip/advance,
+Pokeball flight, and coverage of all scripted camera paths. Save untouched.
+
+2026-11-06 follow-up: timing-20261106-041945-321 ended normally, zero Vulkan API
+submission failures and zero JIT failures. Mean submission interval 11.7466ms
+(~85.13 submissions/sec, NOT measured display completion). Event-camera trace
+reached 840 active updates, including nominal 1/90-frame interpolation.
+User confirms scripted camera and Pokemon release effects fixed, alongside water.
+
+New separately opt-in experiments, not yet visually verified:
+SNX_ARCEUS_BLINK_FIX=1: identified Blink action main+1aafc18, reset main+1959a8c,
+and matching countdown state machine main+194f110 plus base-subobject implementation
+main+194f20c. Each decrements integer counter +68c (subobject +644) by one per call.
+Pace only these two small state machines at 30Hz using the existing elapsed step
+and retained fractional remainder. Face/skeletal animation rendering is untouched.
+Catch up at most three ticks under the existing 100ms cap. Active-call tracing
+reports wrapper calls versus actual updates; actual hook coverage needs next run.
+
+SNX_ARCEUS_CAMERA_INPUT_FIX=1: FieldCameraComponent script bindings identify
+main+193xxxx methods. Main+193c04c processes stick deadzone/curve and modifies yaw
+and pitch response +434/+438 using fixed per-call acceleration and deceleration.
+Run the original response then interpolate its state delta for fractional 30Hz steps;
+whole steps are replayed for larger dt. Preserve the original partial-stick equilibrium,
+signs and curve selection. This is a fractional-step approximation, not a claim of
+exact continuous equivalence for all nonlinear stick transitions. It corrects ramp
+rate; steady camera rotation distance and other camera interpolation remain unmodified.
+Original body is 632 bytes, all instruction guards and AOT metadata verified.
+
+Dialogue investigation: old main+120ae38 candidate appears to perform MessageView
+pane setup and had no callbacks in previous tests; it did not establish update coverage.
+Traced FieldMessageWindow to main+2482818 (copies input into manager) and
+main+27314e8 (walks live message tree, invoking node vtable+80 update).
+New SNX_ARCEUS_DIALOGUE_TRACE read-only probe forces the 184-byte field update
+through JIT and logs the actual live node update targets. This does not fix skipping,
+consume input, slow text reveal, or gate UI updates. Next user test must include NPC
+dialogue so live targets can identify the actual early-advance timer.
+
+All new wrapper installs guard the full game build ID through clock initialization,
+exact instruction words and AOT function sizes. Equivalent B->CBZ XZR instructions
+prevent original hash-matched AOT reuse; direct and inlined originals become stale.
+LLVM independently verified all three branch encodings. Runtime build passed;
+PowerShell launcher parsed; float simulations validated camera linear full-stick
+ramp/release and partial-stick equilibrium at 30/60/120. Blink tick conservation passed
+60/120 and mixed intervals including 100ms capped stalls. No game launched or closed
+by agent. No save changes. Need in-game testing before calling these fixes confirmed.
+
+Launch Test-Arceus-Blink-Camera-120FPS.cmd (or -60FPS). Both include known water,
+effect and event-camera fixes, new blink/camera-input candidates and dialogue trace.
+Previous Camera launchers leave both new correction flags disabled for comparison.
+Review arceus-fixed-step-audit.txt for all 40 contiguous 1/30 constant constructions;
+none blanket-patched. Audit is incomplete for literal pools/nonadjacent instructions.

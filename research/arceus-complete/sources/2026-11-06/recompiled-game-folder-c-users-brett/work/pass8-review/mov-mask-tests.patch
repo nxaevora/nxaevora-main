@@ -1,0 +1,19 @@
+--- a/tests/shader_screen_fetch.c
++++ b/tests/shader_screen_fetch.c
+@@ -134,6 +134,16 @@
+     memcpy(v, base, sizeof base); v[4] = (0x4c98078805a7001eull & ~0xffull) | 4;
+     v[5] = field(0xdd3a0007a0070200ull, 20, 8, 4);
+     test(out, "bindless-tld", v, 6, 1);
++    /* Audit: MOV mask 0/2 is not emitted as a register assignment by the translator. */
++    for (int mask = 0; mask <= 2; mask += 2) {
++        memcpy(v, base, sizeof base);
++        v[4] = mov(8, 255); v[5] = mov(9, 255);
++        v[6] = field(mov(8, 2), 39, 4, mask);
++        v[7] = field(mov(9, 3), 39, 4, mask);
++        v[8] = tld(8);
++        char name[32]; snprintf(name, sizeof name, "ignored-mov-mask-%d", mask);
++        test(out, name, v, 9, 0);
++    }
+     g_shader_screen_fetch = 0;
+     printf("screen-fetch: %d cases, %d failures; ShaderInfo=%zu bytes\n", cases, failures, sizeof(ShaderInfo));
+     return failures ? 1 : 0;

@@ -1,0 +1,206 @@
+Arceus 1.1.1 engine investigation - 2026-11-06
+
+FOLLOW-UP: arceus-engine-research-pass2.txt documents the next research pass,
+additional timer discoveries, and the updated candidate hash. The candidate
+hash and probe count below describe the earlier snapshot, retained as
+ArceusEngineCandidate-before-pass2-runtime.exe. Shader findings remain current.
+
+This pass was performed offline while you were away. No game was launched,
+closed, or driven through gameplay. Saves and extracted game assets were not
+modified. All shader captures, disassembly, and tests stayed on this computer.
+The working Vulkan path remains --nvn_native=0. Escape still does not quit.
+
+WHAT IS READY
+
+A separate engine candidate contains:
+1. An opt-in correction for a confirmed loss of screen-buffer sampling detail
+   at increased render scales.
+2. Optional observation probes for script frame counts, ride-character blink
+   routines, and the timestep passed into Havok collision task setup.
+3. The existing timing fixes, camera gain 2.2 option, and menu-repeat correction.
+
+The regular ArceusClockExperiment-runtime.exe was preserved. The candidate is
+ArceusEngineCandidate-runtime.exe, selected only by the new candidate launchers
+or the Capture script's -EngineCandidate / -ScreenFetchFix switches. It has not
+been copied over the game's executable during this pass.
+
+Candidate SHA-256:
+EA2566FBC33DEC658F62A3E242D225D5760D99EA446B7344D3F87B1957A6B0DB
+Preserved regular package SHA-256:
+69B7C027FAFC35C2AF8270CDCBF01B666E8931CF0C81E39F170193A19F64DDAF
+
+3D BLUR: SECOND, SEPARATE CAUSE FOUND
+
+Earlier logging established that the game can use a smaller scene viewport
+inside a 2560x1440 image. The existing fixed-resolution candidate suppresses
+the automatic resolution governor, while preserving explicit special modes.
+That is separate from the shader issue investigated here.
+
+The Vulkan translator exposes guest screen coordinates as physical FragCoord
+divided by render scale. Several lighting shaders then convert those coordinates
+to integers and fetch G-buffer texels. The old translation rescales the integer
+coordinate. The first rounding has already discarded the extra pixel detail.
+
+At scale 4/3, output pixels 0..7 can therefore fetch columns:
+  old:       0, 2, 2, 3, 4, 6, 6, 7
+  candidate: 0, 1, 2, 3, 4, 5, 6, 7
+
+This pattern was reproduced from the emitted SPIR-V, not just from a separate
+formula. It is a confirmed coordinate defect; it is not yet proof that every
+part of the visible blur has been fixed.
+
+The candidate recognizes only a conservative instruction chain:
+  unmodified screen-position IPA -> 32-bit floor/truncate F2I -> integer fetch
+  with optional MOV instructions and verified reaching definitions.
+
+For a texture marked as scaled, the fetch uses the actual physical framebuffer
+pixel. Unscaled textures retain the original coordinate. Arbitrary coordinates,
+swapped axes, modified values, other rounding modes, packed offsets, and
+ambiguous definitions retain the prior translation. Texture-size queries are
+unchanged. The flag is part of the shader cache key, so enabled and disabled
+SPIR-V cannot be mistaken for each other.
+
+Flag: SNX_ARCEUS_SCREEN_FETCH=1; disabled by default.
+
+Actual game coverage:
+- Captured lighting shader e9e7255e7594a006: two proven reads corrected.
+- Main world-lighting shader e02c1a109a77fac4, found in ha_light.bnsh:
+  six proven reads corrected, at texture slots 0, 1, 4, 5, 10, and 11.
+- 42 local BNSH containers yielded 931 unique fragment shaders.
+- Enabling the candidate changes 54 of those shaders: 49 lighting variants,
+  one each in AO calculation, horizontal/vertical AO blur, added fog, and
+  shadow reception. The remaining 877 shaders are byte-identical.
+- The examined water and post-effect containers are unchanged. The final
+  tonemap shader's fixed 1x1 exposure fetch is not treated as a screen fetch.
+
+Offline checks passed:
+- Runtime build and existing shader regression suite.
+- 29 targeted shader tests covering recognized and excluded instruction forms,
+  including bindless, array, multisample, integer/float MOV chains, predicates,
+  register overwrites, signs, rounding modes, and packed texture offsets.
+- 13,768 emitted-coordinate cases over nine synthetic shaders and eight real
+  lighting reads, including scaled/unscaled textures and unrelated mask bits.
+- 334 cached shaders translate with the candidate both disabled and enabled.
+  Captured constant-buffer reads were replayed for the five shaders that need
+  jump-table data. No unsupported translations remain in this replay.
+- With the candidate disabled, all 334 cached shader outputs are byte-identical
+  to the translator saved before this experiment.
+- All 931 shipped fragment shaders translate in both configurations.
+
+Limits: these are translation and coordinate checks. They are not a complete
+SPIR-V validator, GPU image comparison, gameplay test, or performance benchmark.
+No claim of sustained 1440p/120 FPS is made. The regular saved scale remains 1.
+
+SCRIPT FRAME COUNTER: BROADER AI EFFECTS TO INVESTIGATE
+
+The context updater at main+1050E00 gets elapsed seconds from clock channel 1.
+At main+1051860..105187C it accumulates:
+  context+84: seconds += elapsed time
+  context+88: integer frames += 1
+
+This is NOT simply a global frame number. A round-robin context scheduler resets
+both fields when a group was processed; additional flags can reset them too.
+Consumers receive the accumulated amount since that context's reset.
+
+Getter main+1059A78 returns +88. Fifteen direct call sites in fourteen functions
+were inspected. Nearby vtable methods identify these behaviors/parameters:
+
+  AF22E8: TargetPositionKey, DurationKey, JumpHeight, ChargeTime
+  AF5438: look-around degree range and MinSpendFrame/MaxSpendFrame
+  B32CD4: TurnFramesKey / TurnAngleKey
+  B338DC: TurnFrames / TurnAngle
+  B35AE0: WaitFrame
+  B39184: AddRestValue
+  B39998: AddTirednessValue
+  B3A3B0: AddUpVigilance
+  B40E48: DecreaseHungryValue
+  B416EC: DecreaseSleepValue
+  B41F90: an AI value consumer with BlackboardKey / MinValue; exact name unresolved
+  B530E0: IncreaseHungryValue
+  B55380: IncreaseSleepValue
+  B55CB8: IncreaseVigilance, with crouching/grass input keys
+
+These hunger/sleep names describe internal AI values, not a newly inferred
+player hunger mechanic. Names are from local strings and their vtable neighbors.
+
+Confirmed operations:
+- WaitFrame subtracts the getter's result from its remaining count at +13C.
+- AddRestValue passes the count to main+1AA03F4, which multiplies the configured
+  float increment by that count, adds it to object+8A4, and clamps the result.
+
+This makes the counter a high-priority timing target. It does not establish
+which consumers are active in a particular scene or their actual call cadence.
+It also does not prove this is the remaining dialogue-skip delay.
+
+The candidate's observation-only getter probe records the paired frame count,
+elapsed seconds, flags, object, and caller. The log summarizer reports the ratio
+without summing repeated reads of the same accumulated interval. A 30/120 FPS
+comparison should establish whether the frame count runs ahead of elapsed time.
+
+Do not replace +88 with floor(+84 * 30): a context reset every fast frame would
+discard its fraction repeatedly and could stall WaitFrame. Any later correction
+must preserve fractional progress and the scheduler's reset/pause semantics.
+No script counter correction has been enabled in this candidate.
+
+NAVIGATION AND RIGID-BODY PHYSICS ARE DIFFERENT CASES
+
+Navigation wrapper main+2795204 selects either incoming dt or 1/30 and passes it
+to main+3119908 (local name hkaiWorld::stepWorld). In the inspected callee, the
+incoming float is added to asynchronous latency accumulators +4C0 and +4C4.
+The profiling label is "Async latency". The asynchronous processing launch is
+main+3117A54. This finding weakens the earlier suspicion that this particular
+1/30 constant directly makes characters move four times faster. Navigation was
+left unchanged; downstream scheduling effects remain a separate question.
+
+Rigid-body wrapper main+2AF25B4 is a stronger candidate:
+- +121 chooses incoming dt or fixed 1/30.
+- +124 multiplies that chosen duration.
+- The result is written into a StepInfo structure and passed at main+2AF2AB4
+  to main+2F39630, Havok collision task setup.
+- main+2F3B120 then prepares solving; its local strings include Physics, Solve,
+  Timestep, Tau, Damping, and Num substeps.
+
+The previous entry probe measured incoming dt and mode, not StepInfo. The new
+probe at main+2F39630 logs the actual downstream step_seconds, world object,
+caller, and two raw structure words. A future 30/120 comparison can measure
+whether fixed steps reach this boundary at render cadence. This still does not
+alone prove how every body integrates, and no physics-step change is enabled.
+
+RIDE BLINKING
+
+main+2518BA8 is byte-identical to the already-corrected base blink function.
+main+2518CA4 implements the corresponding subobject countdown. These functions
+were outside the three confirmed blink hooks. Their cadence and live use remain
+unmeasured. Optional probes now record calls and countdown changes without
+pacing these additional routines.
+
+All four new observation probes are gated by SNX_ARCEUS_TIMING_RESEARCH=1 and
+the exact Arceus 1.1.1 build. Function lengths and instruction guards are checked.
+Equivalent LDR/LDUR or B/CBZ-XZR encodings force the existing JIT dispatch path;
+they do not change the counter or timestep semantics. Static guard and branch
+equivalence checks passed. Live installation and callback coverage remain pending.
+
+WHEN YOU RETURN
+
+For the next image-quality comparison, use the same location, camera direction,
+time/weather if practical, and saved game. Each launcher runs until you close
+the game yourself; save before closing. All use the working Vulkan path.
+
+1. Existing Test-Arceus-Fixed-Resolution-1440p-60FPS.cmd is the comparison build.
+2. New Test-Arceus-Screen-Fetch-1440p-60FPS.cmd adds the shader candidate.
+   Compare distant geometry, foliage, building edges, and NPC outlines.
+3. Test-Arceus-Screen-Fetch-1440p-120FPS.cmd is available after checking quality.
+   60 FPS first makes the visual comparison less dependent on GPU load.
+4. Test-Arceus-Engine-Research-30FPS.cmd and ...-120FPS.cmd compare timing probes
+   at the saved resolution, with the shader candidate disabled. The 120 FPS
+   launcher retains the established timing, blink, camera, and menu fixes.
+
+The launchers and log summarizer were syntax/fixture checked. They have not been
+run during this offline pass. Source changes were mirrored and hash-verified in
+the existing repository source copy. There was no upload, commit, or push.
+
+Other pending research targets from the earlier audit remain: battle idle wait
+frames, cave-light blend progress, camera recenter hold frames, and two object
+motion accumulators. Their mere use of fixed constants is not enough to patch
+them safely. The script/AI counter and real physics-step boundary now have
+clearer evidence and take priority over broad constant replacement.

@@ -1,0 +1,228 @@
+ARCEUS 1.1.1 PHYSICS PASS 5: DISPATCH SCHEDULING AND INTEGRATION MEASUREMENT
+2026-11-06. All main+ offsets refer to local main.bin, loaded base0x8005000.
+Scope: offline analysis only. No game launch, shutdown, input, code injection,
+runtime/package edit, save/asset change, network or upload. All new files are
+under work/pass5-physics. Builds on pass4; it does not repeat its motion JIT test.
+
+Conclusions
+The common scheduler does have gates: graph readiness/state, clock-channel delta
+being nonzero, dependency fan-in, worker eligibility, and an owner/skip condition.
+None of the traced dispatcher gates is a 30Hz elapsed-time accumulator or a
+render-frame modulo divisor. A scheduler epoch increments once per invocation;
+completion records it, but no comparison against the previous epoch was found
+in this dispatch chain. Consequently these functions do not establish a fixed
+30Hz physics cadence by themselves. The selected clock's behavior and actual
+integration-range execution still need observation.
+
+The task's +380 value1 and context+C are worker eligibility/index, not a frame
+phase mask. Calling them a frequency or phase divider would be misleading.
+
+An optional entry probe at main+2F269E0 can measure actual final-integration
+range calls and requested motion slots with a safe equivalent-instruction JIT
+clone. It must not label those counts as bodies, frames, or substeps. Precise
+guards and inputs are below. No hook was implemented in this pass.
+
+A. Verified scheduler chain
+1. Physics update object is manager+250, with vtable4187F80.
+   +68 entry is296863C; +70 entry is2B00CA8.
+2. 296863C is the dependency/clock readiness callback.
+3. It calls296B764 to select a worker and enqueue/assign the object.
+4. 296D6B8 consumes a current object at worker+5E8, or obtains one via296D310.
+5. At296D7C4 it calls29684DC on that object and its worker update context.
+6. 29684DC calls object's vtable+70 at2968534 -> physics2B00CA8.
+7. On ordinary return the worker advances downstream dependents, resets fan-in
+   counter, and records completion epoch before seeking another object.
+
+B. Gate details
+296863C entry:
+  296864C LDRB object+1E0; if bit0 clear, take bypass/completion propagation path.
+  296865C LDR W8,object+1E8; if nonzero, use the same bypass path.
+  Otherwise296874C calls context.clock.vtable+0 with object+398 as clock selector.
+  2968760 loads selected clock record+8; only NONZERO proceeds toward enqueue.
+  A zero delta takes bypass/completion propagation, so paused clock can skip work.
+  There is no divide by30, threshold33333333ns, modulo-frame test, or accumulator
+  in this readiness function.
+
+For both execution and bypass paths, list object+70..+78 holds prerequisites.
+If empty, readiness is immediate. Otherwise object+1F0 is atomically incremented
+and compared to the list's 8-byte pointer count. Only the matching arrival runs
+the next part. This is dependency fan-in within a dispatch, not a time counter.
+On bypass,29686F0 calls pre-listeners2968A08, propagates vtable+68 to downstream
+object+ A8..+B0, clears+1F0, stores context+8 at object+37C, and calls post-listeners.
+On execution readiness,29687F4 tail-calls296B764.
+
+The constructor296F65C initializes flags+1E0 to0x16 and +1E8 to0; game construction
+ORs0x8. These are not final ready flags. Pending graph edits are processed by
+296B204 ->29708E8;29709F0..2970A00 clears low2bits then sets bit0. Therefore the
+clock-test path is enabled after graph reconciliation. The graph is explicitly
+wired in game construction:2AFDD00..2AFDD0C adds manager+260 as prerequisite to
+the physics manager+250 object via2970468. At2AFDEF8..2AFDF04 another constructed
+object takes physics+250 as prerequisite. These edges support the fan-in reading.
+The identities of all neighboring jobs were not resolved in this pass.
+
+29684DC final callback gate:
+  It resolves object+388 as an optional owner/reference with type checks and
+  atomic reference acquisition. If it obtains a valid owner, proceed.
+  Without that owner, it loads object+39C at2968510; NONZERO skips callback.
+  Otherwise call pre-listeners2968A08 at2968520, then vtable+70 at2968534.
+Game initializes physics+388=null and +39C=0, so defaults permit callback once
+readiness/queue dispatch arrives. The graph/readiness checks are upstream.
+
+C. Worker routing versus epoch
+296B764 constructs1<<context+C and tests object+380. An object with a nonzero
+mask must match a worker bit; mask0 is unrestricted. It picks current/eligible
+workers from scheduler+18[] and296D064 either assigns worker+5E8 immediately or
+enqueues into one of3 queue groups selected by object+378 (stride0x70).
+296D310 scans those queues and repeats the +380 eligibility test before removal.
+296D6B8 can scan other workers' queues when its local queue is empty. This is
+worker-affinity scheduling, not a repeating frame phase. Physics construction
+sets+380=1, restricting its default eligible worker to index0.
+
+Scheduler296ADC8 is called at278136C from the engine loop27812DC.
+At296AF64..296AF74 scheduler+208 is incremented by1, then copied at296AF84/296AFA8
+to each worker+5D0. Worker context begins at+5C8:
+  context+0 = clock object pointer, copied from caller at296AF88/296AFAC
+  context+8 = dispatch epoch
+  context+C = worker index (worker+5D4), used for eligibility/routing
+296D814 stores that epoch into completed object+37C. Bypass2968730 and base
+callback2970B04 do the same. No read/compare of object+37C occurs in the traced
+readiness, queue removal or execution functions. Thus completion marking alone
+is not proof of a once-per-epoch rejection guard.
+
+Engine loop27812DC obtains clock records, updates clock channels via their
+virtual+8 functions, invokes virtual+10 with argument2 at2781354, then calls
+296ADC8 once at278136C. It also waits/checks an event at278137C. This establishes
+control-flow ordering, not its real-time rate: event signaling, actual clock
+implementation and loop frequency are not fully traced here. In particular,
+neither a 30Hz nor a 120Hz scheduler rate can be inferred solely from this loop.
+
+D. Exact optional final-integrator entry-probe guards
+Function main+2F269E0, indexed length0x1154.
+Recommended guards against the local1.1.1 dump:
+  offset+0000 word0x6DB82BEB: STP D11,D10,[SP,#-0x80]!
+  offset+002C word0xAA0103FA: MOV X26,X1
+  offset+0064 word0xF9400B58: LDR X24,[X26,#0x10]
+  offset+0380 word0x6E21DC00: FMUL V0.4S,V0.4S,V1.4S
+  offset+0534 word0x54FFDE81: B.NE main+2F26AE4, motion-slot loop backedge
+Require exact function start/length in g_mod, entire span in code/readable range,
+and these words before creating an observation wrapper, just like existing
+research guards. Refuse mismatches; never treat a close match as acceptable.
+
+Equivalent clone instruction: change only+2C from0xAA0103FA to0x9100003A,
+ADD X26,X1,#0. Both write identical64-bitX26, readX1, preserve NZCV, and do not
+touch SP/memory. It lies before the first early branch. This supports the existing
+runtime JIT clone mechanism using jit_code_changed / jit_wait / dispatch wrapper.
+The equivalence follows AArch64 semantics; this equivalent instruction was not
+tested by a live patch or a dedicated JIT test. The dispatcher tests below are
+separate and leave all their guest instructions unchanged.
+Original function must still execute exactly once per probe invocation. A probe
+failure must not bypass original guest work. Do not introduce new task locks.
+
+E. Input layout and what can be counted safely
+At main+2F269E0 entry:
+  X0 threadContext (function stores it and uses+8 as world)
+  X1 solverInfo (may be stack-resident in singlethread path)
+  W2 signed starting solver-velocity slot
+  W3 signed number of slots
+  X4 optional profiling/timing object; irrelevant to motion identity
+  X30 caller return address
+
+Minimum observation, before original executes:
+  Capture caller, X0, X1 and signedW2/W3 by value.
+  If readable(context,0x10), world=gr64(context+8).
+  If readable(solverInfo,0x18), step=gr64(solverInfo+10).
+  If readable(step,0x7C), read dt atstep+10, inverse dt+18, substepdt+38,
+      substep_count+70, solver_iteration_count+78.
+  Independently check step==world+530 with overflow-safe arithmetic if logging
+      that identity; do not dereference world based only on this equality.
+  Atomically increment call count and positive-slot sum if W3>0.
+  Preserve original caller locally; call the compiled original exactly once.
+  Only count ordinary completed calls/slots if c->pc equals saved caller afterwards.
+  Avoid reading guest stack-resident solverInfo after return; log saved snapshots.
+  Use atomic counters and sparse samples; this routine can run on multiple workers.
+  Count read-validation failures separately instead of treating missing dt as0.
+
+Optional sparse context: solverInfo+50 motion-array pointer, +68 current velocity
+storage, +90 other velocity storage. Reading these requires readable(solverInfo,
+0x98). They are not necessary for initial call/range statistics.
+
+Caller return identities:
+  main+2F25FE0 / main+2F2621C = singlethread2F25870 final-stage callsites
+  main+2F27F04 = multithread range helper2F27E80
+Log unexpected callers as unknown; do not discard them or infer a simulation type.
+
+This function processes a RANGE, not one body:
+  W3<1 bypasses its motion loop (2F26A78..80).
+  W2 is sign-extended, multiplied by0x20 and offsets two velocity arrays.
+  The loop advances both records by0x20 at2F26F00/04 and compares iteration count
+  toW3 at2F26F08..14. W3 therefore represents requested solver-motion slots.
+  Each slot gets motion index=(u32)(velocityRecord+18)&0x7fffffff at2F26B70/74;
+  motionAddress=solverInfo.motionArray + index*0x80 at2F26B84.
+  The high bit is separately used as a flag. The slot index is not the motion ID.
+  Motion IDs are not guaranteed one-to-one with game actors or rigid bodies.
+  Specialized motion handling may invoke world+650 virtual+28 before joining
+  the common integration path. Counting requests is safer than claiming distinct
+  body updates. A fault/abnormal exit can prevent completion of all requested slots.
+
+Nor is this a count of all substeps: pass4 established2F265BC handles intermediate
+substeps and2F269E0 handles the final stage. Multithread partitioning can produce
+multiple final-stage range calls within one solve. Some ranges can be empty.
+Report: entered_ranges, completed_ranges, positive_requested_slots, completed
+requested_slots, world, dt, substeps, caller, and timestamps. Do not label the
+first counter physics_fps, or multiply it directly bydt to claim elapsed physics.
+
+F. Recommended next measurement
+The smallest useful new observation is the guarded2F269E0 range wrapper above,
+paired with the existing selected-world-dt observation. Compare rates over a
+stable30/60/120scene and group by world and caller. This resolves whether the
+actual final integration stage is running frequently, rather than merely storing
+StepInfo or building tasks. It still cannot prove an individual body runs4x.
+
+If grouping still leaves uncertainty, a later bounded tracked-motion sample can
+log a chosen motion ID's presence in the submitted ranges and its before/after
+position, carefully guarding arithmetic/ranges and handling ID reuse. Iterating
+every body's data or logging every invocation initially would add avoidable work
+and perturb scheduling. A frame/epoch association would require an explicit
+world-solve serial in the parent wrapper; thread-local assumptions alone are
+insufficient because the actual integration can execute on other workers.
+
+G. Isolated original-guest dispatcher checks
+The complete indexed functions296863C (0x1E4 bytes) and29684DC (0x160 bytes)
+were extracted without changing any instruction and executed by the existing
+local JIT in synthetic guest memory. PC-relative internal branches remain valid
+at their relocated fixture addresses. External2968A08 listener and296B764 enqueue
+targets plus the clock virtual0 and physics virtual70 functions are explicit
+host stubs. The stubs record arguments and return normally; they do not run real
+clock arithmetic, callback physics, queue operations, listener code or workers.
+The owner-null branch is tested, so unrelated reference/type services are unused.
+
+Matrix: active flag0/1, blocking field0/1, clock delta0/nonzero, dependency-list
+cardinality0..3, and initial fan-in counter0..3 =128 cases. Two final-dispatch
+cases cover skip+39C0/1 with no owner. Assertions cover call arguments, return/SP,
+clock query gating, enqueue/listener counts, fan-in increments/resets and+37C
+completion epoch. Downstream lists are empty. Additional two-call sequences keep
+the same epoch and establish that a repeated readiness call is not locally
+rejected solely because of the recorded completion epoch.
+
+Result captured in dispatcher-checks.txt:
+  dispatcher guest scenarios=130 checks=927 failures=0 compiled_functions=2
+The scenario counter counts matrix cases; the two repeated-call sequences are
+additional. Invalid/out-of-order fan-in values in the matrix test branch behavior,
+not a claim that those states naturally arise during normal scheduler execution.
+This confirms actual guest gate/epoch instruction behavior with synthetic state.
+It cannot prove live job cardinality, DAG uniqueness, real elapsed rate, or body
+updates; higher-level graph construction can prevent repeated notifications.
+
+Static stopping point: the complete clock implementation, actual worker timing,
+graph contents and motion activation are runtime state. No dt patch is warranted
+from these findings alone. Existing working Vulkan settings remain untouched.
+
+Artifacts
+findings.txt: this report.
+guards-fields.py/.txt: exact instruction guards and scheduler field-access scan.
+search.py: vtable mapping and component-region virtual+70 candidate scan.
+disasm.py: private disassembler, fixing pass4's negative-immediate display regex.
+Function .txt/.bin/.elf files contain local disassembly evidence used above.
+make-fixture.py, dispatcher-fixture.h/.json, dispatcher-jit.c, run-checks.ps1:
+reproducible isolated scheduler fixture with its exact stub boundaries.
+dispatcher-checks.txt: passing result captured by PowerShell (UTF-16 text).

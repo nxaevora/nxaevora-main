@@ -1,0 +1,2788 @@
+--- a/src/nx/CMakeLists.txt
++++ b/src/nx/CMakeLists.txt
+@@ -35,7 +35,7 @@
+ 
+ snx_component(core runtime/main.c runtime/arm.c runtime/loader.c runtime/rtapi.c runtime/clock.c runtime/pause.c runtime/state.c runtime/state_fns.c runtime/state_file.c runtime/crash.c runtime/options.c
+               runtime/startup.c runtime/gdbstub.c runtime/present.c runtime/guest_jit.c
+-              runtime/cheats.c)
++              runtime/cheats.c runtime/arceus_clock.c)
+ target_link_libraries(snx_core PRIVATE snx_driver snx_lz4 snx_zstd snx_build_info)
+ target_link_libraries(snx_core PUBLIC snx_settings_runtime) # the game's .ini's tables (cmake/settings.cmake)
+ if(APPLE)
+@@ -197,6 +197,13 @@
+         target_link_libraries(snx-test-shader-direct-regressions PRIVATE Threads::Threads m)
+     endif()
+     add_test(NAME shader_direct_regressions COMMAND $<TARGET_FILE:snx-test-shader-direct-regressions>)
++    add_executable(snx-test-shader-screen-fetch "${PROJECT_SOURCE_DIR}/tests/shader_screen_fetch.c")
++    snx_test_target(snx-test-shader-screen-fetch 11)
++    target_link_libraries(snx-test-shader-screen-fetch PRIVATE snx_shader)
++    if(NOT WIN32)
++        target_link_libraries(snx-test-shader-screen-fetch PRIVATE Threads::Threads m)
++    endif()
++    add_test(NAME shader_screen_fetch COMMAND $<TARGET_FILE:snx-test-shader-screen-fetch>)
+     add_test(NAME runtime_settings_list COMMAND "${CMAKE_COMMAND}" -DRUNTIME=$<TARGET_FILE:scarletnx>
+              -P "${PROJECT_SOURCE_DIR}/tests/settings_list.cmake")
+     add_test(NAME runtime_unknown_option COMMAND "${CMAKE_COMMAND}" -DRUNTIME=$<TARGET_FILE:scarletnx>
+@@ -278,3 +285,5 @@
+ if(BUILD_TESTING)
+     snx_sanitizer_path() # tests/CMakeLists.txt: this folder's tests
+ endif()
++
++include("${PROJECT_SOURCE_DIR}/world-pt/integration.cmake")
+--- a/src/nx/gpu/shader/shader.h
++++ b/src/nx/gpu/shader/shader.h
+@@ -149,6 +149,8 @@
+ /* VK_KHR_shader_maximal_reconvergence: a structured program's lanes reconverge where its constructs merge, so one
+    whose lanes must reconverge (subgroup operations, barriers, derivatives) takes structured control flow too */
+ extern int g_shader_maximal_reconvergence;
++/* Opt-in precise texel fetches proven to read F2I(FragCoord); part of the shader-cache key. */
++extern int g_shader_screen_fetch;
+ /* in clip_enable: a later stage before rasterization (tessellation or geometry) follows, and the last one applies
+    the depth mode and the clip distances */
+ #define SNX_SH_NOT_LAST (1u << 31)
+--- a/src/nx/gpu/shader/spirv_translate.c
++++ b/src/nx/gpu/shader/spirv_translate.c
+@@ -64,6 +64,8 @@
+     u32 branch_cond; /* with structured flow, the condition of the branch that ends the block, 0 for always */
+     u32 branch_target; /* and the word a BRX that ends it goes to */
+ } DirectCtx;
++#include "particle-translate.inc"
++#include "smoke-program.h"
+ 
+ int g_shader_texture_arrays;
+ int g_shader_stage_point_size;
+@@ -76,6 +78,7 @@
+ int g_shader_tessellation = 1;
+ int g_shader_clock_scopes;
+ int g_shader_maximal_reconvergence;
++int g_shader_screen_fetch;
+ 
+ /* the Function variable of a register, predicate or flag (z, s, c, o) */
+ static u32 var_of(const DirectCtx* c, u32 v) {
+@@ -985,7 +988,8 @@
+ /* Fragment fetches from a scaled render target (resolution=): texel p is at (p + 0.5) * scale, and TXQ answers the
+    size over the scale. The texture's bit is in the push constants' uvec4, x for slots 0-31, y for 32-63 */
+ _Static_assert(SH_MAXTEX <= 64, "the scaled textures' mask has a bit a slot");
+-static void scaled_coords(DirectCtx* c, u32 push, int slot, int size, u32 i32_type, u32* x, u32* y) {
++static void scaled_coords(DirectCtx* c, u32 push, int slot, int size, u32 i32_type, u32* x, u32* y,
++                          u32 screen_position, u32 position_type, int screen_multiplier) {
+     u32 one = spv_emit_constant_u32(&c->emit, c->u32_type, 1);
+     u32 bits = spv_emit_push_component_f32(&c->emit, spv_emit_type_pointer(&c->emit, 9, c->u32_type), push, one,
+                                            slot >= 32 ? one : c->zero, c->u32_type); /* PushConstant */
+@@ -1001,6 +1005,7 @@
+                              spv_emit_constant_f32(&c->emit, c->f32_type, 1.0f));
+     u32 half = spv_emit_constant_f32(&c->emit, c->f32_type, 0.5f);
+     u32* v[2] = {x, y};
++    u32 position = screen_position ? spv_emit_load(&c->emit, position_type, screen_position) : 0;
+     for (int k = 0; k < 2; k++) {
+         u32 f = size ? spv_emit_convert_u_to_f(&c->emit, c->f32_type, *v[k])
+                      : spv_emit_fadd(&c->emit, c->f32_type, spv_emit_convert_s_to_f(&c->emit, c->f32_type, *v[k]), half);
+@@ -1014,6 +1019,24 @@
+         } else /* floored: below 0 stays outside */
+             *v[k] = spv_emit_convert_f_to_s(&c->emit, i32_type,
+                                             spv_emit_glsl_unary(&c->emit, c->f32_type, c->glsl, SPV_GLSL_FLOOR, f));
++        if (position && !size) {
++            /* Proven F2I(FragCoord) reads the current screen texel. Scaling its
++               already-rounded guest coordinate duplicates/skips higher-resolution
++               samples. For a scaled image, use the actual framebuffer pixel;
++               unscaled textures retain the game's integer coordinate. */
++            u32 coord = spv_emit_vec4_extract(&c->emit, c->f32_type, position, (u32)k);
++            if (screen_multiplier == 2) {
++                /* A proven 2*FragCoord fetch selects a full-resolution texel
++                   from a half-resolution pass before integer quantization. */
++                coord = spv_emit_fmul(&c->emit, c->f32_type, coord,
++                    spv_emit_constant_f32(&c->emit, c->f32_type, 2.0f));
++                spv_emit_no_contraction(&c->emit, coord);
++            }
++            coord = spv_emit_glsl_unary(&c->emit, c->f32_type, c->glsl, SPV_GLSL_FLOOR, coord);
++            u32 exact = spv_emit_convert_f_to_s(&c->emit, i32_type, coord);
++            *v[k] = spv_emit_select(&c->emit, i32_type,
++                spv_emit_i_not_equal(&c->emit, c->bool_type, bit, c->zero), exact, *v[k]);
++        }
+     }
+ }
+ 
+@@ -1656,8 +1679,8 @@
+             if (!op) return -1;
+             switch (op->id) {
+                 /* Lanes that do not take a conditional exit keep their register definitions. */
+-                case O_EXIT: fall = !flow_always(insn[k]); break;
+-                case O_KIL:
++                case O_EXIT:
++                case O_KIL: fall = !flow_always(insn[k]); break;
+                 case O_RET:
+                 case O_PRET:
+                 case O_PEXIT: fall = 0; break;
+@@ -1914,6 +1937,42 @@
+ 
+ static int direct_reaching_def(const u64* insn, u32 n, u32 index, u32 reg) {
+     return direct_reaching_def_same(insn, n, index, reg, NULL, 0);
++}
++
++/* Conservative proof of a current-screen-pixel fetch. Follow MOV and the
++   existing dominating-definition analysis; do not infer screen space from a
++   coincidental coordinate value. Offsets, arbitrary UV arithmetic, modified
++   coordinates, other rounding modes and ambiguous reaching definitions keep
++   the original resolution-scale behavior. */
++static int direct_screen_axis(const u64* insn, u32 n, u32 index, u32 reg, u32 axis, int integer, int depth) {
++    int j = depth > 8 ? -1 : direct_reaching_def(insn, n, index, reg);
++    if (j < 0) return 0;
++    u64 w = insn[j];
++    int op = decode(w)->id;
++    if (op == O_MOV_R) {
++        /* Match the emitter: other masks do not assign this register. */
++        if (B(w, 39, 4) != 1 && B(w, 39, 4) != 15) return 0;
++        return direct_screen_axis(insn, n, (u32)j, B(w, 20, 8), axis, integer, depth + 1);
++    }
++    if (integer) {
++        if (op != O_F2I_R || B(w, 8, 2) != 2 || B(w, 10, 2) != 2 || B(w, 49, 1) || B(w, 45, 1) ||
++            (B(w, 39, 2) != 1 && B(w, 39, 2) != 3)) return 0;
++        return direct_screen_axis(insn, n, (u32)j, B(w, 20, 8), axis, 0, depth + 1);
++    }
++    /* Exact shipped FMUL.FTZ Rdest,Rsource,2 encoding, with only the two
++       register fields variable. Reject modifiers, predication, other factors,
++       post-F2I arithmetic, and repeated multiplication. */
++    if (op == O_FMUL_I && (w & ~0xffffull) == 0x3868104000070000ull)
++        return direct_screen_axis(insn, n, (u32)j, B(w, 8, 8), axis, 0, depth + 1) == 1 ? 2 : 0;
++    return op == O_IPA && !B(w, 38, 1) && !B(w, 51, 1) && B(w, 54, 2) != 1 &&
++           B(w, 30, 8) * 4 == 0x70 + 4 * axis;
++}
++
++static int direct_screen_fetch(const u64* insn, u32 n, u32 index, u32 x, u32 y) {
++    if (!g_shader_screen_fetch) return 0;
++    int xm = direct_screen_axis(insn, n, index, x, 0, 1, 0);
++    int ym = direct_screen_axis(insn, n, index, y, 1, 1, 0);
++    return xm == ym ? xm : 0;
+ }
+ 
+ static int direct_track_const(const u64* insn, u32 n, u32 index, u32 reg, u32* value, int depth) {
+@@ -3410,7 +3469,7 @@
+         if (!si->cs_local[0] || !si->cs_local[1] || !si->cs_local[2]) return direct_reject(si, "compute local size");
+     }
+     u32 len;
+-    shader_hash(code, max_bytes, &len);
++    u64 materialHash=shader_hash(code,max_bytes,&len); bool worldSmoke=world_smoke_program(materialHash) && stage==ST_FS;
+     u32 n = len / 8;
+     u32 sph[20];
+     for (u32 i = 0; i < 20; i++) sph[i] = snx_ld_le32(code + i * 4);
+@@ -3438,7 +3497,7 @@
+     ShTex textures[SH_MAXTEX] = {0};
+     int texture_count = 0;
+     ShaderInfo image_info = {0};
+-    int needs_fragcoord = 0;
++    int needs_fragcoord = worldSmoke;
+     int needs_frontface = 0;
+     int needs_point_coord = 0, needs_sample_id = 0, needs_coverage = 0;
+     int needs_demote = 0;
+@@ -4976,6 +5035,18 @@
+             spv_emit_uniform_vec4_array(&c->emit, vec4_u32, c->u32_type, c->u32_type, shader_vk_set(stage),
+                                         SNX_VKB_TEXMAP, SH_INDEXED_TABLES * SNX_TEX_ARRAY / 4, &c->tex_map_pointer);
+         interfaces[count++] = c->tex_map_buffer;
++    }
++    u32 smokeSampler=0,smokeType=0,smokeWitness=0,smokePointer=0;
++    if(worldSmoke && texture_count<SH_MAXTEX){
++        smokeSampler=spv_emit_sampler_image(&c->emit,c->f32_type,shader_vk_set(stage),SNX_VKB_TEX+SH_MAXTEX-1,2,0,0,0,&smokeType);
++        interfaces[count++]=smokeSampler;
++#ifdef PARTICLE_WITNESS
++        u32 array=spv_emit_type_runtime_array(&c->emit,c->u32_type,4);
++        u32 structure=spv_emit_type_struct_one(&c->emit,array);
++        smokePointer=spv_emit_type_storage_pointer(&c->emit,c->u32_type);
++        smokeWitness=spv_emit_storage_buffer(&c->emit,structure,shader_vk_set(stage),SNX_VKB_SSBO+15);
++        interfaces[count++]=smokeWitness;
++#endif
+     }
+     u32 texture_scalar[SH_MAXTEX], texture_vec4[SH_MAXTEX];
+     for (int i = 0; i < texture_count; i++) {
+@@ -7733,7 +7804,12 @@
+                                                                      four));
+             }
+             if (type == 0 && !array) texel_row_coord(c, i32_type, &x, &y);
+-            if (type == 1 && needs_texel_scale) scaled_coords(c, push, slot, 0, i32_type, &x, &y);
++            if (type == 1 && needs_texel_scale) {
++                int screen_multiplier = fragcoord && packed_reg == 255 ?
++                    direct_screen_fetch(insn, n, i, a + array, a + array + 1) : 0;
++                u32 position = screen_multiplier ? fragcoord : 0;
++                scaled_coords(c, push, slot, 0, i32_type, &x, &y, position, vec4, screen_multiplier);
++            }
+             u32 coord = z ? spv_emit_vec3_construct(&c->emit, vec3_i32, x, y, z)
+                           : spv_emit_vec2_construct(&c->emit, vec2_i32, x, y);
+             u32 sample =
+@@ -7856,7 +7932,15 @@
+                 y = spv_emit_iadd_u32(&c->emit, i32_type, y, oy);
+             }
+             if (type == 0) texel_row_coord(c, i32_type, &x, &y);
+-            if (type == 1 && needs_texel_scale) scaled_coords(c, push, slot, 0, i32_type, &x, &y);
++            if (type == 1 && needs_texel_scale) {
++                u32 xr = array ? b : a;
++                u32 yr = array ? b + 1 : encoding == 4 || encoding == 5 || encoding == 6 ||
++                         encoding == 7 || encoding == 12 ? a + 1 : b;
++                int screen_multiplier = fragcoord && encoding != 4 && encoding != 12 ?
++                    direct_screen_fetch(insn, n, i, xr, yr) : 0;
++                u32 position = screen_multiplier ? fragcoord : 0;
++                scaled_coords(c, push, slot, 0, i32_type, &x, &y, position, vec4, screen_multiplier);
++            }
+             u32 coord = type == 2 ? spv_emit_vec3_construct(&c->emit, vec3_i32, x, y,
+                                                             reg_read_as(c, b, i32_type))
+                         : array   ? spv_emit_vec3_construct(
+@@ -8121,7 +8205,7 @@
+                 third ? spv_emit_vec4_extract(&c->emit, c->u32_type, dimensions, 2)
+                       : spv_emit_constant_u32(&c->emit, c->u32_type, 1),
+                 spv_emit_image_query_levels(&c->emit, c->u32_type, c->sampled_type[slot], c->sampler[slot])};
+-            if (qtype == 1 && needs_texel_scale) scaled_coords(c, push, slot, 1, i32_type, &values[0], &values[1]);
++            if (qtype == 1 && needs_texel_scale) scaled_coords(c, push, slot, 1, i32_type, &values[0], &values[1], 0, 0, 0);
+             u32 dst = d;
+             for (u32 k = 0; k < 4; k++)
+                 if (B(w, 31 + k, 1)) {
+@@ -8364,6 +8448,7 @@
+                                                            : zero_f;
+                         if (rt == 0 && k == 3) alpha = spv_emit_bitcast(&c->emit, c->f32_type, raw);
+                     }
++                    if(rt==0 && !integer && smokeSampler)particle_modulate(c,components,vec4,vec3,fragcoord,smokeSampler,smokeType,smokeWitness,smokePointer,materialHash==0x202b8339af5ac97cull?3:0);
+                     u32 color = spv_emit_vec4_construct(&c->emit, color_type, components);
+                     spv_emit_store(&c->emit, outputs[output++], color);
+                 }
+--- a/src/nx/gpu/vk/device.c
++++ b/src/nx/gpu/vk/device.c
+@@ -13,6 +13,41 @@
+ #include "common/gpu/vk/swapchain.h"
+ #include "common/gpu/vk/vk_common.h"
+ 
++#include "vk_dlaa.h"
++extern int arceus_contact_supported;
++int arceus_contact_supported;
++extern u32 arceus_texture_slots;
++u32 arceus_texture_slots;
++extern int arceus_checkpoints;
++int arceus_checkpoints;
++static int world_fault_enabled;
++static void world_fault(void){
++    static int reported;
++    if(__atomic_exchange_n(&reported,1,__ATOMIC_RELAXED))return;
++    if(world_fault_enabled && vkGetDeviceFaultInfoEXT){
++        VkDeviceFaultCountsEXT counts={.sType=VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
++        if(vkGetDeviceFaultInfoEXT(g_vk.dev,&counts,NULL)==VK_SUCCESS){
++            VkDeviceFaultAddressInfoEXT addresses[32];
++            VkDeviceFaultVendorInfoEXT vendors[8];
++            if(counts.addressInfoCount>32)counts.addressInfoCount=32;
++            if(counts.vendorInfoCount>8)counts.vendorInfoCount=8;
++            counts.vendorBinarySize=0;
++            VkDeviceFaultInfoEXT info={.sType=VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT,.pAddressInfos=addresses,.pVendorInfos=vendors};
++            VkResult r=vkGetDeviceFaultInfoEXT(g_vk.dev,&counts,&info);
++            if(r==VK_SUCCESS || r==VK_INCOMPLETE){
++                WARN("world-pt: device fault %s addresses=%u vendors=%u\n",info.description,counts.addressInfoCount,counts.vendorInfoCount);
++                for(u32 i=0;i<counts.addressInfoCount && i<32;i++)WARN("world-pt: device fault address %llx type=%d\n",(unsigned long long)addresses[i].reportedAddress,addresses[i].addressType);
++                for(u32 i=0;i<counts.vendorInfoCount && i<8;i++)WARN("world-pt: device fault detail %s\n",vendors[i].description);
++            }
++        }
++    }
++    if(arceus_checkpoints && vkGetQueueCheckpointDataNV){
++        VkCheckpointDataNV points[16];u32 n=16;
++        for(u32 i=0;i<16;i++)points[i]=(VkCheckpointDataNV){.sType=VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV};
++        vkGetQueueCheckpointDataNV(g_vk.gfx,&n,points);
++        for(u32 i=0;i<n && i<16;i++)WARN("world-pt: last queue checkpoint stage=%x marker=%llu\n",points[i].stage,(unsigned long long)(uintptr_t)points[i].pCheckpointMarker);
++    }
++}
+ int g_vk_preserve_infnan;
+ int g_vk_preserve_infnan64;
+ int g_vk_flush_denorm;
+@@ -53,6 +88,7 @@
+ 
+ int vk_ok_(VkResult r, const char* what, const char* file, int line) {
+     if (r >= 0) return 1;
++    if(r==VK_ERROR_DEVICE_LOST)world_fault();
+     WARN("vulkan: %s failed: %s (%d) at %s:%d\n", what, snx_vk_result_str(r), (int)r, file, line);
+     return 0;
+ }
+@@ -85,14 +121,21 @@
+ static int create_instance(void) {
+     u32 nbe = 0;
+     const char* const* be = g_opt_headless ? NULL : backend_vk_extensions(&nbe);
++    u32 extension_count=be?nbe:0,capacity=extension_count+32;
++    const char **extensions=calloc(capacity,sizeof *extensions);
++    if(!extensions)return 0;
++    if(extension_count)memcpy(extensions,be,extension_count*sizeof *extensions);
++    vk_dlaa_instance_exts(extensions,&extension_count,capacity);
+     SnxVkInstanceInfo info = {.app_name = "ScarletNX",
+-                              .extensions = be,
+-                              .extension_count = be ? nbe : 0,
++                              .extensions = extensions,
++                              .extension_count = extension_count,
+                               .validation = g_settings.vulkan_validation_layer != 0,
+                               .portability = true,
+                               .debug = debug_cb};
+     SnxVkInstance made;
+-    if (!VK_OK(snx_vk_instance_create(&info, &made))) return 0;
++    VkResult instance_result=snx_vk_instance_create(&info,&made);
++    free(extensions);
++    if(!VK_OK(instance_result))return 0;
+     if (info.validation && !made.validation)
+         WARN("vulkan: validation was asked for (vk_validation), but "
+              "VK_LAYER_KHRONOS_validation is not installed\n");
+@@ -271,7 +314,7 @@
+     g_shader_tessellation = want->tessellationShader != 0;
+     const char** ext = g_vk.dev_ext;
+     int has_pipeline_robustness = 0, has_robustness2 = 0;
+-    int has_budget = 0;
++    int has_budget = 0, has_compute_derivatives = 0;
+     u32 next = 0;
+     int has_shader_clock = 0, has_feedback_dynamic = 0, has_cond = 0, has_provoking = 0, video_exts = 0;
+     int has_portability = 0, has_reconvergence = 0;
+@@ -280,6 +323,7 @@
+     {
+         SnxVkExtensions e;
+         snx_vk_device_extensions(g_vk.phys, &e);
++        has_compute_derivatives=snx_vk_extensions_has(&e,VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME);
+         g_vk.has_divisor = snx_vk_extensions_has(&e, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
+         g_vk.has_xfb = snx_vk_extensions_has(&e, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
+         g_vk.has_border_color = snx_vk_extensions_has(&e, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+@@ -431,6 +475,16 @@
+                                             /* KIL demotes the lane; S2R queries its helper status */
+                                             .shaderDemoteToHelperInvocation = VK_TRUE};
+     void* chain = &f13;
++    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives={
++        .sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
++    if(has_compute_derivatives && !vk_dlaa_wanted()){
++        VkPhysicalDeviceFeatures2 query={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,.pNext=&derivatives};
++        vkGetPhysicalDeviceFeatures2(g_vk.phys,&query);
++        if(derivatives.computeDerivativeGroupLinear || derivatives.computeDerivativeGroupQuads){
++            ext[next++]=VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME;
++            derivatives.pNext=chain;chain=&derivatives;
++        }
++    }
+     if (g_vk.has_divisor) {
+         fdiv = (VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT){
+             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
+@@ -533,6 +587,62 @@
+                                               .queueFamilyIndex = g_vk.video_family,
+                                               .queueCount = 1,
+                                               .pQueuePriorities = prio};
++    if(vk_dlaa_wanted()){SnxVkExtensions e={0}; if(snx_vk_device_extensions(g_vk.phys,&e)){vk_dlaa_device_exts(e.list,e.count,ext,&next,sizeof g_vk.dev_ext/sizeof *ext);snx_vk_extensions_free(&e);}}
++    const char *contact_exts[]={VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,VK_KHR_RAY_QUERY_EXTENSION_NAME,VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME};
++    VkPhysicalDeviceRayQueryFeaturesKHR rq={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
++    VkPhysicalDeviceAccelerationStructureFeaturesKHR accel={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,.pNext=&rq};
++    VkPhysicalDeviceFeatures2 probe={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,.pNext=&accel};
++    SnxVkExtensions available={0};
++#include "world-limits.h"
++    const VkPhysicalDeviceLimits *limits=&pp2.properties.limits;
++    // Fixed scene inputs use nine sampled descriptors and three storage images.
++    const u32 budgets[]={limits->maxPerStageDescriptorSamplers,limits->maxDescriptorSetSamplers,
++        limits->maxPerStageDescriptorSampledImages,limits->maxDescriptorSetSampledImages,
++        limits->maxPerStageResources>3?limits->maxPerStageResources-3:0};
++    arceus_texture_slots=WORLD_TEXTURE_SLOTS;
++    for(unsigned i=0;i<sizeof budgets/sizeof *budgets;i++){
++        u32 room=budgets[i]>9?budgets[i]-9:0;
++        if(room<arceus_texture_slots)arceus_texture_slots=room;
++    }
++    const char *slotLimit=getenv("ARCEUS_PT_TEXTURE_LIMIT");
++    unsigned long cap=slotLimit?strtoul(slotLimit,NULL,10):0;
++    if(cap>=2 && cap<arceus_texture_slots)arceus_texture_slots=(u32)cap;
++    int supported=q12.bufferDeviceAddress && q12.shaderSampledImageArrayNonUniformIndexing &&
++        arceus_texture_slots>=2 && snx_vk_device_extensions(g_vk.phys,&available);
++    for(unsigned i=0;i<3 && supported;i++)supported=snx_vk_extensions_has(&available,contact_exts[i]);
++    snx_vk_extensions_free(&available);
++    if(supported && next+3<=sizeof g_vk.dev_ext/sizeof *ext){
++        vkGetPhysicalDeviceFeatures2(g_vk.phys,&probe);
++        if(accel.accelerationStructure && rq.rayQuery){
++            for(unsigned i=0;i<3;i++){
++                unsigned j=0;while(j<next && strcmp(ext[j],contact_exts[i]))++j;
++                if(j==next)ext[next++]=contact_exts[i];
++            }
++            f12.bufferDeviceAddress=VK_TRUE;
++            rq.pNext=chain;
++            accel=(VkPhysicalDeviceAccelerationStructureFeaturesKHR){.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,.pNext=&rq,.accelerationStructure=VK_TRUE};
++            chain=&accel;
++            arceus_contact_supported=1;
++        }
++    }
++    LOG("arceus-rt: Vulkan ray queries %s\n",arceus_contact_supported?"enabled":"unavailable");
++    if(arceus_contact_supported)LOG("arceus-rt: %u material texture slots\n",arceus_texture_slots);
++    VkPhysicalDeviceFaultFeaturesEXT fault={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
++    if(getenv("ARCEUS_RT_DIAGNOSTICS")){
++        SnxVkExtensions extensions={0};
++        if(snx_vk_device_extensions(g_vk.phys,&extensions)){
++            if(next<sizeof g_vk.dev_ext/sizeof *ext && snx_vk_extensions_has(&extensions,VK_EXT_DEVICE_FAULT_EXTENSION_NAME)){
++                VkPhysicalDeviceFeatures2 features={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,.pNext=&fault};
++                vkGetPhysicalDeviceFeatures2(g_vk.phys,&features);
++                if(fault.deviceFault){fault.deviceFaultVendorBinary=VK_FALSE;fault.pNext=chain;chain=&fault;world_fault_enabled=1;ext[next++]=VK_EXT_DEVICE_FAULT_EXTENSION_NAME;}
++            }
++            if(next<sizeof g_vk.dev_ext/sizeof *ext && snx_vk_extensions_has(&extensions,VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)){
++                ext[next++]=VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME;arceus_checkpoints=1;
++            }
++            snx_vk_extensions_free(&extensions);
++        }
++        LOG("world-pt: driver fault reporting=%d checkpoints=%d\n",world_fault_enabled,arceus_checkpoints);
++    }
+     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+                               .pNext = chain,
+                               .queueCreateInfoCount = nq,
+@@ -782,3 +892,4 @@
+     if (!create_device()) return 0;
+     return g_opt_headless ? 1 : vk_swapchain_create(0);
+ }
++
+--- a/src/nx/gpu/vk/pipeline.c
++++ b/src/nx/gpu/vk/pipeline.c
+@@ -8,6 +8,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include "world-pt-cache.h"
+ #include "nx/runtime/main.h"
+ #include "nx/runtime/options.h"
+ #include "nx/gpu/gpu.h"
+@@ -255,6 +256,9 @@
+ }
+ 
+ void vk_pipeline_init(void) {
++    const char* screen_fetch = getenv("SNX_ARCEUS_SCREEN_FETCH");
++    g_shader_screen_fetch = screen_fetch && !strcmp(screen_fetch, "1");
++    if (g_shader_screen_fetch) LOG("vulkan: precise current-screen-pixel texture fetch candidate enabled\n");
+     pm_lock_announce(&g_playout_lock, "pipeline layout");
+     pm_lock_announce(&g_xlate_lock, "shader translate");
+     /* a layout per set, the same bindings, each visible to the stage that uses the set (shader_vk_set): within the
+@@ -328,7 +332,7 @@
+     }
+     g_vk_playout = vk_playout(0);
+     if (!g_vk_playout) fatal("vulkan: cannot create shader pipeline layout");
+-    snprintf(g_cache_dir, sizeof g_cache_dir, "%sshader_cache", g_cachedir);
++    snprintf(g_cache_dir, sizeof g_cache_dir, "%sshader_cache_world_pt_" WORLD_PT_CACHE_ID, g_cachedir);
+     plat_mkdir(g_cache_dir);
+     snprintf(g_pcache_path, sizeof g_pcache_path, "%s/vk_pipelines.bin", g_cache_dir);
+     snx_path_native(g_pcache_path);
+@@ -428,6 +432,10 @@
+    translation read through read in s->cbr. NULL when it can't be (si.first_unsupported says why). shipped: a program
+    the game ships, translated before any draw (ship_make), which fails when its translation read a constant buffer: a
+    draw's lookup checks those reads against its own buffers, which no read without them matches */
++#include "smoke-program.h"
++#include "dual-source.inc"
++#include "reflection-program.h"
++#include "reflect-module.inc"
+ static u32* sh_spirv(VkSh* s, const u8* code, u64 h, int stage, const u32 mask[20], u32 len, u64 qh, u32 len_a,
+                      u64 qh_a, const ShXfb* xfb, VkCbReader read, int shipped, size_t* nw) {
+     s->shipped = shipped;
+@@ -443,6 +451,14 @@
+     SNX_ZONE(z_translate, "shader translate");
+     SNX_ZONE_TEXT(z_translate, "%s hash %08x", stage < 6 ? vk_tracy_stage[stage] : "stage?", (unsigned)h);
+     u32* spv = vk_translate_spirv(code, SH_CODE, stage, &s->si, nw, read, &s->cbr);
++    if(spv && stage==ST_FS && mask[6]==1 && !blend_source_module(&spv,nw)){
++        free(spv);spv=NULL;
++        snprintf(s->si.first_unsupported,sizeof s->si.first_unsupported,"secondary blend color interface");
++    }
++    if(spv && stage==ST_FS && world_smoke_program(h)){
++        const char *dump=getenv(h==0x202b8339af5ac97cull?"ARCEUS_QA_VILLAGE_SMOKE_SPV":"ARCEUS_QA_PARTICLE_SPV");
++        if(dump){FILE *file=fopen(dump,"wb");if(file){fwrite(spv,4,*nw,file);fclose(file);}}
++    }
+     SNX_ZONE_VALUE(z_translate, *nw);
+     SNX_ZONE_END(z_translate);
+     for (int i = 0; i < s->si.ntex; i++) s->indexed |= (s->si.tex[i].flags & SNX_TEX_INDEXED) != 0;
+@@ -480,9 +496,7 @@
+     u32* spv = sh_spirv(s, code, h, stage, mask, len, qh, len_a, qh_a, xfb, read, 0, &nw);
+     SNX_ZONE_END(z);
+     if (spv) {
+-        VkShaderModuleCreateInfo mi = {
+-            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = nw * 4, .pCode = spv};
+-        if (!VK_OK(vkCreateShaderModule(g_vk.dev, &mi, NULL, &s->mod))) {
++        if(!(s->mod=make_reflection_module(s,spv,nw))){
+             s->failed = 1;
+             snprintf(s->si.first_unsupported, sizeof s->si.first_unsupported, "vkCreateShaderModule failed");
+         } else
+@@ -586,7 +600,7 @@
+             q->qh == qh && q->clen_a == len_a && q->qh_a == qh_a && vk_cb_reads_hold(&q->cbr, sh_cb_read))
+             s = q;
+     if (s && s->shipped == 1) pf_ship_found(s);
+-    if (!s && (s = pf_ship_take(h, stage, mask, len, qh, len_a, qh_a)) != NULL) {
++    if (!s && !(world_smoke_program(h) && stage==ST_FS) && (s = pf_ship_take(h, stage, mask, len, qh, len_a, qh_a)) != NULL) {
+         s->next = g_shh[h & 1023];
+         g_shh[h & 1023] = s;
+     }
+@@ -1308,6 +1322,7 @@
+    NULL when it can't be */
+ static VkSh* sh_from_record(const PfShader* r, const u32* cbr, const u32* spv) {
+     VkSh* s;
++    if(world_smoke_program(r->hash) && r->stage==ST_FS)return NULL;
+     if (r->si.ntex < 0 || r->si.ntex > SH_MAXTEX || vk_spirv_unavailable(spv, r->nspv)) return NULL;
+     s = calloc(1, sizeof *s);
+     if (!s) return NULL;
+@@ -1330,7 +1345,7 @@
+     s->clen_a = r->clen_a;
+     s->qh_a = r->qh_a;
+     for (int i = 0; i < s->si.ntex; i++) s->indexed |= (s->si.tex[i].flags & SNX_TEX_INDEXED) != 0;
+-    s->mod = vk_module_spv(spv, r->nspv);
++    s->mod = make_reflection_module(s,spv,r->nspv);
+     if (!s->mod) {
+         free(s->cbr.r);
+         free(s);
+@@ -1375,7 +1390,7 @@
+     spv = sh_spirv(s, window, r->hash, (int)r->stage, r->mask, r->clen, r->qh, r->clen_a, r->qh_a, xfb, replay_read, 0,
+                    &nw);
+     g_replay = NULL;
+-    if (!spv || vk_spirv_unavailable(spv, nw) || !(s->mod = vk_module_spv(spv, nw))) goto fail;
++    if (!spv || vk_spirv_unavailable(spv, nw) || !(s->mod = make_reflection_module(s,spv,nw))) goto fail;
+     pf_shader_into(&g_pf.file, s, mod_bits(s->mod), spv, nw, window, r->ncode, xfb);
+     free(spv);
+     free(window);
+@@ -1428,6 +1443,11 @@
+     p->k.tes = mod_handle(m[2]);
+     p->k.gs = mod_handle(m[3]);
+     p->k.fs = mod_handle(m[4]);
++    if(p->k.alpha_to_coverage){
++        const VkSh *frag=g_pf.sh;
++        while(frag && frag->mod!=p->k.fs)frag=frag->next;
++        if(!frag || !(frag->si.sph[18]&8))p->k.alpha_to_coverage=0;
++    }
+     if (((const PfLoad*)ctx)->rebuild && !pf_key_holds(&p->k)) {
+         free(p);
+         return;
+@@ -1510,9 +1530,9 @@
+                      (unsigned)sizeof(PfSource), (unsigned)sizeof(PfPipe), (unsigned)sizeof(ShXfb));
+     *guest = g > 0 && (size_t)g < n ? (size_t)g : 0;
+     if (*guest)
+-        snprintf(out + *guest, n - *guest, " %s%s driver=%u api=%u uuid=%s ftz=%d quad=%d sizes=%u,%u vertex_bounds=%d",
++        snprintf(out + *guest, n - *guest, " %s%s driver=%u api=%u uuid=%s ftz=%d quad=%d sizes=%u,%u vertex_bounds=%d screen_fetch=%d direct_flow=3",
+                  snx_build_info(), exe, d->driverVersion, d->apiVersion, uuid, g_vk_ftz, g_shader_quad,
+-                 (unsigned)sizeof(ShaderInfo), (unsigned)sizeof(PfShader), g_vk.has_vertex_robustness2);
++                 (unsigned)sizeof(ShaderInfo), (unsigned)sizeof(PfShader), g_vk.has_vertex_robustness2, g_shader_screen_fetch);
+ }
+ 
+ /* ---- the shaders of the programs the game ships (gpu/shipped_pass.c finds them), translated before a draw asks */
+--- a/src/nx/gpu/vk/query.c
++++ b/src/nx/gpu/vk/query.c
+@@ -44,7 +44,7 @@
+ static u64* g_qres;   /* segment s's count at s % QN, once its copy has run */
+ static int g_qfailed; /* the pool couldn't be made: reports keep the made-up value */
+ /* each slot's segment: its counter (1 + its index in g_qc, 0 none) and its guest sample count */
+-static u8 g_qown[QN], g_qmul[QN];
++static u8 g_qown[QN], g_qmul[QN], up_display[QN];
+ static struct {
+     u64 next;   /* segments begun */
+     u64 copied; /* segments whose results have their copy recorded */
+@@ -160,18 +160,18 @@
+             c->sum = 0;
+         }
+         for (u64 s = c->sum_end; s < upto; s++)
+-            if (g_qown[s % QN] == i + 1) c->sum += snx_le64(g_qres[s % QN]) * g_qmul[s % QN];
++            if (g_qown[s % QN] == i + 1) c->sum += (up_display[s % QN] ? (snx_le64(g_qres[s % QN])*g_qmul[s % QN]+2)/4 : snx_le64(g_qres[s % QN])*g_qmul[s % QN]);
+         if (upto > c->sum_end) c->sum_end = upto;
+         c->reported = c->sum_end;
+     }
+ }
+ void vk_query_draw(VkCommandBuffer cb, u32 chan, u32 msaa_mode) {
+     QCounter* c = counter(chan, 0);
+-    u32 mul = msaa_samples(msaa_mode);
++    u32 mul = msaa_samples(msaa_mode&0x7fffffffu);
+     int own = c ? (int)(c - g_qc) + 1 : 0;
+     if (g_q.open) {
+         u32 at = (u32)((g_q.next - 1) % QN);
+-        if (g_qown[at] == own && g_qmul[at] == mul) return; /* the segment open now counts this draw too */
++        if (g_qown[at] == own && g_qmul[at] == mul && up_display[at]==(msaa_mode>>31)) return; /* the segment open now counts this draw too */
+         vk_query_pass_end(cb);
+     }
+     if (!c || !c->started || c->disabled || c->bad) return;
+@@ -184,7 +184,7 @@
+     }
+     u32 at = (u32)(g_q.next % QN);
+     g_qown[at] = (u8)own;
+-    g_qmul[at] = (u8)mul;
++    g_qmul[at] = (u8)mul; up_display[at]=msaa_mode>>31;
+     rec_CmdBeginQuery(cb, g_qpool, at, g_vk.feat.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+     g_q.next++;
+     g_q.open = 1;
+@@ -262,10 +262,10 @@
+         c->sum = 0;
+     }
+     for (u64 s = c->sum_end; s < end; s++)
+-        if (g_qown[s % QN] == ci % QCH + 1) c->sum += snx_le64(g_qres[s % QN]) * g_qmul[s % QN]; /* the device's */
++        if (g_qown[s % QN] == ci % QCH + 1) c->sum += (up_display[s % QN] ? (snx_le64(g_qres[s % QN])*g_qmul[s % QN]+2)/4 : snx_le64(g_qres[s % QN])*g_qmul[s % QN]); /* the device's */
+     if (end > c->sum_end) c->sum_end = end;
+     if (c->whead != c->wtail) c->wtail++;
+-    double area = (double)g_vk_scale * (double)g_vk_scale;
++    double area=1.0;
+     u64 v = area == 1.0 ? c->sum : (u64)((double)c->sum / area + 0.5);
+     return c->sum && !v ? 1 : v;
+ }
+--- a/src/nx/gpu/vk/record.c
++++ b/src/nx/gpu/vk/record.c
+@@ -11,6 +11,7 @@
+    else has to happen after the queued commands are recorded and submitted waits for the ring to drain
+    (vk_rec_sync): a new command buffer from the frame's pool, a device wait. Waits on the graphics timeline need
+    none, as a timeline value can be waited for before its submission. */
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include "common/utilities/common.h"
+@@ -235,6 +236,27 @@
+     u32 idx;
+ } Present;
+ static VkResult g_present_result; /* atomic: the last present's result that wasn't VK_SUCCESS, until it is taken */
++/* Optional CPU timestamps around the real Vulkan present call, not a displayed-frame counter.
++   PresentMon supplies display completion and dropped-frame evidence. Calls are serialized by the recording
++   thread, or by vk_lock with recording disabled. Buffering avoids a disk flush on every frame. */
++static FILE* present_trace(void) {
++    static int initialized;
++    static FILE* file;
++    if (!initialized) {
++        const char* path = getenv("SNX_PRESENT_TRACE");
++        initialized = 1;
++        if (path && *path) {
++            file = fopen(path, "wx");
++            if (file) {
++                setvbuf(file, NULL, _IOFBF, 65536);
++                fputs("begin_ns,end_ns,swapchain,image,result\n", file);
++            } else {
++                WARN("present trace: cannot create %s (use a new filename)\n", path);
++            }
++        }
++    }
++    return file;
++}
+ static VkResult present_run(const Present* x) {
+     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                            .waitSemaphoreCount = 1,
+@@ -243,7 +265,15 @@
+                            .pSwapchains = &x->sc,
+                            .pImageIndices = &x->idx};
+     SNX_ZONE(z_queue_present, "vkQueuePresentKHR");
+-    return vkQueuePresentKHR(g_vk.gfx, &pi);
++    FILE* trace = present_trace();
++    u64 begin = trace ? plat_ns() : 0;
++    VkResult result = vkQueuePresentKHR(g_vk.gfx, &pi);
++    u64 end = trace ? plat_ns() : 0;
++    if (trace && fprintf(trace, "%llu,%llu,%llu,%u,%d\n", (unsigned long long)begin,
++                         (unsigned long long)end, (unsigned long long)(uintptr_t)x->sc, x->idx, (int)result) < 0) {
++        WARN_LIMIT(1, "present trace: write failed\n");
++    }
++    return result;
+ }
+ static void present_queued(const void* p) {
+     VkResult r = present_run(p);
+--- a/src/nx/gpu/vk/render.c
++++ b/src/nx/gpu/vk/render.c
+@@ -1,3 +1,4 @@
++#include <math.h>
+ /* SPDX-License-Identifier: GPL-3.0-or-later
+    Copyright 2026 the ScarletNX contributors */
+ /* The render target set, clears and draws. The 3D registers name up to 8 color targets (RT_CONTROL at 0x487 maps
+@@ -397,6 +398,19 @@
+     return bytes && s && s->gva >= lo && s->gva - lo < bytes;
+ }
+ 
++
++/* Explicit Arceus experiment: the observed 1024-square D32/tag shadow pair.
++   Disabled by default; no scene color/depth format is selected. */
++static int native_shadow_shape(u32 w, u32 h, u32 fkey) {
++    const char* flag = getenv("SNX_ARCEUS_NATIVE_SHADOWS");
++    return flag && !strcmp(flag, "1") && w == 1024 && h == 1024 &&
++           (fkey == 0x1000a || fkey == 0xf6);
++}
++
++static float target_raster_scale(Surf** rt, Surf* zt, u32 n) {
++    float scale=0;for(u32 i=0;i<=n;i++){Surf *t=i==n?zt:rt[i];if(!t)continue;
++        float q=(float)t->sw/t->w;if(scale && fabsf(scale-q)>.001f){LOG_LIMIT(8,"arceus-upscaler: mixed-scale attachments\n");return 0;}scale=q;}return scale?scale:1;
++}
+ /* v: bit 0 depth, 1 stencil, 2-5 the RGBA mask, 6-9 the color slot, 10-20 the layer */
+ void vk_render_clear(GpuChannel* ch, u32 v) {
+     u32* r = ch->r3d;
+@@ -408,7 +422,9 @@
+     Surf* rt[8];
+     Surf* zt;
+     u32 n;
+-    read_targets(ch, rt, &zt, &n);      /* may record uploads: before anything is opened */
++    read_targets(ch, rt, &zt, &n);
++    float raster_scale = target_raster_scale(rt, zt, n);
++    if (!raster_scale) return;      /* may record uploads: before anything is opened */
+     for (u32 i = 0; mask && i < n; i++) /* the slot the clear takes is resolved below: every bound one is listed */
+         if (trace_target(rt[i]))
+             LOG_LIMIT(64,
+@@ -436,10 +452,10 @@
+     VkClearRect rect = {{{0, 0}, g_rp.ext}, layer, 1};
+     if (r3d_clear_scissored(r)) {
+         u32 xs = r[0x381], ys = r[0x382];
+-        i32 x0 = (i32)vk_scf(xs & 0xFFFF), x1 = (i32)vk_scf(xs >> 16), y0 = (i32)vk_scf(ys & 0xFFFF),
+-            y1 = (i32)vk_scf(ys >> 16);
++        i32 x0 = (i32)((float)(xs & 0xFFFF) * raster_scale), x1 = (i32)((float)(xs >> 16) * raster_scale), y0 = (i32)((float)(ys & 0xFFFF) * raster_scale),
++            y1 = (i32)((float)(ys >> 16) * raster_scale);
+         if (r[0x4EB] & 1) {
+-            i32 clip_height = (i32)vk_scf((float)(r[0x3FE] >> 16));
++            i32 clip_height = (i32)((float)((float)(r[0x3FE] >> 16)) * raster_scale);
+             i32 old_y0 = y0;
+             y0 = clip_height - y1;
+             y1 = clip_height - old_y0;
+@@ -893,7 +909,7 @@
+    is drawn */
+ typedef struct {
+     u64 tm, ts, dm;
+-    u32 rm, rs, df, unfed;
++    u32 rm, rs, df, unfed, dual;
+ } FsKey;
+ /* the integer color targets (rm, signed rs) the registers name, which key the fragment shader's outputs */
+ static void rt_int_targets(const u32* r, u32* rm, u32* rs) {
+@@ -917,6 +933,19 @@
+     u32* r = ch->r3d;
+     u32 nd = 0;
+     *fk = (FsKey){.rm = rt_int, .rs = rt_sint, .unfed = s0->si.in_mask & ~last_out};
++    // With one render target the guest's second color can feed the blend unit.
++    u32 ctl=r[0x487];
++    const u32 *second=r+0x200+((ctl>>7)&7)*0x10;
++    bool secondTarget=(ctl&15)>=2 && (second[0] || second[1]) && second[2] && second[3] && second[4];
++    if(g_vk.feat.dualSrcBlend && !secondTarget && r[0x4d8] &&
++       (s0->si.sph[18]&0xf0) && !(s0->si.sph[18]&~255u)){
++        const u32 *b=r[0x4b9]?r+0x780:r+0x4cf;
++        u32 factors[]={b[2],b[3],b[5],b[r[0x4b9]?6:7]};
++        for(unsigned j=0;j<4;j++){
++            VkBlendFactor f=blend_factor(factors[j]);
++            if(f>=VK_BLEND_FACTOR_SRC1_COLOR && f<=VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA)fk->dual=1;
++        }
++    }
+     int nt = s0->si.ntex > SH_MAXTEX ? SH_MAXTEX : s0->si.ntex;
+     for (int i = 0; i < nt; i++) {
+         const ShTex* st = &s0->si.tex[i];
+@@ -947,8 +976,8 @@
+ }
+ /* the fragment shader at addr in the variant fk names, s0 when it names none */
+ static VkSh* fs_variant(GpuChannel* ch, u64 addr, VkSh* s0, const FsKey* fk) {
+-    if (!fk->tm && !fk->rm && !fk->rs && !fk->dm && !fk->unfed) return s0;
+-    return vk_shader_get(ch, addr, 0, ST_FS, fk->tm, fk->ts, fk->rm, fk->rs, 0, fk->dm, fk->df, fk->unfed, NULL);
++    if (!fk->tm && !fk->rm && !fk->rs && !fk->dm && !fk->unfed && !fk->dual) return s0;
++    return vk_shader_get(ch, addr, 0, ST_FS, fk->tm, fk->ts, fk->rm, fk->rs, fk->dual, fk->dm, fk->df, fk->unfed, NULL);
+ }
+ 
+ VkImageViewType vk_tex_view_type(const ShTex* st) {
+@@ -1130,13 +1159,14 @@
+ 
+ /* small constants in this frame's staging: 1/resolution scale (SNX_RS) at 0, the 0,0,0,1 of attributes without
+    data at 16 (float) and 32 (integer) */
+-static int frame_consts(VkBuffer* buf, u64* off) {
++static int frame_consts(VkBuffer* buf, u64* off, float raster_scale) {
+     static u64 frame = ~0ull, o;
++    static float cached_scale;
+     static VkBuffer b;
+-    if (frame != vk_submit_number()) {
++    if (frame != vk_submit_number() || cached_scale != raster_scale) {
+         u8* p = vk_stage(64, vk_stage_align(), &b, &o);
+         if (!p) return 0;
+-        float rs[4] = {1 / g_vk_scale, 1 / g_vk_scale, g_vk_scale, 0}, fa[4] = {0, 0, 0, 1};
++        float rs[4] = {1 / raster_scale, 1 / raster_scale, raster_scale, 0}, fa[4] = {0, 0, 0, 1};
+         u32 ia[4] = {0, 0, 0, 1};
+         memcpy(p, rs, 16);
+         memcpy(p + 16, fa, 16);
+@@ -1144,6 +1174,7 @@
+         memset(p + 48, 0, 16); /* empty vertex bindings retain their original format */
+         snx_le32_array(p, 12); /* the device reads them little-endian */
+         frame = vk_submit_number();
++        cached_scale = raster_scale;
+     }
+     *buf = b;
+     *off = o;
+@@ -1609,18 +1640,68 @@
+     *e = (typeof(cache[0])){h1, h2, frame, set};
+     return set;
+ }
++/* Opt-in cosmetic workaround, not a proven emulation correction.
++   Match the captured scene's two category1 color entries exactly. */
++static int rim_candidate_enabled(void) {
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("SNX_ARCEUS_NEUTRAL_RIM"); on = e && !strcmp(e,"1"); }
++    return on;
++}
++static int rim_candidate_match(const void* data, u32 size, int stage, int bank, u64 hash) {
++    static const u32 purple[4] = {0x3ee9aeb6,0x3e405416,0x3f3ce7b4,0x3ef0f0f1};
++    static const u32 warm[4] = {0x3f800000,0x3f4a9282,0x3f54ad57,0x3f169697};
++    if (!data || size < 0x160 || size > 65536 || stage != 4 || bank != 3 ||
++        (hash != 0x89619027ba43e5d3ull && hash != 0xe02c1a109a77fac4ull)) return 0;
++    return !memcmp((const u8*)data+0x150,purple,sizeof purple) &&
++           !memcmp((const u8*)data+0xd0,warm,sizeof warm);
++}
++static void rim_candidate_apply(void* data) {
++    float rgb[3]; memcpy(rgb,(u8*)data+0x150,sizeof rgb);
++    float y = .2126f*rgb[0] + .7152f*rgb[1] + .0722f*rgb[2];
++    rgb[0]=rgb[1]=rgb[2]=y;
++    memcpy((u8*)data+0x150,rgb,sizeof rgb);
++}
++static void rim_candidate_buffer(GpuChannel* ch, int stage, int bank, VkSh* shader,
++                                  u32 size, VkBuffer* buffer, u64* offset) {
++    if (!rim_candidate_enabled() || stage!=4 || bank!=3 ||
++        (shader->hash!=0x89619027ba43e5d3ull && shader->hash!=0xe02c1a109a77fac4ull)) return;
++    u64 address=ch->cbind[stage][bank]; VkBuffer pending; u64 pending_offset;
++    if (!address || vk_buf_pending(address,size) || vk_compute_gpu_src(address,size,&pending,&pending_offset)) {
++        LOG_LIMIT(4,"arceus-neutral-rim: skipped non-CPU constant buffer\n"); return;
++    }
++    const void* src=gmem_ptr(address,size);
++    if (!rim_candidate_match(src,size,stage,bank,shader->hash)) return;
++    VkBuffer b; u64 o;
++    void* dst=vk_stage(size,vk_stage_align(),&b,&o);
++    if (!dst) { LOG_LIMIT(4,"arceus-neutral-rim: allocation failed; original lighting retained\n"); return; }
++    memcpy(dst,src,size); rim_candidate_apply(dst);
++    *buffer=b; *offset=o;
++    LOG_LIMIT(8,"arceus-neutral-rim: applied category1 purple tint workaround fs=%llx; alpha and luminance preserved\n",(unsigned long long)shader->hash);
++}
++
++static VkImageView up_override;static u64 up_address;
++#ifdef PARTICLE_WITNESS
++static VkBuffer particle_witness_buffer(void);
++#endif
++#include "smoke-program.h"
++#include "reflection-program.h"
++extern int arceus_contact_supported;
++static VkImage capForwardImage;
++static bool forward_bind(Surf *target,DescWrites *d);
++#include "smoke-material.inc"
++static bool particle_binding(Surf *target,VkDescriptorImageInfo *info);
+ static VkDescriptorSet stage_set_(GpuChannel* ch, int stage, VkSh* s, Surf** rt, Surf* zt, u32 n, int* zt_ro,
+-                                  u32* fb, u64* scaled, TexRes* res, const VkDrawStorage* draw, DrawImages* images);
++                                  u32* fb, u64* scaled, TexRes* res, const VkDrawStorage* draw, DrawImages* images, float raster_scale);
+ /* scaled: a bit for each texture slot bound to a scaled render target (scaled_coords in spirv_translate.c) */
+ static VkDescriptorSet stage_set(GpuChannel* ch, int stage, VkSh* s, Surf** rt, Surf* zt, u32 n, int* zt_ro, u32* fb,
+-                                 u64* scaled, TexRes* res, const VkDrawStorage* draw, DrawImages* images) {
++                                 u64* scaled, TexRes* res, const VkDrawStorage* draw, DrawImages* images, float raster_scale) {
+     SNX_ZONE(z, "stage set");
+-    VkDescriptorSet set = stage_set_(ch, stage, s, rt, zt, n, zt_ro, fb, scaled, res, draw, images);
++    VkDescriptorSet set = stage_set_(ch, stage, s, rt, zt, n, zt_ro, fb, scaled, res, draw, images, raster_scale);
+     SNX_ZONE_END(z);
+     return set;
+ }
+ static VkDescriptorSet stage_set_(GpuChannel* ch, int stage, VkSh* s, Surf** rt, Surf* zt, u32 n, int* zt_ro,
+-                                  u32* fb, u64* scaled, TexRes* res, const VkDrawStorage* draw, DrawImages* images) {
++                                  u32* fb, u64* scaled, TexRes* res, const VkDrawStorage* draw, DrawImages* images, float raster_scale) {
+     u32* r = ch->r3d;
+     VkDescriptorSetLayout layout = g_vk_dslayout[s->indexed][shader_vk_set(stage)];
+     VkDescriptorSet set = VK_NULL_HANDLE; /* the writes take it once their contents are known (desc_set_cached) */
+@@ -1632,6 +1713,7 @@
+         VkBuffer b;
+         u64 o;
+         if (!cb_get(ch, stage, i, sz, &b, &o)) return VK_NULL_HANDLE;
++        rim_candidate_buffer(ch,stage,i,s,sz,&b,&o);
+         dw_buffer(&d, set, SNX_VKB_CB + i, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, b, o, sz);
+     }
+     for (int i = 0; i < s->si.ngbuf && i < 16; i++) {
+@@ -1653,10 +1735,25 @@
+                   draw->map_off[stage ? 1 : 0], draw->map_size[stage ? 1 : 0]);
+     VkBuffer cb;
+     u64 co;
+-    if (stage == 4 && frame_consts(&cb, &co))
++    if (stage == 4 && frame_consts(&cb, &co, raster_scale))
+         dw_buffer(&d, set, SNX_VKB_RS, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, cb, co, 16);
+     u32 tcb = r[0x982];
+     int nt = s->si.ntex > SH_MAXTEX ? SH_MAXTEX : s->si.ntex;
++#ifdef FORWARD_REFLECTIONS
++    if(stage==4 && arceus_contact_supported && world_reflection_program(s->hash) && nt<=SH_MAXTEX-2 && s->si.ngbuf<16 &&
++       !forward_bind(n?rt[0]:NULL,&d))return VK_NULL_HANDLE;
++#endif
++    if(stage==4 && world_smoke_program(s->hash) && nt<SH_MAXTEX){
++        u32 bind=SNX_VKB_TEX+SH_MAXTEX-1;
++        if(!particle_binding(n && smoke_material(s,res)?rt[0]:NULL,&d.ii[bind]))return VK_NULL_HANDLE;
++#ifdef PARTICLE_WITNESS
++        VkBuffer witness=particle_witness_buffer();
++        if(!witness || s->si.ngbuf>=16)return VK_NULL_HANDLE;
++        dw_buffer(&d,set,SNX_VKB_SSBO+15,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,witness,0,24);
++#endif
++        d.w[d.n++]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=set,.dstBinding=bind,
++            .descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&d.ii[bind]};
++    }
+     int table_first[SH_INDEXED_TABLES] = {0}, table_count = 0;
+     for (int i = 0; i < nt; i++) {
+         ShTex* st = &s->si.tex[i];
+@@ -1747,6 +1844,7 @@
+         if (!view) return VK_NULL_HANDLE;
+         VkSampler smp = vk_tex_bind_sampler(x->tsc, x->tic, st, num, sampled, want);
+         if (!smp) return VK_NULL_HANDLE;
++        if(stage==4 && up_override && t && t->gva==up_address && want==VK_IMAGE_VIEW_TYPE_2D){view=up_override;LOG_LIMIT(12,"arceus-upscaler: bound reconstructed scene to composite slot %d\n",i);layout=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;if(scaled)*scaled|=1ull<<i;}
+         u32 b = SNX_VKB_TEX + i;
+         d.ii[b] = (VkDescriptorImageInfo){smp, view, layout};
+         d.w[d.n++] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+@@ -1857,7 +1955,7 @@
+ /* NVB197_SET_VIEWPORT_COORDINATE_SWIZZLE (0x0A18) can negate Y before the scale and offset. A negative Vulkan
+    height implements the same mapping without changing texture coordinates or guest render-target contents.
+    Reference: NVIDIA open-gpu-doc/classes/3d/clb197.h. */
+-VkViewport vk_render_viewport_at(const u32* r, u32 index) {
++static VkViewport render_viewport_scaled(const u32* r, u32 index, float raster_scale) {
+     if (index >= GUEST_VIEWPORTS) fatal("vulkan: viewport %u of the %u the GPU has", index, GUEST_VIEWPORTS);
+     float vt[6];
+     memcpy(vt, &r[0x280 + index * 8], sizeof vt);
+@@ -1868,12 +1966,12 @@
+         LOG_LIMIT(1, "vulkan: viewport scale %g x %g with transform enable %x\n", sx, sy, r[0x64B]);
+     if (small) {
+         u32 vx = r[0x300 + index * 4], vy = r[0x301 + index * 4];
+-        vp = (VkViewport){vk_scf(vx & 0xFFFF), vk_scf(vy & 0xFFFF), vk_scf(vx >> 16), vk_scf(vy >> 16), 0, 1};
++        vp = (VkViewport){((float)(vx & 0xFFFF) * raster_scale), ((float)(vy & 0xFFFF) * raster_scale), ((float)(vx >> 16) * raster_scale), ((float)(vy >> 16) * raster_scale), 0, 1};
+     } else
+-        vp = (VkViewport){vk_scf(tx - ax), vk_scf(ty - sy), vk_scf(2 * ax), vk_scf(2 * sy), 0, 1};
++        vp = (VkViewport){((float)(tx - ax) * raster_scale), ((float)(ty - sy) * raster_scale), ((float)(2 * ax) * raster_scale), ((float)(2 * sy) * raster_scale), 0, 1};
+     /* A lower-left window measures y from the surface clip's bottom. Match the 3D blit path's conversion. */
+     if (r[0x4EB] & 1) {
+-        vp.y += vk_scf((float)(r[0x3FE] >> 16));
++        vp.y += ((float)((float)(r[0x3FE] >> 16)) * raster_scale);
+         vp.height = -vp.height;
+     }
+     if (((r[0x286 + index * 8] >> 4) & 7) == 3) {
+@@ -1890,6 +1988,9 @@
+     vp.minDepth = zn < 0 ? 0 : zn > 1 ? 1 : zn;
+     vp.maxDepth = zf < 0 ? 0 : zf > 1 ? 1 : zf;
+     return vp;
++}
++VkViewport vk_render_viewport_at(const u32* r, u32 index) {
++    return render_viewport_scaled(r, index, g_vk_scale);
+ }
+ VkViewport vk_render_viewport(const u32* r) { return vk_render_viewport_at(r, 0); }
+ /* the vertices of the geometry program's input primitive: the tessellator's output primitive (0xC8: the domain in
+@@ -2104,20 +2205,26 @@
+             memcpy(xfb.layout[i], &r[0xA00 + 0x20 * i], sizeof xfb.layout[i]); /* word n / 4's byte n % 4 */
+         }
+     }
++    int capture_positions=g_vk.has_xfb && !xfb_on && !tes_on && !gs_on && topology==4;
++    if(capture_positions){
++        memset(&xfb,0,sizeof xfb);
++        xfb.count[0]=6;xfb.stride[0]=32;xfb.layout[0][4]=32;xfb.layout[0][5]=33;
++        for(u32 j=0;j<4;j++)xfb.layout[0][j]=(u8)(28+j);
++    }
+     o->topology = topology;
+     o->xfb_on = xfb_on;
+     o->attr_int = attr_int;
+     o->attr_sint = attr_sint;
+     o->vs = vk_shader_get(ch, code + r[0x811], (r[0x800] & 1) ? code + r[0x801] : 0, ST_VS, attr_int, attr_sint, 0, 0,
+                           tes_on || gs_on ? SNX_SH_NOT_LAST : clip, 0, 0, 0,
+-                          xfb_on && !tes_on && !gs_on ? &xfb : NULL);
++                          (xfb_on || capture_positions) && !tes_on && !gs_on ? &xfb : NULL);
+     /* a vertex program's images pick its variant as a fragment program's do (fs_key) */
+     u32 vs_signed_images = 0;
+     u32 vs_images = o->vs && !o->vs->failed && o->vs->si.nimg ? image_variant(ch, 0, o->vs, &vs_signed_images) : 0;
+     if (vs_images || vs_signed_images)
+         o->vs = vk_shader_get(ch, code + r[0x811], (r[0x800] & 1) ? code + r[0x801] : 0, ST_VS, attr_int, attr_sint,
+                               vs_images << 8, vs_signed_images << 8, tes_on || gs_on ? SNX_SH_NOT_LAST : clip, 0, 0, 0,
+-                              xfb_on && !tes_on && !gs_on ? &xfb : NULL);
++                              (xfb_on || capture_positions) && !tes_on && !gs_on ? &xfb : NULL);
+     o->tcs =
+         tcs_on ? vk_shader_get(ch, code + r[0x821], 0, ST_TCS, 0, 0, 0, 0, SNX_SH_NOT_LAST, 0, 0, 0, NULL) : NULL;
+     o->tes = tes_on ? vk_shader_get(ch, code + r[0x831], 0, ST_TES, 0, 0, r[0xC8] & 0x333, 0,
+@@ -2180,7 +2287,7 @@
+         LOG_LIMIT(1, "vulkan: flat inputs take the first vertex of a primitive, not the last the game asks for\n");
+     /* ANTI_ALIAS_ALPHA_CONTROL (0x54F) bit 0. The game uses it for grass and leaves: with one sample the driver
+        dithers the coverage by alpha, which softens the edges of the alpha-cut quads */
+-    k->alpha_to_coverage = fs ? r[0x54F] & 1 : 0;
++    k->alpha_to_coverage = fs && (fs->si.sph[18]&8) ? r[0x54F] & 1 : 0;
+     if (k->alpha_to_coverage)
+         LOG_LIMIT(4, "vulkan: the game draws with alpha to coverage (register 0x54f = %x, msaa mode 0x574 = %x)\n",
+                   r[0x54F], r[0x574]);
+@@ -2350,6 +2457,10 @@
+             k->blend[i].aop = blend_op(eqa);
+             k->blend[i].sa = blend_factor(sa);
+             k->blend[i].da = blend_factor(da);
++            if((k->blend[i].dc>=VK_BLEND_FACTOR_SRC1_COLOR || k->blend[i].da>=VK_BLEND_FACTOR_SRC1_COLOR) && fs){
++                LOG_LIMIT(14,"world-blend: fs=%llx out=%x ctl=%x blend=%x ind=%x n=%u slot=%u sc=%x dc=%x sa=%x da=%x dual=%u\n",
++                    (unsigned long long)fs->hash,fs->si.sph[18],r[0x487],r[0x4d8+i],r[0x4b9],n,i,sc,dc,sa,da,fs->mask[6]);
++            }
+         }
+     }
+     if (zt) {
+@@ -2483,6 +2594,641 @@
+     render_draw(ch, indexed, topology, first, count, base_vertex, base_instance, instances);
+     SNX_ZONE_END(z);
+ }
++/* Diagnostic CPU snapshots only. Never flush or mutate guest state here.
++   Pending GPU-written constants are explicitly omitted rather than mislabeled. */
++#define REF_DRAW_MAX 8
++void vk_reflection_bindings_capture(const char* prefix);
++static struct {
++    u64 hash, target;
++    u32 present, mask, nt;
++    struct { u64 address; u32 size, status; u8 data[65536]; } cb[18];
++    struct { u64 address; u32 word, tic[8], tsc[8], format, levels; } tex[SH_MAXTEX];
++} reflection_draw[REF_DRAW_MAX];
++static u32 reflection_present = ~0u, reflection_count, reflection_dropped;
++static int reflection_enabled(void) {
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("SNX_REFLECTION_CAPTURE"); on = e && !strcmp(e,"1"); }
++    return on;
++}
++#include <math.h>
++#include "prepare_sky.h"
++#include "vk_dlaa.h"
++#include "material_flow_sky.h"
++#include "motion/cut_frame.h"
++#include "motion/capture.inc"
++#include "nx/runtime/platform/plat.h"
++#include <stdarg.h>
++void vk_fsr_log(const char *fmt,...){char buf[1024];va_list a;va_start(a,fmt);vsnprintf(buf,sizeof buf,fmt,a);va_end(a);LOG("%s",buf);}
++void vk_fsr_message(const char*t,bool error,const wchar_t*m){LOG_LIMIT(16,"%s error=%d: %ls\n",t,error,m);}
++typedef struct {VkImage im; VmaAllocation mem; VkImageView view; VkImageLayout layout;} THist;
++static THist th[2][2];
++static VkDescriptorSetLayout tdsl; static VkPipelineLayout tpl; static VkPipeline tpipe; static VkSampler tsamp;
++static u32 tlast,tw,thh,tindex,tjitframe; static int tready,tjitvalid;
++static float tprev[16]; static u64 tzaddr;
++static float up_halton(u32 x,u32 b){float v=0,a=1;while(x){a/=b;v+=a*(x%b);x/=b;}return v;}
++extern int arceus_contact_supported;
++extern u32 arceus_texture_slots;
++static void tjitter(float *xy){u32 phase=1+g_vk_present%14;xy[0]=up_halton(phase,2)-.5f;xy[1]=up_halton(phase,3)-.5f;}
++#include "world-limits.h"
++static int tinit(void){
++ static int attempted;if(attempted)return tpipe!=0;attempted=1;
++ VkFormatProperties a,bfmt;vkGetPhysicalDeviceFormatProperties(g_vk.phys,VK_FORMAT_R16G16B16A16_SFLOAT,&a);vkGetPhysicalDeviceFormatProperties(g_vk.phys,VK_FORMAT_B10G11R11_UFLOAT_PACK32,&bfmt);if(!(a.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_SRC_BIT)||!(bfmt.optimalTilingFeatures&VK_FORMAT_FEATURE_BLIT_DST_BIT))return 0;
++ VkDescriptorSetLayoutBinding b[13];for(int i=0;i<8;i++) b[i]=(VkDescriptorSetLayoutBinding){i,(i==0||i==2||i>=5)?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,1,VK_SHADER_STAGE_COMPUTE_BIT,NULL};
++ b[8]=(VkDescriptorSetLayoutBinding){8,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,arceus_texture_slots,VK_SHADER_STAGE_COMPUTE_BIT,NULL};
++ for(u32 i=9;i<13;i++)b[i]=(VkDescriptorSetLayoutBinding){i,VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,1,VK_SHADER_STAGE_COMPUTE_BIT,NULL};
++ VkDescriptorSetLayoutCreateInfo dc={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=arceus_contact_supported?13:8,.pBindings=b};
++ if(vkCreateDescriptorSetLayout(g_vk.dev,&dc,0,&tdsl))return 0;
++ VkPushConstantRange range={VK_SHADER_STAGE_COMPUTE_BIT,0,128};
++ VkPipelineLayoutCreateInfo lc={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&tdsl,.pushConstantRangeCount=1,.pPushConstantRanges=&range};
++ if(vkCreatePipelineLayout(g_vk.dev,&lc,0,&tpl))return 0;
++ VkSamplerCreateInfo sc={VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
++ if(vkCreateSampler(g_vk.dev,&sc,0,&tsamp))return 0;
++ VkShaderModule m=vk_module_spv(up_words,sizeof up_words/4);if(!m)return 0;
++ VkComputePipelineCreateInfo pc={VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,.stage={VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_COMPUTE_BIT,.module=m,.pName="main"},.layout=tpl};
++ VkResult r=vkCreateComputePipelines(g_vk.dev,vk_pipeline_cache(),1,&pc,0,&tpipe);vkDestroyShaderModule(g_vk.dev,m,0);return !r;
++}
++static int timages(u32 w,u32 h){
++ if(tw==w && thh==h)return 1;
++ tw=thh=0;tready=0;temporal_snapshot.backend=NULL;
++ for(int i=0;i<4;i++){THist *t=&th[i/2][i%2];if(t->im)vk_defer_image(t->im,t->mem,t->view,0);memset(t,0,sizeof *t);}
++ for(int i=0;i<4;i++){THist *t=&th[i/2][i%2];VkFormat f=i==1?VK_FORMAT_R32_SFLOAT:i==2?VK_FORMAT_R16G16_SFLOAT:VK_FORMAT_R16G16B16A16_SFLOAT;
++ VkImageCreateInfo c={VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,.imageType=VK_IMAGE_TYPE_2D,.format=f,.extent={i==3?w:1920,i==3?h:1080,1},.mipLevels=1,.arrayLayers=1,.samples=VK_SAMPLE_COUNT_1_BIT,.usage=VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT};
++ if(!vk_image_create(&c,&t->im,&t->mem))return 0;
++ VkImageViewCreateInfo v={VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=t->im,.viewType=VK_IMAGE_VIEW_TYPE_2D,.format=f,.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
++ if(vkCreateImageView(g_vk.dev,&v,0,&t->view))return 0;}
++ tw=w;thh=h;return 1;
++}
++#include "temporal_camera.h"
++static void tuse(VkCommandBuffer cb,THist *t,VkImageLayout l){
++ vk_barrier(cb,t->im,VK_IMAGE_ASPECT_COLOR_BIT,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_WRITE_BIT|VK_ACCESS_2_MEMORY_READ_BIT,t->layout,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT,l);t->layout=l;
++}
++static VkImage cap_depth_image;static u32 cap_frame;static u64 cap_color,cap_depth;static float cap_matrix[16];static int cap_valid;
++static struct {u64 address;VkImage image;u32 tic[8],tsc[8];} worldProbe,worldDiffuse;
++typedef struct {u64 address,write;VkImage image;} LightingImage;
++static LightingImage lightingAlbedo,lightingEmission,lightingNormal;
++static u32 lightingAlbedoTic[8],lightingAlbedoTsc[8];
++static struct {LightingImage input;u32 tic[8],tsc[8];ShTex shader;} diffuseVolume;
++
++static Surf *lighting_surface(const LightingImage *input,u32 w,u32 h){
++    if(!input->image)return NULL;
++    for(Surf *s=vk_surf_first(input->address);s;s=s->next)
++        if(s->gva==input->address && s->img==input->image && s->wseq==input->write &&
++           s->sw==w && s->sh==h && s->layout!=VK_IMAGE_LAYOUT_UNDEFINED)return s;
++    return NULL;
++}
++static struct {float direction[4],radiance[4],diffuseTint[4],specularTint[4];} mainLight;
++static void read_probe_tints(GpuChannel *ch,const VkSh *fs){
++    mainLight.diffuseTint[3]=mainLight.specularTint[3]=1.f;
++    for(u32 i=0;i<3;i++)mainLight.diffuseTint[i]=mainLight.specularTint[i]=1.f;
++    u64 address=ch->cbind[4][3];
++    if(!address || cb_range(ch,4,fs,3)<0x980 || vk_buf_pending(address+0x960,32) ||
++       vk_compute_pending(address+0x960,32))return;
++    const void *source=gmem_host(address+0x960,32);if(!source)return;
++    float rgb[2][4];memcpy(rgb,source,sizeof rgb);
++    for(u32 j=0;j<2;j++)for(u32 i=0;i<3;i++)if(!(rgb[j][i]>=0.f && rgb[j][i]<=256.f))return;
++    for(u32 i=0;i<3;i++){
++        mainLight.diffuseTint[i]=rgb[0][i]*.318309886f;
++        mainLight.specularTint[i]=rgb[1][i];
++    }
++    float scale[2]={1,1};
++    const void *data=(!vk_buf_pending(address+0x628,8) && !vk_compute_pending(address+0x628,8))?gmem_host(address+0x628,8):NULL;
++    if(data){memcpy(scale,data,sizeof scale);if(scale[0]>0 && scale[0]<=4 && scale[1]>0 && scale[1]<=4){
++        mainLight.diffuseTint[3]=scale[0];mainLight.specularTint[3]=scale[1];
++    }}
++    if(getenv("ARCEUS_QA_PROBE") && g_vk_present%120==0){
++        LOG("world-pt: native probes present=%u diffuse=(%g,%g,%g) specular=(%g,%g,%g) uvScale=(%g,%g)\n",g_vk_present,
++            mainLight.diffuseTint[0],mainLight.diffuseTint[1],mainLight.diffuseTint[2],
++            mainLight.specularTint[0],mainLight.specularTint[1],mainLight.specularTint[2],scale[0],scale[1]);
++    }
++}
++static void read_main_light(GpuChannel *ch,const VkSh *fs){
++    memset(&mainLight,0,sizeof mainLight);
++    read_probe_tints(ch,fs);
++    u64 addr=ch->cbind[4][3];
++    if(!addr || cb_range(ch,4,fs,3)<0x960 || vk_buf_pending(addr+0x490,16) ||
++       vk_compute_pending(addr+0x490,16) || vk_buf_pending(addr+0x950,16) ||
++       vk_compute_pending(addr+0x950,16))return;
++    const void *d=gmem_host(addr+0x490,16),*c=gmem_host(addr+0x950,16);
++    if(!d || !c)return;
++    float dir[4],color[4];
++    memcpy(dir,d,16);memcpy(color,c,16);
++    float length=dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2];
++    if(!(length>.99f && length<1.01f && color[3]>0 && color[3]<=64.f))return;
++    for(u32 i=0;i<3;i++)if(!(color[i]>=0 && color[i]<=16.f))return;
++    for(u32 i=0;i<3;i++){
++        mainLight.direction[i]=-dir[i]/sqrtf(length);
++        mainLight.radiance[i]=color[i]*color[3];
++    }
++    mainLight.direction[3]=1.f;
++}
++static struct { u64 address, write; VkImage image; } cap_material;
++static FlowGpu material_flow;
++static int material_init_attempted;
++static u32 material_last_frame;
++static u64 material_last_address;
++static float material_last_jitter[2];
++static int material_surface_valid(const Surf *s,u32 w,u32 h){
++ return s && s->layers==1 && s->sw==w && s->sh==h &&
++        s->f.vk==VK_FORMAT_R8G8B8A8_UNORM && s->layout!=VK_IMAGE_LAYOUT_UNDEFINED;
++}
++static Surf *up_material_surface(u32 w,u32 h){
++ if(!cap_material.image)return NULL;
++ for(Surf *s=vk_surf_first(cap_material.address);s;s=s->next){
++  if(s->gva==cap_material.address && s->img==cap_material.image && s->wseq==cap_material.write && material_surface_valid(s,w,h))return s;
++ }
++ return NULL;
++}
++static void upscale_scene(Surf *col,Surf *z,bool opaqueStage);
++static void taa_after(GpuChannel *ch,VkSh *fs,TexRes *tex,Surf *col){
++ // A second fullscreen material pass writes opaque terrain into the same HDR target.
++ // Trace after that pass so later forward draws blend onto the traced opaque scene.
++ if(fs && fs->hash==0xfddd1ce88da11da0ull && !ch->render_pred && cap_valid &&
++    cap_frame==g_vk_present && col && col->gva==cap_color && col->f.vk==VK_FORMAT_B10G11R11_UFLOAT_PACK32){
++     for(Surf *z=vk_surf_first(cap_depth);z;z=z->next){
++         if(z->gva==cap_depth && z->img==cap_depth_image){
++             upscale_scene(col,z,true);
++             break;
++         }
++     }
++     return;
++ }
++ if(!fs||!col||(fs->hash!=0x89619027ba43e5d3ull&&fs->hash!=0xe02c1a109a77fac4ull)||col->f.vk!=VK_FORMAT_B10G11R11_UFLOAT_PACK32||col->layers!=1||ch->render_pred)return;
++ cap_valid=0;
++ diffuseVolume.input.image=VK_NULL_HANDLE;
++ lightingAlbedo.image=lightingEmission.image=lightingNormal.image=VK_NULL_HANDLE;
++ cap_material.image=VK_NULL_HANDLE;worldProbe.image=VK_NULL_HANDLE;worldDiffuse.image=VK_NULL_HANDLE;
++ Surf *z=NULL;
++ for(int i=0;i<fs->si.ntex&&i<SH_MAXTEX;i++)if(tex[i].have){
++  Surf *s=tex[i].t;
++  if(s && getenv("ARCEUS_QA_PROBE") && (g_vk_present==600 || g_vk_present==1960))
++      LOG("world-pt: probe binding f=%u fs=%llx slot=%d cb=%x size=%ux%u format=%u rt=%d type=%d\n",
++          g_vk_present,(unsigned long long)fs->hash,i,fs->si.tex[i].cbuf_off,s->sw,s->sh,s->f.vk,s->is_rt,vk_tex_view_type(&fs->si.tex[i]));
++  if(s && fs->si.tex[i].cbuf_off==8 && vk_tex_view_type(&fs->si.tex[i])==VK_IMAGE_VIEW_TYPE_2D &&
++     s->layers==1 && s->sw==960 && s->sh==540 && s->f.vk==VK_FORMAT_R16G16B16A16_SFLOAT){
++      diffuseVolume.input=(LightingImage){s->gva,s->wseq,s->img};
++      memcpy(diffuseVolume.tic,tex[i].tic,sizeof diffuseVolume.tic);memcpy(diffuseVolume.tsc,tex[i].tsc,sizeof diffuseVolume.tsc);
++      diffuseVolume.shader=fs->si.tex[i];
++  }
++  if(s && fs->si.tex[i].cbuf_off==0x36 && vk_tex_view_type(&fs->si.tex[i])==VK_IMAGE_VIEW_TYPE_CUBE){
++       worldProbe.address=s->gva;worldProbe.image=s->img;
++       memcpy(worldProbe.tic,tex[i].tic,sizeof worldProbe.tic);memcpy(worldProbe.tsc,tex[i].tsc,sizeof worldProbe.tsc);
++   }
++   if(s && fs->si.tex[i].cbuf_off==0x34 && vk_tex_view_type(&fs->si.tex[i])==VK_IMAGE_VIEW_TYPE_CUBE){
++       worldDiffuse.address=s->gva;worldDiffuse.image=s->img;
++       memcpy(worldDiffuse.tic,tex[i].tic,sizeof worldDiffuse.tic);memcpy(worldDiffuse.tsc,tex[i].tsc,sizeof worldDiffuse.tsc);
++   }
++   if(fs->si.tex[i].cbuf_off==0x32)z=s;
++   if(fs->si.tex[i].cbuf_off==0x2c && material_surface_valid(s,1920,1080))
++       lightingNormal=(LightingImage){s->gva,s->wseq,s->img};
++   if(s && fs->si.tex[i].cbuf_off==0x30 && s->sw==1920 && s->sh==1080 &&
++      s->layers==1 && s->f.vk==VK_FORMAT_B10G11R11_UFLOAT_PACK32)
++       lightingEmission=(LightingImage){s->gva,s->wseq,s->img};
++   if(s && fs->si.tex[i].cbuf_off==0x2a && s->sw==1920 && s->sh==1080 &&
++      s->layers==1 && s->f.vk==VK_FORMAT_R8G8B8A8_SRGB){
++       lightingAlbedo.address=s->gva;
++       lightingAlbedo.image=s->img;
++       lightingAlbedo.write=s->wseq;
++       memcpy(lightingAlbedoTic,tex[i].tic,sizeof lightingAlbedoTic);
++       memcpy(lightingAlbedoTsc,tex[i].tsc,sizeof lightingAlbedoTsc);
++   }
++  if(fs->si.tex[i].cbuf_off==0x2e && material_surface_valid(s,1920,1080)){
++   cap_material.image=s->img;cap_material.address=s->gva;cap_material.write=s->wseq;
++  }
++ }
++ if(!z||z->sw!=1920||z->sh!=1080||col->sw!=1920||col->sh!=1080||z->f.vk!=VK_FORMAT_D24_UNORM_S8_UINT)return;
++ read_main_light(ch,fs);
++ u64 addr=ch->cbind[4][4];VkBuffer b;u64 off;if(!addr||cb_range(ch,4,fs,4)<256||vk_buf_pending(addr,256)||vk_compute_gpu_src(addr,256,&b,&off))return;
++ const void *m=gmem_ptr(addr+192,64);if(!m)return;memcpy(cap_matrix,m,64);for(int i=0;i<16;i++)if(!isfinite(cap_matrix[i]))return;
++ cap_frame=g_vk_present;cap_color=col->gva;cap_depth=z->gva;cap_depth_image=z->img;cap_valid=1;
++}
++#include "contact.h"
++#include "denoise.inc"
++#include "rr-render.inc"
++#include "material-audit.inc"
++
++#include "opaque-scene.inc"
++static void upscale_scene(Surf *col,Surf *z,bool opaqueStage){
++ if(upscale_disabled)return;
++ if(opaqueStage && (!tready || tlast+1!=g_vk_present || previous_color!=cap_color || tzaddr!=cap_depth))return;
++ if(!col||!z||col->sw!=1920||col->sh!=1080||z->sw!=1920||z->sh!=1080)return;
++ if(tready && tlast==g_vk_present){
++  if(previous_color==cap_color && tzaddr==cap_depth && previous_color_write==col->wseq &&
++     previous_depth_write==z->wseq && !memcmp(cap_matrix,tprev,sizeof tprev)){
++    up_override=th[1][1].view;
++    up_address=cap_color;
++  }
++  return;
++ }
++ material_audit_save();
++ particle_capture_previous();
++ overlay_mask_capture_previous();
++ rr_capture_previous();
++ if(!opaqueStage && opaque.frame==g_vk_present && opaque.color==col->img && opaque.depth==z->img){
++     opaque_resolve(col,z);
++     return;
++ }
++ if(opaqueStage && !opaque_image_ready(col->sw,col->sh))return;
++ float *cur=cap_matrix;
++ VkComponentMapping id={0};VkImageView cv=vk_tex_view(col,VK_IMAGE_VIEW_TYPE_2D,0,&id,0),zv=vk_tex_view(z,VK_IMAGE_VIEW_TYPE_2D,0,&id,0);
++ if(!cv||!zv||!tinit()||!timages(3840,2160)){LOG_LIMIT(2,"arceus-taa: resources unavailable\n");return;}
++ VkDescriptorSet set=vk_desc_alloc(tdsl);if(!set)return;
++ VkCommandBuffer cb=vk_cmd();vk_render_end();
++ const VkImageLayout ro=VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,rw=VK_IMAGE_LAYOUT_GENERAL;
++ vk_surf_use(cb,col,ro,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++ vk_surf_use(cb,z,ro,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++ THist *color=&th[0][0],*depth=&th[0][1],*motion=&th[1][0],*dst=&th[1][1];
++ u32 w=col->sw,h=col->sh;
++ for(int i=0;i<4;i++)tuse(cb,&th[i/2][i%2],rw);
++ VkImageView albedoView=VK_NULL_HANDLE;
++ world_select(lightingAlbedo.image,z->img,lightingAlbedo.address);
++ if(lightingAlbedo.image && world.albedoAddress==lightingAlbedo.address){
++     for(Surf *surface=vk_surf_first(world.albedoAddress);surface;surface=surface->next){
++         if(surface->gva!=world.albedoAddress || surface->img!=lightingAlbedo.image ||
++            surface->wseq!=lightingAlbedo.write || surface->layout==VK_IMAGE_LAYOUT_UNDEFINED ||
++            surface->sw!=w || surface->sh!=h)continue;
++         albedoView=vk_tex_bind_view(surface,VK_IMAGE_VIEW_TYPE_2D,lightingAlbedoTic,lightingAlbedoTsc,0);
++         if(albedoView){vk_surf_touch(surface);vk_surf_use(cb,surface,ro,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);break;}
++     }
++ }
++ VkImageView probeView=VK_NULL_HANDLE;
++ if(worldProbe.image){
++     for(Surf *probe=vk_surf_first(worldProbe.address);probe;probe=probe->next){
++         if(probe->img!=worldProbe.image||probe->gva!=worldProbe.address)continue;
++         probeView=vk_tex_bind_view(probe,VK_IMAGE_VIEW_TYPE_CUBE,worldProbe.tic,worldProbe.tsc,0);
++         if(probeView){vk_surf_touch(probe);vk_surf_use(cb,probe,ro,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);}
++         break;
++     }
++ }
++ VkImageView diffuseView=VK_NULL_HANDLE;
++ if(worldDiffuse.image){
++     for(Surf *probe=vk_surf_first(worldDiffuse.address);probe;probe=probe->next){
++         if(probe->img!=worldDiffuse.image||probe->gva!=worldDiffuse.address)continue;
++         diffuseView=vk_tex_bind_view(probe,VK_IMAGE_VIEW_TYPE_CUBE,worldDiffuse.tic,worldDiffuse.tsc,0);
++         if(diffuseView){vk_surf_touch(probe);vk_surf_use(cb,probe,ro,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);}
++         break;
++     }
++ }
++ VkImageView views[]={zv,motion->view,cv,color->view,depth->view,albedoView?albedoView:cv,probeView,diffuseView};VkDescriptorImageInfo ii[8];VkWriteDescriptorSet wr[8];
++ for(int i=0;i<(probeView && diffuseView?8:6);i++){int sampled=i==0||i==2||i>=5;ii[i]=(VkDescriptorImageInfo){sampled?tsamp:0,views[i],sampled?ro:rw};wr[i]=(VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=set,.dstBinding=i,.descriptorCount=1,.descriptorType=sampled?VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,.pImageInfo=ii+i};} vkUpdateDescriptorSets(g_vk.dev,probeView && diffuseView?8:6,wr,0,NULL);
++ u32 surfaceInputs=0;
++ if(probeView && diffuseView && albedoView && drawCount){
++     bind_world_textures(cb,set,albedoView,ro);
++     Surf *extras[]={lighting_surface(&lightingEmission,w,h),lighting_surface(&lightingNormal,w,h),up_material_surface(w,h)};
++     VkDescriptorImageInfo infos[3];VkWriteDescriptorSet writes[3];
++     for(u32 i=0;i<3;i++){
++         Surf *s=extras[i];
++         VkImageView view=s?vk_tex_view(s,VK_IMAGE_VIEW_TYPE_2D,0,&id,0):VK_NULL_HANDLE;
++         if(view){
++             vk_surf_touch(s);vk_surf_use(cb,s,ro,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++             surfaceInputs|=1u<<i;
++         }
++         infos[i]=(VkDescriptorImageInfo){tsamp,view?view:albedoView,ro};
++         writes[i]=(VkWriteDescriptorSet){.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=set,.dstBinding=9+i,
++             .descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=infos+i};
++     }
++     vkUpdateDescriptorSets(g_vk.dev,3,writes,0,NULL);
++     Surf *volume=lighting_surface(&diffuseVolume.input,960,540);
++     VkDescriptorImageInfo probeInfo={tsamp,albedoView,ro};
++     if(volume){
++         VkImageView view=vk_tex_bind_view(volume,VK_IMAGE_VIEW_TYPE_2D,diffuseVolume.tic,diffuseVolume.tsc,0);
++         VkSampler sampler=vk_tex_bind_sampler(diffuseVolume.tsc,diffuseVolume.tic,&diffuseVolume.shader,0,volume,VK_IMAGE_VIEW_TYPE_2D);
++         if(view && sampler){
++             vk_surf_touch(volume);vk_surf_use(cb,volume,ro,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++             probeInfo=(VkDescriptorImageInfo){sampler,view,ro};surfaceInputs|=16u;
++         }
++     }
++     VkWriteDescriptorSet probeWrite={.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=set,.dstBinding=12,
++         .descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&probeInfo};
++     vkUpdateDescriptorSets(g_vk.dev,1,&probeWrite,0,NULL);
++     material_audit_capture(cb,extras[1],extras[2]);
++ }
++ struct{float m[16],j[2];u32 valid;float skyDepth;}pc={0};if(tjitvalid&&tjitframe==g_vk_present)tjitter(pc.j);
++ if(getenv("ARCEUS_QA_JITTER") && g_vk_present%90==0)
++     LOG("arceus-qa: resolve present=%u last=%u jitterFrame=%u jitter=%g,%g depth=%llx\n",g_vk_present,tlast,tjitframe,pc.j[0],pc.j[1],(unsigned long long)z->gva);
++ if(fabsf(cur[11])>1.e-8f)pc.skyDepth=-cur[15]/cur[11];
++ // Motion and all temporal consumers use coordinates in the allocated image.
++ // Conjugate the camera transform by the guest viewport to keep them in that space.
++ VkRect2D activeRect=world.selected?world.rect:(VkRect2D){{0,0},{w,h}};
++ pc.valid=!memcmp(&previousRect,&activeRect,sizeof activeRect) && tready && tlast+1==g_vk_present && previous_color==cap_color && tzaddr==z->gva && tmatrix(cur,tprev,pc.m);
++ if(pc.valid && (activeRect.extent.width!=w || activeRect.extent.height!=h)){
++     float sx=(float)activeRect.extent.width/w,sy=(float)activeRect.extent.height/h;
++     float tx=2.f*activeRect.offset.x/w+sx-1.f,ty=1.f-sy-2.f*activeRect.offset.y/h;
++     for(u32 i=0;i<4;i++){
++         pc.m[i]/=sx;pc.m[4+i]/=sy;pc.m[12+i]-=tx*pc.m[i]+ty*pc.m[4+i];
++     }
++     for(u32 j=0;j<16;j+=4){
++         pc.m[j]=sx*pc.m[j]+tx*pc.m[j+3];pc.m[j+1]=sy*pc.m[j+1]+ty*pc.m[j+3];
++     }
++ }
++ rec_CmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,tpipe);rec_CmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,tpl,0,1,&set,0,NULL);
++ rec_CmdPushConstants(cb,tpl,VK_SHADER_STAGE_COMPUTE_BIT,0,sizeof pc,&pc);rec_CmdDispatch(cb,(w+7)/8,(h+7)/8,1);
++ bool dl=vk_dlaa_wanted();
++ static bool initialized;
++ if(dl && !initialized){initialized=true;vk_dlaa_init(g_vk.instance,g_vk.phys,g_vk.dev);}
++ const bool requested=rr_requested();
++ if(dl && !vk_dlaa_available()){
++    LOG_LIMIT(1,"world-pt: NGX unavailable, selecting standard FSR\n");
++    dl=false;
++ }
++ rr.writing=requested && dl && surfaceInputs && probeView && diffuseView && albedoView && drawCount &&
++     vk_rr_available() && rr_prepare(w,h);
++ // Measure the frame interval at the same point before optional frozen-reference dispatches.
++ u64 frameTime=plat_ns();
++ bool traced=probeView && diffuseView && albedoView && drawCount && contact_record(cb,set,cur,surfaceInputs,pc.j);
++ if(opaqueStage && !traced){vk_render_forget_state();return;}
++ VkImageLayout vendor_layout=dl?rw:ro;
++ tuse(cb,color,vendor_layout);tuse(cb,depth,vendor_layout);tuse(cb,motion,rw);
++ Surf *material=up_material_surface(w,h);
++ VkImageView material_view=VK_NULL_HANDLE;
++ VkDescriptorSet flow_set=VK_NULL_HANDLE;
++ if(material && !material_init_attempted){
++  material_init_attempted=1;
++  const char *setting=getenv("SNX_ARCEUS_MATERIAL_MOTION");
++  if(!setting || strcmp(setting,"0")){
++   VkResult result=flow_create(&material_flow,g_vk.phys,g_vk.dev,w,h,vk_pipeline_cache());
++   LOG("arceus-motion: material estimator initialization %d at %ux%u\n",result,w,h);
++  }
++ }
++ if(material && material_flow.setLayout){
++  material_view=vk_tex_view(material,VK_IMAGE_VIEW_TYPE_2D,0,&id,0);
++  if(material_view)flow_set=vk_desc_alloc(material_flow.setLayout);
++  if(flow_set){
++   vk_surf_touch(material);
++   vk_surf_use(cb,material,ro,VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
++  }
++ }
++ vk_rec_sync(); /* finish all queued records before the vendor directly records to this same command buffer */
++ world_mark(cb,7);
++ static u64 prevtime;float ms=prevtime?(float)(frameTime-prevtime)*1e-6f:8.333f;prevtime=frameTime;
++ VkFsr2Frame f={.color=color->im,.depth=depth->im,.mv=motion->im,.out=dst->im,.color_view=color->view,.depth_view=depth->view,.mv_view=motion->view,.out_view=dst->view,.color_format=VK_FORMAT_R16G16B16A16_SFLOAT,.depth_format=VK_FORMAT_R32_SFLOAT,.out_format=VK_FORMAT_R16G16B16A16_SFLOAT,.w=w,.h=h,.ow=tw,.oh=thh,.jx=-pc.j[0],.jy=-pc.j[1],.dt_ms=fminf(100,fmaxf(1,ms)),.near_z=1.f/fmaxf(.001f,cur[11]+cur[15]),.far_z=1.f/fmaxf(.000001f,cur[15]),.fov_y=2*atanf(sqrtf(cur[4]*cur[4]+cur[5]*cur[5]+cur[6]*cur[6])),.reset=!pc.valid||ms>200};
++ bool material_history=false;
++ FlowParams p={0};
++ memcpy(p.clipToPrevious,pc.m,sizeof pc.m);memcpy(p.jitter,pc.j,sizeof pc.j);
++ memcpy(p.previousJitter,material_last_jitter,sizeof p.previousJitter);
++ if(flow_set){
++  static bool lastFlowUsedAlbedo;
++  bool flowUsesAlbedo=traced && albedoView;
++  p.historyValid=material_flow.warm && !f.reset && material_last_frame+1==g_vk_present &&
++      material_last_address==cap_material.address && flowUsesAlbedo==lastFlowUsedAlbedo;
++  material_history=p.historyValid;
++  // Shading noise changes even on a stationary object. Match the underlying texture.
++  FlowInputs inputs={flowUsesAlbedo?albedoView:color->view,depth->view,material_view,motion->view,
++                     flowUsesAlbedo?ro:vendor_layout,vendor_layout,ro};
++  flow_record(&material_flow,cb,flow_set,&inputs,p);
++  lastFlowUsedAlbedo=flowUsesAlbedo;
++  static int motionReactiveOverride=-2;
++  if(motionReactiveOverride==-2){
++   const char *setting=getenv("ARCEUS_FSR_MATERIAL_REACTIVE");
++   motionReactiveOverride=setting?(strcmp(setting,"0")!=0):-1;
++  }
++  // An opaque path sample can change even when the material and camera stay still.
++  // Its matching cost cannot identify transparency in this pass.
++  bool useMotionReactive=motionReactiveOverride<0?!traced:motionReactiveOverride!=0;
++  if(!dl && material_history && useMotionReactive){
++   flow_mask_layout(&material_flow,cb,ro);
++   f.reactive=material_flow.images[FlowMask].image;f.reactive_view=material_flow.images[FlowMask].view;
++  }
++  material_last_frame=g_vk_present;material_last_address=cap_material.address;
++  memcpy(material_last_jitter,pc.j,sizeof pc.j);
++ }else material_flow.warm=0;
++ SceneResolve input={.f=f,.rect=activeRect,.flow=p,.albedo=albedoView,.materialView=flow_set?material_view:VK_NULL_HANDLE,
++     .materialAddress=material?material->gva:0,.dl=dl,.traced=traced,.guides=traced && rr.writing,
++     .hasFlow=flow_set!=VK_NULL_HANDLE,.materialHistory=material_history};
++ if(opaqueStage){
++     if(input.guides && !vk_rr_create(cb,&input.f))input.guides=false;
++     if(!input.guides)scene_filter(cb,&input);
++     opaque_write(cb,col,z,&input);
++     return;
++ }
++ rr.guides.beforeImage=VK_NULL_HANDLE;rr.guides.beforeView=VK_NULL_HANDLE;
++ scene_finish(cb,col,z,&input);
++}
++static void upscale_before(VkSh *fs,TexRes *tex,Surf *target){
++ up_override=0;up_address=0;
++ if(!cap_valid||cap_frame!=g_vk_present||!fs||!target||target->sw!=3840||target->sh!=2160||
++   (fs->hash!=0x63b3848c1a6e23e0ull && fs->hash!=0x8a160a27d90af72dull))return;
++ Surf *col=NULL,*z=NULL;
++ for(int i=0;i<fs->si.ntex&&i<SH_MAXTEX;i++)if(tex[i].have&&tex[i].t){
++  if(tex[i].t->gva==cap_color)col=tex[i].t;
++  if(tex[i].t->gva==cap_depth)z=tex[i].t;
++ }
++ if(col && z)upscale_scene(col,z,false);
++}
++
++
++static void reflection_record(GpuChannel* ch, VkSh* fs, const TexRes* tex) {
++    if (!reflection_enabled() || !fs || !tex) return;
++    if (reflection_present != g_vk_present) {
++        reflection_present = g_vk_present; reflection_count = 0; reflection_dropped = 0;
++    }
++    /* Both known deferred lighting variants. Other shaders remain outside scope. */
++    if (fs->hash != 0xe02c1a109a77fac4ull && fs->hash != 0x89619027ba43e5d3ull) return;
++    if (reflection_count == REF_DRAW_MAX) { reflection_dropped++; return; }
++    typeof(reflection_draw[0])* d = &reflection_draw[reflection_count++];
++    d->hash = fs->hash; d->present = g_vk_present; d->mask = fs->si.cbuf_mask & 0x3ffff;
++    d->target = g_rp.n && g_rp.rt[0] ? g_rp.rt[0]->gva : 0;
++    for (u32 i = 0; i < 18; i++) {
++        d->cb[i].status = 0; d->cb[i].size = 0; d->cb[i].address = ch->cbind[4][i];
++        if (!(d->mask & (1u << i))) continue;
++        u32 n = cb_range(ch,4,fs,i); d->cb[i].size = n;
++        u64 a = d->cb[i].address;
++        if (!a) { memset(d->cb[i].data,0,n); d->cb[i].status = 1; continue; }
++        VkBuffer b; u64 off;
++        if (vk_buf_pending(a,n) || vk_compute_gpu_src(a,n,&b,&off)) { d->cb[i].status = 2; continue; }
++        const void* p = gmem_ptr(a,n);
++        if (!p) { d->cb[i].status = 3; continue; }
++        memcpy(d->cb[i].data,p,n); d->cb[i].status = 1;
++        if (rim_candidate_enabled() && rim_candidate_match(d->cb[i].data,n,4,i,fs->hash))
++            rim_candidate_apply(d->cb[i].data);
++    }
++    d->nt = fs->si.ntex < SH_MAXTEX ? fs->si.ntex : SH_MAXTEX;
++    for (u32 i = 0; i < d->nt; i++) {
++        memset(&d->tex[i],0,sizeof d->tex[i]);
++        d->tex[i].word = fs->si.tex[i].cbuf_off;
++        if (!tex[i].have) continue;
++        memcpy(d->tex[i].tic,tex[i].tic,sizeof d->tex[i].tic);
++        memcpy(d->tex[i].tsc,tex[i].tsc,sizeof d->tex[i].tsc);
++        if (tex[i].t) { d->tex[i].address=tex[i].t->gva; d->tex[i].format=tex[i].t->f.vk; d->tex[i].levels=tex[i].t->levels; }
++    }
++}
++void vk_reflection_bindings_capture(const char* prefix) {
++    if (!reflection_enabled() || !prefix || !*prefix || strpbrk(prefix,"\t\r\n")) return;
++    temporal_snapshot_capture(prefix);
++    char path[1100];
++    int n=snprintf(path,sizeof path,"%s_lighting.tsv",prefix);
++    if(n<0 || (size_t)n>=sizeof path) return;
++    FILE* f=fopen(path,"wb"); if(!f) { LOG("reflection-bindings: cannot open manifest\n"); return; }
++    u32 failures=0;
++    fprintf(f,"# capture_present=%u recorded_present=%u draws=%u dropped=%u constants=CPU-at-draw-with-enabled-rim-transform-not-GPU-readback status1=valid-CPU status2=GPU-pending-omitted status3=unmapped\n",g_vk_present,reflection_present,reflection_count,reflection_dropped);
++    for(u32 i=0;i<reflection_count;i++) {
++        typeof(reflection_draw[0])* d=&reflection_draw[i];
++        fprintf(f,"draw\t%u\tpresent\t%u\tfs\t%llx\ttarget\t%llx\n",i,d->present,(unsigned long long)d->hash,(unsigned long long)d->target);
++        for(u32 j=0;j<18;j++) if(d->mask & (1u<<j)) {
++            n=snprintf(path,sizeof path,"%s_light_%u_cb%u.bin",prefix,i,j);
++            int ok=0;
++            if(d->cb[j].status==1 && n>=0 && (size_t)n<sizeof path) {
++                FILE* b=fopen(path,"wb");
++                if(b) { ok=fwrite(d->cb[j].data,1,d->cb[j].size,b)==d->cb[j].size; if(fclose(b)) ok=0; }
++                if(!ok) failures++;
++            }
++            fprintf(f,"cb\t%u\t%u\t%llx\t%u\tstatus\t%u\twritten\t%d\t%s\n",i,j,(unsigned long long)d->cb[j].address,d->cb[j].size,d->cb[j].status,ok,ok?path:"-");
++        }
++        for(u32 j=0;j<d->nt;j++) {
++            fprintf(f,"texture\t%u\t%u\tword\t%x\taddress\t%llx\tformat\t%u\tlevels\t%u\ttic",i,j,d->tex[j].word,(unsigned long long)d->tex[j].address,d->tex[j].format,d->tex[j].levels);
++            for(u32 k=0;k<8;k++) fprintf(f,"\t%08x",d->tex[j].tic[k]);
++            fprintf(f,"\ttsc");for(u32 k=0;k<8;k++) fprintf(f,"\t%08x",d->tex[j].tsc[k]);fputc('\n',f);
++        }
++    }
++    if(ferror(f)) failures++; if(fclose(f)) failures++;
++    LOG("reflection-bindings: present=%u recorded=%u draws=%u dropped=%u failures=%u\n",g_vk_present,reflection_present,reflection_count,reflection_dropped,failures);
++}
++
++/* Opt-in material metadata for textured geometry. This reads already resolved
++   CPU metadata only: no guest reads, image copies, descriptor creation or draw
++   state changes. Unlike resolution_trace, distinct mesh shaders and bindings
++   are retained. Indexed descriptor tables are explicitly not expanded here. */
++static void material_trace(VkViewport vp, VkRect2D sc, VkSh* vs, VkSh* fs,
++                           const TexRes* tex, u32 count, u64 scaled, const u32* r) {
++    enum { LIMIT = 512, TABLE = 2048 };
++    static int enabled = -1;
++    static u32 used;
++    static u64 seen[TABLE];
++    if (enabled < 0) {
++        const char* e = getenv("SNX_MATERIAL_TRACE");
++        enabled = e && !strcmp(e, "1");
++        if (enabled)
++            LOG("material-trace: resolved-input metadata enabled, limit=%u; indexed tables not expanded\n", LIMIT);
++    }
++    if (!enabled || used == LIMIT || !fs || !g_rp.zt) return;
++    int nt = fs->si.ntex < SH_MAXTEX ? fs->si.ntex : SH_MAXTEX;
++    struct {
++        u64 vs, fs, scaled;
++        u32 colors, ntex;
++        u32 bias[6];
++        VkViewport vp;
++        VkRect2D sc;
++    } head = {0};
++    head.vs = vs ? vs->hash : 0; head.fs = fs->hash; head.scaled = scaled;
++    head.colors = g_rp.n; head.ntex = (u32)nt; head.vp = vp; head.sc = sc;
++    head.bias[0] = r[0x55B]; head.bias[1] = r[0x56F]; head.bias[2] = r[0x61F];
++    head.bias[3] = r[0x370]; head.bias[4] = r[0x371]; head.bias[5] = r[0x372];
++    u64 key = vk_hash(&head, sizeof head);
++    for (u32 i = 0; i <= g_rp.n; i++) {
++        const Surf* t = i == g_rp.n ? g_rp.zt : g_rp.rt[i];
++        if (!t) continue;
++        u64 output[] = {i, i == g_rp.n, t->gva, t->w, t->h, t->sw, t->sh, t->fkey, t->f.vk};
++        key = (key ^ vk_hash(output, sizeof output)) * 0x9e3779b97f4a7c15ull;
++    }
++    for (int i = 0; i < nt; i++) {
++        const ShTex* st = &fs->si.tex[i];
++        if (st->flags & SNX_TEX_INDEXED) continue;
++        const TexRes* x = &tex[i];
++        u64 part[4] = {(u64)(u32)i, x->have, 0, 0};
++        if (x->have) {
++            part[2] = vk_hash(x->tic, sizeof x->tic);
++            part[3] = vk_hash(x->tsc, sizeof x->tsc);
++        }
++        key = (key ^ vk_hash(part, sizeof part)) * 0x9e3779b97f4a7c15ull;
++        if (x->have && x->t) {
++            const Surf* t = x->t;
++            u64 shape[] = {t->gva, t->w, t->h, t->sw, t->sh, t->layers, t->levels, t->depth3d,
++                           t->fkey, t->f.vk, t->f.conv, t->is_rt, t->bl, t->bh, t->bd, t->pitch};
++            key = (key ^ vk_hash(shape, sizeof shape)) * 0x9e3779b97f4a7c15ull;
++        }
++    }
++    /* Generation counters and per-draw counts deliberately do not grow the key. */
++    if (!key) key = 1;
++    u32 at = (u32)(key >> 32) & (TABLE - 1);
++    while (seen[at] && seen[at] != key) at = (at + 1) & (TABLE - 1);
++    if (seen[at]) return;
++    seen[at] = key;
++    u32 id = ++used;
++    LOG("material-trace: draw id=%u present=%u vs=%llx fs=%llx count=%u colors=%u viewport=%g,%g,%g,%g scissor=%d,%d,%u,%u scaled=%llx bias_raw=%08x,%08x,%08x bias_enable=%u,%u,%u\n",
++        id, g_vk_present, (unsigned long long)head.vs, (unsigned long long)head.fs, count, g_rp.n,
++        vp.x, vp.y, vp.width, vp.height, sc.offset.x, sc.offset.y, sc.extent.width, sc.extent.height,
++        (unsigned long long)scaled, r[0x55B], r[0x56F], r[0x61F], r[0x370], r[0x371], r[0x372]);
++    for (u32 i = 0; i <= g_rp.n; i++) {
++        const Surf* t = i == g_rp.n ? g_rp.zt : g_rp.rt[i];
++        if (!t) continue;
++        LOG("material-trace: output id=%u slot=%u depth=%u address=%llx guest=%ux%u image=%ux%u fkey=%x vkfmt=%u\n",
++            id, i, i == g_rp.n, (unsigned long long)t->gva, t->w, t->h, t->sw, t->sh, t->fkey, (u32)t->f.vk);
++    }
++    for (int i = 0; i < nt; i++) {
++        const ShTex* st = &fs->si.tex[i];
++        LOG("material-trace: shader-input id=%u slot=%d cbuf_word=%x bindless=%u cb=%u split=%u split_cb=%u split_word=%x type=%u array=%u shadow=%u flags=%x\n",
++            id, i, st->cbuf_off, st->bindless, st->bl_cbuf, st->bl2, st->bl2_cbuf, st->bl2_off,
++            st->type, st->array, st->shadow, st->flags);
++        if (st->flags & SNX_TEX_INDEXED) {
++            LOG("material-trace: input id=%u slot=%d indexed_table=1 details=not-expanded\n", id, i);
++            continue;
++        }
++        const TexRes* x = &tex[i];
++        if (!x->have) {
++            LOG("material-trace: input id=%u slot=%d resolved=0\n", id, i);
++            continue;
++        }
++        LOG("material-trace: descriptors id=%u slot=%d handle=%08x tic=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x tsc=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
++            id, i, x->handle, x->tic[0], x->tic[1], x->tic[2], x->tic[3], x->tic[4], x->tic[5], x->tic[6], x->tic[7],
++            x->tsc[0], x->tsc[1], x->tsc[2], x->tsc[3], x->tsc[4], x->tsc[5], x->tsc[6], x->tsc[7]);
++        const Surf* t = x->t;
++        if (!t) {
++            LOG("material-trace: input id=%u slot=%d resolved=1 surface=0\n", id, i);
++            continue;
++        }
++        VkComponentMapping map = tex_map(t, x->tic);
++        LOG("material-trace: input id=%u slot=%d address=%llx guest=%ux%u image=%ux%u layers=%u levels=%u depth3d=%u rt=%d fkey=%x vkfmt=%u conversion=%u block=%ux%u bytes=%u signed=%u integer=%u depth=%u bgra=%u srgb=%d map=%u,%u,%u,%u layout=%u,%u,%u,%u upload_valid=%d wgen=%u\n",
++            id, i, (unsigned long long)t->gva, t->w, t->h, t->sw, t->sh, t->layers, t->levels, t->depth3d,
++            t->is_rt, t->fkey, (u32)t->f.vk, t->f.conv, t->f.bw, t->f.bh, t->f.bpp,
++            t->f.sint, t->f.is_int, t->f.depth, t->f.bgra, tex_srgb(x->tic, x->tsc),
++            (u32)map.r, (u32)map.g, (u32)map.b, (u32)map.a,
++            t->bl, t->bh, t->bd, t->pitch, t->upload_valid, t->wgen);
++    }
++    if (used == LIMIT) LOG("material-trace: distinct configuration limit reached\n");
++}
++
++/* Opt-in resolution diagnosis. Log each distinct viewport/target combination once;
++   retain shader identity for small fullscreen/postprocess draws, but not every mesh.
++   Disabled runs pay only the cached flag check. No shader or rendering state changes. */
++static void resolution_trace(VkViewport vp, VkRect2D sc, VkSh* fs, TexRes* tex, u32 count, u64 fs_addr) {
++    static int enabled = -1;
++    static struct {
++        u32 w, h, sw, sh, format, n, depth, small;
++        float vw, vh;
++        u32 cw, ch;
++        u64 shader;
++    } seen[512];
++    static u32 used;
++    if (enabled < 0) {
++        const char* e = getenv("SNX_RESOLUTION_TRACE");
++        enabled = e && *e && *e != '0';
++    }
++    if (!enabled || used == 512) return;
++    Surf* dst = NULL;
++    for (u32 i = 0; i < g_rp.n && !dst; i++) dst = g_rp.rt[i];
++    if (!dst) dst = g_rp.zt;
++    if (!dst) return;
++    typeof(seen[0]) key = {0};
++    key.w = dst->w; key.h = dst->h; key.sw = dst->sw; key.sh = dst->sh;
++    key.format = dst->fkey; key.n = g_rp.n; key.depth = g_rp.zt != NULL;
++    key.small = count <= 6; key.vw = vp.width; key.vh = vp.height;
++    key.cw = sc.extent.width; key.ch = sc.extent.height;
++    key.shader = key.small && fs ? fs->hash : 0;
++    for (u32 i = 0; i < used; i++) if (!memcmp(&seen[i], &key, sizeof key)) return;
++    seen[used++] = key;
++    LOG("resolution-trace: draw id=%u present=%u guest=%ux%u image=%ux%u viewport=%gx%g scissor=%ux%u colors=%u depth=%u count=%u target=%llx fs=%llx hash=%llx\n",
++        used, g_vk_present, dst->w, dst->h, dst->sw, dst->sh, vp.width, vp.height,
++        sc.extent.width, sc.extent.height, g_rp.n, key.depth, count,
++        (unsigned long long)dst->gva, (unsigned long long)fs_addr,
++        (unsigned long long)(fs ? fs->hash : 0));
++    if (fs) for (int i = 0; i < fs->si.ntex && i < SH_MAXTEX; i++) {
++        if (!tex[i].have || !tex[i].t) continue;
++        Surf* t = tex[i].t;
++        LOG("resolution-trace: input id=%u slot=%d target=%llx guest=%ux%u image=%ux%u rt=%d\n",
++            used, i, (unsigned long long)t->gva, t->w, t->h, t->sw, t->sh, t->is_rt);
++    }
++    if (used == 512) LOG("resolution-trace: draw configuration limit reached\n");
++}
++
+ static void render_draw(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count, u32 base_vertex,
+                         u32 base_instance, u32 instances) {
+     u32* r = ch->r3d;
+@@ -2492,6 +3238,7 @@
+     VkDescriptorSet bset[3];
+     if (!count || !instances) return;
+     vk_frame_check();
++    world_frame();
+     if (g_draw.check < 0) {
+         const char* e = getenv("SNX_DIRTY_CHECK");
+         g_draw.check = e && *e && *e != '0';
+@@ -2598,6 +3345,8 @@
+                     break;
+                 }
+         }
++    float raster_scale = target_raster_scale(rt, zt, n);
++    if (!raster_scale) { g_vk_skipped++; return; }
+     /* nothing drawn to, captured or stored. A program's stores to memory or images still run in a pass without
+        attachments: a per-pixel pass may set every target's format to 0 and keep only what it stores */
+     int stores = vs->si.gbuf_wmask || vs->si.nimg || (fs && (fs->si.gbuf_wmask || fs->si.nimg));
+@@ -2671,7 +3420,7 @@
+     for (u32 v = 0; v < k->nbind; v++) {
+         if (pl->key[v] == ~0u || pl->key[v] == ~1u) {
+             /* the constants: staging that fails skips the draw (it once drew without the attributes) */
+-            if (!frame_consts(&vbuf[v], &voff[v])) {
++            if (!frame_consts(&vbuf[v], &voff[v], raster_scale)) {
+                 g_vk_skipped++;
+                 return;
+             }
+@@ -2697,7 +3446,7 @@
+         len += pl->pad[v] < limit - len ? pl->pad[v] : limit - len;
+         u32 base = pl->key[v] >> 5;
+         if (base >= len) {
+-            if (!frame_consts(&vbuf[v], &voff[v])) {
++            if (!frame_consts(&vbuf[v], &voff[v], raster_scale)) {
+                 g_vk_skipped++;
+                 return;
+             }
+@@ -2752,9 +3501,10 @@
+     u32 fb = 0;
+     u64 scaled = 0;
+     DrawImages images = {0};
+-    VkDescriptorSet vset = stage_set(ch, 0, vs, rt, zt, n, &zt_ro, NULL, NULL, NULL, &storage, &images);
++    upscale_before(fs,fres,n?rt[0]:NULL);
++    VkDescriptorSet vset = stage_set(ch, 0, vs, rt, zt, n, &zt_ro, NULL, NULL, NULL, &storage, &images, raster_scale);
+     VkDescriptorSet fset =
+-        fs ? stage_set(ch, 4, fs, rt, zt, n, &zt_ro, &fb, &scaled, fres, &storage, &images) : VK_NULL_HANDLE;
++        fs ? stage_set(ch, 4, fs, rt, zt, n, &zt_ro, &fb, &scaled, fres, &storage, &images, raster_scale) : VK_NULL_HANDLE;
+     /* the sets of the stages between, at their stage's index (shader_vk_set) */
+     between[0] = tcs;
+     between[1] = tes;
+@@ -2768,7 +3518,7 @@
+             bset_ok = 0;
+             break;
+         }
+-        bset[b] = stage_set(ch, b + 1, between[b], rt, zt, n, &zt_ro, NULL, NULL, NULL, &storage, NULL);
++        bset[b] = stage_set(ch, b + 1, between[b], rt, zt, n, &zt_ro, NULL, NULL, NULL, &storage, NULL, raster_scale);
+         if (!bset[b]) bset_ok = 0;
+     }
+     if (!vset || (fs && !fset) || !bset_ok) {
+@@ -3033,7 +3783,7 @@
+     if (k->nbind)
+         rec_CmdBindVertexBuffers2(cb, 0, k->nbind, vbuf, voff, vsize, g_vk.has_dynamic_stride ? pl->stride : NULL);
+ 
+-    VkViewport vp = vk_render_viewport(r);
++    VkViewport vp = render_viewport_scaled(r, 0, raster_scale);
+     u32 viewports = last->si.writes_viewport ? GUEST_VIEWPORTS : 1;
+     if (viewports == 1 && !(vp.width > 0 && vp.height != 0)) {
+         draw_images_discard(&images);
+@@ -3045,7 +3795,7 @@
+                   ? g_vk.props.limits.viewportSubPixelBits
+                   : g_vk.props.limits.subPixelPrecisionBits; /* the points' nudge below */
+     for (u32 i = 0; i < viewports; i++) {
+-        viewport[i] = vk_render_viewport_at(r, i);
++        viewport[i] = render_viewport_scaled(r, i, raster_scale);
+         /* A point a pixel wide covers the pixel its window position falls in on the console (OpenGL's aliased point
+            rule), so one exactly on a pixel border goes to the pixel after it. Vulkan covers the pixels whose center is
+            in the point's square, and leaves a center on its edge to the device: RADV takes the pixel before. One game
+@@ -3057,7 +3807,7 @@
+            rounds away. Not at all on a viewport without subpixel bits. Only in the modes that game draws them in,
+            the OpenGL point center (0x597) and half-integer pixel centers (0x649): the others' rules aren't known */
+         if (topo == VK_PRIMITIVE_TOPOLOGY_POINT_LIST && !gs && !tes && !r[0x597] && !r[0x649] && sub) {
+-            float e = vk_scf(1.0f / (float)(1u << (sub < 7 ? sub : 7)));
++            float e = ((float)(1.0f / (float)(1u << (sub < 7 ? sub : 7))) * raster_scale);
+             viewport[i].x += e;
+             viewport[i].y += (r[0x4EB] & 1) ? -e : e;
+         }
+@@ -3067,10 +3817,10 @@
+         VkRect2D sc = {{0, 0}, area ? g_rp.ext : (VkExtent2D){0, 0}};
+         if (area && (r[0x380 + i * 4] & 1)) {
+             u32 xs = r[0x381 + i * 4], ys = r[0x382 + i * 4];
+-            i32 x0 = (i32)vk_scf(xs & 0xFFFF), x1 = (i32)vk_scf(xs >> 16);
+-            i32 y0 = (i32)vk_scf(ys & 0xFFFF), y1 = (i32)vk_scf(ys >> 16);
++            i32 x0 = (i32)((float)(xs & 0xFFFF) * raster_scale), x1 = (i32)((float)(xs >> 16) * raster_scale);
++            i32 y0 = (i32)((float)(ys & 0xFFFF) * raster_scale), y1 = (i32)((float)(ys >> 16) * raster_scale);
+             if (r[0x4EB] & 1) {
+-                i32 clip_height = (i32)vk_scf((float)(r[0x3FE] >> 16));
++                i32 clip_height = (i32)((float)((float)(r[0x3FE] >> 16)) * raster_scale);
+                 i32 old_y0 = y0;
+                 y0 = clip_height - y1;
+                 y1 = clip_height - old_y0;
+@@ -3084,6 +3834,19 @@
+         }
+         scissor[i] = sc;
+     }
++    if(tready && tlast+1==g_vk_present && zt && zt->gva==tzaddr && zt->sw==1920 && zt->sh==1080 && r[0x4B3] && viewports==1 && fabsf(viewport[0].width-1920)<1 && fabsf(fabsf(viewport[0].height)-1080)<1){
++        float j[2];tjitter(j);viewport[0].x+=j[0];viewport[0].y+=j[1];tjitframe=g_vk_present;tjitvalid=1;
++    }
++    static u32 inspectedPresent=~0u;
++    if(g_vk_present%90==0 && inspectedPresent!=g_vk_present && zt && n>=2 && (writes&2) && rt[1] &&
++       rt[1]->f.vk==VK_FORMAT_R8G8B8A8_SRGB && getenv("ARCEUS_QA_JITTER")){
++        inspectedPresent=g_vk_present;
++        LOG("arceus-qa: geometry present=%u lastResolve=%u ready=%u depth=%llx previousDepth=%llx test=%u viewports=%u extent=%ux%u viewport=%g,%g\n",
++            g_vk_present,tlast,tready,(unsigned long long)zt->gva,(unsigned long long)tzaddr,r[0x4B3],viewports,zt->sw,zt->sh,viewport[0].width,viewport[0].height);
++    }
++    resolution_trace(viewport[0], scissor[0], fs, fres, count, code + r[0x851]);
++    reflection_record(ch, fs, fres);
++    material_trace(viewport[0], scissor[0], vs, fs, fres, count, scaled, r);
+     if (fresh || g_dyn.viewports != viewports || memcmp(g_dyn.vp, viewport, viewports * sizeof *viewport)) {
+         memcpy(g_dyn.vp, viewport, viewports * sizeof *viewport);
+         rec_CmdSetViewportWithCount(cb, viewports, viewport);
+@@ -3199,7 +3962,7 @@
+     memcpy(&pc[8], scaled_words, sizeof scaled_words);
+     rec_CmdPushConstants(cb, g_vk_playout, VK_PUSH_STAGES, 0, sizeof pc, pc);
+ 
+-    vk_query_draw(cb, ch->id, r[0x574]); /* counted by the channel's samples-passed counter when it runs */
++    vk_query_draw(cb, ch->id, r[0x574] | (raster_scale>1.1f?0x80000000u:0)); /* counted by the channel's samples-passed counter when it runs */
+     VkBuffer counters[4] = {g_xfb.buf, g_xfb.buf, g_xfb.buf, g_xfb.buf};
+     VkDeviceSize counter_offs[4] = {0, 4, 8, 12};
+     /* the buffers from 0 to the last one bound, as begin and end take the counters of: one between that isn't bound
+@@ -3219,6 +3982,12 @@
+         rec_CmdBindTransformFeedbackBuffersEXT(cb, 0, xcount, xbuf, xoff, xsize);
+         rec_CmdBeginTransformFeedbackEXT(cb, 0, xcount, from, counter_offs);
+     }
++    u32 inputVertices=indexed?icount:count;
++    u64 captureCount=(u64)(inputVertices-inputVertices%3u)*instances;
++    int capturing=!xfb_on && !tcs && !gs && !tes && topology==4 && zt && zt->sw==1920 && zt->sh==1080 &&
++        n>=2 && (writes&2) && rt[1] && rt[1]->f.vk==VK_FORMAT_R8G8B8A8_SRGB &&
++        rt[1]->sw==1920 && rt[1]->sh==1080 && zt->f.vk==VK_FORMAT_D24_UNORM_S8_UINT &&
++        captureCount<=worldMaxVertices && g_vk.has_xfb && world_capture_begin(cb,(u32)captureCount,rt[1],zt,vp,ch,fs,fres);
+     pred_begin(cb, ch->render_pred);
+     if (indexed) {
+         rec_CmdBindIndexBuffer(cb, ibuf, ioff, itype);
+@@ -3228,6 +3997,7 @@
+     } else
+         rec_CmdDraw(cb, count, instances, first, base_instance);
+     pred_end(cb, ch->render_pred);
++    if(capturing)rec_CmdEndTransformFeedbackEXT(cb,0,0,NULL,NULL);
+     if (xcount) {
+         rec_CmdEndTransformFeedbackEXT(cb, 0, xcount, counters, counter_offs);
+         ch->xfb_started = (u8)((ch->xfb_started | xbound) & 15);
+@@ -3243,6 +4013,7 @@
+     if (zt && !zt_ro && (r[0x4BA] || (r[0x4E0] && ((r[0x4E7] & 0xFF) || (r[0x565] && (r[0x3D6] & 0xFF))))) &&
+         zt_written(zt, ch->render_pred, zt_undefined))
+         target_written(zt);
++    if(n && (writes&1))taa_after(ch,fs,fres,rt[0]);
+     g_vk_drawn++;
+ }
+ 
+@@ -3281,12 +4052,14 @@
+         return;
+     }
+     /* in the images' pixels: a target is scaled, and a texture made from one is too */
++    float dsx = (float)d->sw/d->w;
++    float dsy = dsx;
+     float tsx = (float)t->sw / (float)t->w, tsy = (float)t->sh / (float)t->h;
+     VkImageBlit b = {
+         .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+         .srcOffsets = {{(i32)(sx0 * tsx), (i32)(sy0 * tsy), 0}, {(i32)(sx1 * tsx), (i32)(sy1 * tsy), 1}},
+         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+-        .dstOffsets = {{(i32)vk_scf(x0), (i32)vk_scf(y0), 0}, {(i32)vk_scf(x0 + w), (i32)vk_scf(y0 + h), 1}}};
++        .dstOffsets = {{(i32)((x0) * dsx), (i32)((y0) * dsy), 0}, {(i32)((x0 + w) * dsx), (i32)((y0 + h) * dsy), 1}}};
+     int linear =
+         (x.tsc[1] & 3) == 2 && !t->f.is_int && format_has(t->f.vk, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+     vk_render_end(); /* blits happen outside rendering passes */
+@@ -3303,3 +4076,4 @@
+     vk_rt_drawn(d);
+     vk_surf_touch(d);
+ }
++
+--- a/src/nx/gpu/vk/renderer.c
++++ b/src/nx/gpu/vk/renderer.c
+@@ -34,6 +34,37 @@
+ static Surf* g_last;
+ static u32 g_last_x, g_last_y, g_last_w, g_last_h;
+ static u32 g_last_transform;
++/* Optional local diagnosis: F3 still saves its ordinary screenshot immediately.
++   A separate request records raw buffers and a matching final image at the next
++   completed game present. All access is under vk_lock; no timer or gameplay input. */
++static char g_material_snapshot[1024];
++static u32 g_material_snapshot_requests;
++static void material_snapshot_complete(Surf* src);
++
++static void material_snapshot_request(const char* path) {
++    const char* enabled = getenv("SNX_MATERIAL_SNAPSHOT");
++    if (!enabled || strcmp(enabled, "1") || !path || !*path || !g_last) return;
++    if (g_material_snapshot[0]) {
++        LOG("material-snapshot: earlier request still pending; ordinary screenshot saved\n");
++        return;
++    }
++    if (g_material_snapshot_requests >= 4) {
++        LOG("material-snapshot: four-capture limit reached; ordinary screenshots remain available\n");
++        return;
++    }
++    if (strpbrk(path, "\t\r\n")) return;
++    int n = snprintf(g_material_snapshot, sizeof g_material_snapshot, "%s_buffers_%u",
++                     path, g_material_snapshot_requests + 1);
++    if (n < 0 || (size_t)n >= sizeof g_material_snapshot) {
++        g_material_snapshot[0] = 0;
++        LOG("material-snapshot: screenshot path is too long\n");
++        return;
++    }
++    g_material_snapshot_requests++;
++    LOG("material-snapshot: queued %s for next completed game present; ordinary screenshot is unpaired\n",
++        g_material_snapshot);
++}
++
+ /* vk_lock once around the hooks: each takes it again only as a depth count. Each took and dropped it on its own, and
+    every drop let the lock go (vk_let_go) on the GPU thread's writes, the constant buffer uploads before most draws */
+ static void vkr_before_write(u64 gva, u64 size) {
+@@ -659,10 +690,14 @@
+     vk_lock();
+     vk_buf_writable_abort(); /* a draw abandoned during setup has no shader writes to land */
+     vk_render_end();
++    int cpu_fallback = 0;
+     Surf* src = NULL;
+     if (w && h && w <= g_vk.props.limits.maxImageDimension2D && h <= g_vk.props.limits.maxImageDimension2D) {
+         src = vk_rt_for_cpu(cpu_addr, w, h);
+-        if (!src || src->f.is_int) src = cpu_frame(cpu_addr, w, h, pitch, layout, bhl, fmt);
++        if (!src || src->f.is_int) {
++            cpu_fallback = 1;
++            src = cpu_frame(cpu_addr, w, h, pitch, layout, bhl, fmt);
++        }
+     }
+     /* the part of the buffer shown: vi's crop, or all of it */
+     u32 x0 = 0, y0 = 0, x1 = w, y1 = h;
+@@ -689,7 +724,23 @@
+         g_last_w = (u32)((u64)src->sw * x1 / src->w) - g_last_x;
+         g_last_h = (u32)((u64)src->sh * y1 / src->h) - g_last_y;
+     }
++    static int resolution_trace_enabled = -1;
++    static u32 last_resolution[9];
++    if (resolution_trace_enabled < 0) {
++        const char* e = getenv("SNX_RESOLUTION_TRACE");
++        resolution_trace_enabled = e && *e && *e != '0';
++    }
++    if (resolution_trace_enabled) {
++        u32 dims[9] = {w, h, src ? src->w : 0, src ? src->h : 0,
++                       src ? src->sw : 0, src ? src->sh : 0, g_last_w, g_last_h, (u32)cpu_fallback};
++        if (memcmp(last_resolution, dims, sizeof dims)) {
++            memcpy(last_resolution, dims, sizeof dims);
++            LOG("resolution-trace: present buffer=%ux%u guest=%ux%u image=%ux%u crop=%ux%u cpu_fallback=%d\n",
++                dims[0], dims[1], dims[2], dims[3], dims[4], dims[5], dims[6], dims[7], cpu_fallback);
++        }
++    }
+     show(src, x1 - x0, y1 - y0, transform, 1);
++    material_snapshot_complete(src);
+     __atomic_store_n(&g_shown_ns, plat_ns(), __ATOMIC_RELAXED);
+     vk_unlock();
+ }
+@@ -792,11 +843,62 @@
+     }
+     return hash;
+ }
++/* Called only after show() submitted its swapchain-acquire wait and queued
++   presentation. Refreshes of the runtime menu do not consume this request. */
++static void material_snapshot_complete(Surf* src) {
++    if (!g_material_snapshot[0] || !src || src != g_last || !g_last_w || !g_last_h) return;
++    char prefix[sizeof g_material_snapshot], final_prefix[1100], pair_path[1100], final_path[1100];
++    memcpy(prefix, g_material_snapshot, sizeof prefix);
++    g_material_snapshot[0] = 0; /* one shot, including failures */
++    int a = snprintf(final_prefix, sizeof final_prefix, "%s_final", prefix);
++    int b = snprintf(pair_path, sizeof pair_path, "%s_pair.tsv", prefix);
++    int c = snprintf(final_path, sizeof final_path, "%s_final.ppm", prefix);
++    if (a < 0 || (size_t)a >= sizeof final_prefix || b < 0 || (size_t)b >= sizeof pair_path ||
++        c < 0 || (size_t)c >= sizeof final_path) {
++        LOG("material-snapshot: paired output path is too long\n");
++        return;
++    }
++    /* Raw attachment copies finish before surf_save's temporary image is made;
++       no temporary-image allocation can evict a gathered attachment pointer. */
++    vk_surf_diagnostic_capture(prefix);
++    u64 hash = surf_save(src, g_last_x, g_last_y, g_last_w, g_last_h, g_last_transform, final_prefix);
++    int final_ok = 0;
++    FILE* check = fopen(final_path, "rb");
++    if (check) {
++        char header[80];
++        int bytes = snprintf(header, sizeof header, "P6\n%u %u\n255\n", g_last_w, g_last_h);
++        if (bytes > 0 && !fseek(check, 0, SEEK_END)) {
++            long length = ftell(check);
++            final_ok = length >= 0 && (u64)length == (u64)bytes + (u64)g_last_w * g_last_h * 3;
++        }
++        fclose(check);
++    }
++    FILE* pair = fopen(pair_path, "wb");
++    int ok = pair != NULL;
++    if (pair) {
++        ok = fprintf(pair,
++            "# raw_orientation=guest-image-order final_orientation=crop-and-flip_src-transform\n"
++            "# final_scope=guest-final-surface-excludes-runtime-postfx-letterbox-and-UI\n"
++            "# ordinary-F3-screenshot-is-earlier-and-not-the-attachment-pair\n"
++            "present\tfinal_file\tfinal_complete\tfinal_hash\tgva\tfkey\tvkformat\tguest_w\tguest_h"
++            "\timage_w\timage_h\tlayers\tcrop_x\tcrop_y\tcrop_w\tcrop_h\ttransform\n"
++            "%llu\t%s\t%d\t%llx\t%llx\t%x\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\n",
++            (unsigned long long)g_vk_present, final_path, final_ok, (unsigned long long)hash,
++            (unsigned long long)src->gva, src->fkey, (u32)src->f.vk, src->w, src->h, src->sw, src->sh,
++            src->layers, g_last_x, g_last_y, g_last_w, g_last_h, g_last_transform) >= 0;
++        if (fclose(pair)) ok = 0;
++    }
++    if (!ok) LOG("material-snapshot: incomplete pairing metadata %s\n", pair_path);
++    LOG("material-snapshot: paired present=%llu final_complete=%d final=%s metadata=%s\n",
++        (unsigned long long)g_vk_present, final_ok, final_path, pair_path);
++}
++
+ /* the last presented frame as PPM (path.ppm), and a hash of its pixels */
+ static u64 vkr_screenshot(const char* path) {
+     vk_lock();
+     u64 hash = g_last ? surf_save(g_last, g_last_x, g_last_y, g_last_w, g_last_h, g_last_transform, path)
+                       : 1469598103934665603ull;
++    material_snapshot_request(path);
+     vk_unlock();
+     return hash;
+ }
+--- a/src/nx/gpu/vk/surface.c
++++ b/src/nx/gpu/vk/surface.c
+@@ -166,6 +166,15 @@
+ 
+ static u64 g_rt_made; /* for the stats line */
+ u64 vk_rt_made(void) { return g_rt_made; }
++
++/* Explicit Arceus experiment: the observed 1024-square D32/tag shadow pair.
++   Disabled by default; no scene color/depth format is selected. */
++static int native_shadow_shape(u32 w, u32 h, u32 fkey) {
++    const char* flag = getenv("SNX_ARCEUS_NATIVE_SHADOWS");
++    return flag && !strcmp(flag, "1") && w == 1024 && h == 1024 &&
++           (fkey == 0x1000a || fkey == 0xf6);
++}
++
+ static Surf* surf_create(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 bh, u32 pitch, int is_rt, u32 layers) {
+     Surf* s = calloc(1, sizeof *s);
+     if (!s) return NULL;
+@@ -174,6 +183,16 @@
+     s->h = h;
+     s->sw = is_rt ? vk_sc(w) : w;
+     s->sh = is_rt ? vk_sc(h) : h;
++    /* Arceus 1.1.1 docked display chain confirmed in independent captures. Only these
++       full-size, one-layer LDR surfaces get the 4/3 display scale. Unknowns are native. */
++    if (!(is_rt && w==1920 && h==1080 && layers==1 &&
++        ((gva==0x54d320000ull && fkey==0xd6) ||
++        ((gva==0x553550000ull || gva==0x553dc0000ull) && fkey==0xd5)))) {s->sw=w;s->sh=h;}
++    if (is_rt && native_shadow_shape(w, h, fkey)) {
++        s->sw = w; s->sh = h;
++        LOG_LIMIT(8, "arceus-native-shadow: target=%llx format=%x native=%ux%u\n",
++                  (unsigned long long)gva, fkey, w, h);
++    }
+     s->layers = layers;
+     s->levels = 1;
+     s->fkey = fkey;
+@@ -1490,12 +1509,12 @@
+     vk_surf_touch(st); /* used now: making the destination may evict what wasn't */
+     dt = vk_zt_array(d->addr, d->width, d->height, fmt, tile, 1, 0);
+     if (!dt || dt == st || dt->f.vk != st->f.vk) return 0;
+-    float S = g_vk_scale;
++    float S = (float)st->sw/st->w, D=(float)dt->sw/dt->w;
+     i32 x0 = (i32)(sx * S), y0 = (i32)(sy * S), x1 = (i32)((sx + sdx * dw) * S + 0.5),
+         y1 = (i32)((sy + sdy * dh) * S + 0.5);
+-    i32 X1 = (i32)((dx + dw) * S + 0.5f), Y1 = (i32)((dy + dh) * S + 0.5f);
+-    dx = (i32)(dx * S);
+-    dy = (i32)(dy * S);
++    i32 X1 = (i32)((dx + dw) * D + 0.5f), Y1 = (i32)((dy + dh) * D + 0.5f);
++    dx = (i32)(dx * D);
++    dy = (i32)(dy * D);
+     if (x1 > (i32)st->sw) x1 = (i32)st->sw;
+     if (y1 > (i32)st->sh) y1 = (i32)st->sh;
+     if (X1 > (i32)dt->sw) X1 = (i32)dt->sw;
+@@ -1540,12 +1559,12 @@
+     if (!blit_ok(st->f.vk, VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !blit_ok(dt->f.vk, VK_FORMAT_FEATURE_BLIT_DST_BIT))
+         return 0;
+     /* in the images' pixels: targets are scaled */
+-    float S = g_vk_scale;
++    float S = (float)st->sw/st->w, D=(float)dt->sw/dt->w;
+     i32 x0 = (i32)(sx * S), y0 = (i32)(sy * S), x1 = (i32)((sx + sdx * dw) * S + 0.5),
+         y1 = (i32)((sy + sdy * dh) * S + 0.5);
+-    i32 X1 = (i32)((dx + dw) * S + 0.5f), Y1 = (i32)((dy + dh) * S + 0.5f);
+-    dx = (i32)(dx * S);
+-    dy = (i32)(dy * S);
++    i32 X1 = (i32)((dx + dw) * D + 0.5f), Y1 = (i32)((dy + dh) * D + 0.5f);
++    dx = (i32)(dx * D);
++    dy = (i32)(dy * D);
+     if (x1 > (i32)st->sw) x1 = (i32)st->sw;
+     if (y1 > (i32)st->sh) y1 = (i32)st->sh;
+     if (X1 > (i32)dt->sw) X1 = (i32)dt->sw;
+@@ -1758,3 +1777,404 @@
+ }
+ /* a load's reset: what an earlier state left unmatched goes */
+ void vk_zt_forget(void) { zt_drop(); }
++
++/* Append to surface.c: optional, local raw attachment snapshots after a completed game present.
++   The caller holds vk_lock and has already submitted the swapchain-acquire wait. */
++#define DIAG_SURF_MAX 96u
++#define DIAG_SURF_IMAGE_BYTES (64ull << 20)
++#define DIAG_SURF_TOTAL_BYTES (384ull << 20)
++#define DIAG_SURF_PATH 1100u
++
++static void vk_surf_reflection_capture(const char* prefix);
++void vk_reflection_bindings_capture(const char* prefix);
++static u32 diagnostic_pixel_bytes(const Surf* s, VkImageAspectFlags* aspect) {
++    *aspect = s->f.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
++    if (s->f.depth) {
++        switch (s->f.vk) {
++            case VK_FORMAT_D16_UNORM:
++            case VK_FORMAT_D16_UNORM_S8_UINT: return 2;
++            case VK_FORMAT_X8_D24_UNORM_PACK32:
++            case VK_FORMAT_D24_UNORM_S8_UINT:
++            case VK_FORMAT_D32_SFLOAT:
++            case VK_FORMAT_D32_SFLOAT_S8_UINT: return 4;
++            default: return 0;
++        }
++    }
++    /* Vulkan storage bytes, not f.bpp: converted guest textures can differ. No
++       native compressed/packed-YUV images or guessed bytes-per-pixel. */
++    switch (s->f.vk) {
++        case VK_FORMAT_R8_UNORM:
++        case VK_FORMAT_R8_UINT: return 1;
++        case VK_FORMAT_R16_UNORM:
++        case VK_FORMAT_R16_SFLOAT: return 2;
++        case VK_FORMAT_R16G16_UNORM:
++        case VK_FORMAT_R16G16_SNORM:
++        case VK_FORMAT_R8G8B8A8_UNORM:
++        case VK_FORMAT_R8G8B8A8_SRGB:
++        case VK_FORMAT_R32_SFLOAT:
++        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return 4;
++        case VK_FORMAT_R16G16B16A16_SFLOAT:
++        case VK_FORMAT_R32G32_SFLOAT: return 8;
++        case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
++        default: return 0;
++    }
++}
++
++static int diagnostic_surface_size(const Surf* s, u32 present, u32* bpp,
++                                   VkImageAspectFlags* aspect, u64* size) {
++    if (!s->img || (!s->is_rt && !s->took_drawn) ||
++        (u32)(present - (u32)s->last_used) > 2 || !s->sw || !s->sh || !s->layers ||
++        s->layout == VK_IMAGE_LAYOUT_UNDEFINED || s->pred_undefined || s->volume ||
++        s->type == VK_IMAGE_VIEW_TYPE_3D || s->depth3d > 1) return 0;
++    if (s->type != VK_IMAGE_VIEW_TYPE_2D && s->type != VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
++        s->type != VK_IMAGE_VIEW_TYPE_CUBE && s->type != VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) return 0;
++    *bpp = diagnostic_pixel_bytes(s, aspect);
++    if (!*bpp) return 0;
++    /* Bound each multiply before doing it, including corrupt/unexpected extents. */
++    u64 n = *bpp;
++    if (s->sw > DIAG_SURF_IMAGE_BYTES / n) return 0;
++    n *= s->sw;
++    if (s->sh > DIAG_SURF_IMAGE_BYTES / n) return 0;
++    n *= s->sh;
++    if (s->layers > DIAG_SURF_IMAGE_BYTES / n) return 0;
++    *size = n * s->layers;
++    return 1;
++}
++
++void vk_surf_diagnostic_capture(const char* prefix) {
++    vk_reflection_bindings_capture(prefix);
++    vk_surf_reflection_capture(prefix);
++    const char* enabled = getenv("SNX_MATERIAL_SNAPSHOT");
++    if (!enabled || strcmp(enabled, "1") || !prefix || !*prefix) return;
++    char manifest_path[DIAG_SURF_PATH], file_path[DIAG_SURF_PATH];
++    /* TSV paths cannot contain separators; reject rather than produce ambiguous metadata. */
++    if (strpbrk(prefix, "\t\r\n")) {
++        LOG("material-snapshot: invalid control character in prefix\n");
++        return;
++    }
++    int written = snprintf(manifest_path, sizeof manifest_path, "%s_attachments.tsv", prefix);
++    if (written < 0 || (size_t)written >= sizeof manifest_path) {
++        LOG("material-snapshot: prefix is too long\n");
++        return;
++    }
++    FILE* manifest = fopen(manifest_path, "wb");
++    if (!manifest) {
++        LOG("material-snapshot: cannot open %s\n", manifest_path);
++        return;
++    }
++    /* Safe only after present's acquire-wait submission. Finish/land prior work
++       before gathering pointers; recycle the new command slot before that too.
++       No cache allocation, trim or eviction is performed after gathering. */
++    vk_finish();
++    vk_render_end();
++    vk_cmd();
++    const u32 present = g_vk_present;
++    struct {
++        Surf* surf;
++        u64 bytes;
++        u32 bpp;
++        VkImageAspectFlags aspect;
++    } selected[DIAG_SURF_MAX];
++    u32 n = 0, eligible = 0, bounded_out = 0, succeeded = 0, failures = 0;
++    u64 total = 0, maximum = 0;
++    const int lists[] = {VK_LRU_RT, VK_LRU_RT + LRU_AGED, VK_LRU_TEX, VK_LRU_TEX + LRU_AGED};
++    /* Newest first. Gather without changing recency or calling allocation/flush
++       helpers while walking the LRU. Each Surf occurs in exactly one list. */
++    for (u32 l = 0; l < sizeof lists / sizeof lists[0]; l++)
++        for (Surf* s = g_lru[lists[l]].tail; s; s = s->lru_prev) {
++            u32 bpp; u64 size; VkImageAspectFlags aspect;
++            if (!diagnostic_surface_size(s, present, &bpp, &aspect, &size)) continue;
++            eligible++;
++            if (n == DIAG_SURF_MAX || size > DIAG_SURF_TOTAL_BYTES - total) {
++                bounded_out++;
++                continue;
++            }
++            selected[n].surf = s; selected[n].bytes = size;
++            selected[n].bpp = bpp; selected[n].aspect = aspect;
++            n++; total += size;
++            if (size > maximum) maximum = size;
++        }
++    int manifest_ok = fprintf(manifest,
++        "# material-snapshot v1 present=%u selected=%u eligible=%u bounded_out=%u total_bytes=%llu "
++        "scope=raw-base-mip-all-array-layers-depth-only-no-stencil\n"
++        "index\tstatus\tfile\tpresent\tgva\tfkey\tvkformat\taspect\tbpp\tguest_w\tguest_h\timage_w\timage_h"
++        "\tlayers\tlevels\tmip\tbytes\trow_bytes\tlayer_bytes\tis_rt\ttook_drawn\twgen\tdrawn_at\tlast_used"
++        "\toriginal_layout\twseq\n",
++        present, n, eligible, bounded_out, (unsigned long long)total) >= 0;
++    VkBuffer buffer = VK_NULL_HANDLE;
++    /* One bounded host buffer reused serially. This helper directly allocates
++       through VMA, without vk_mem_trim. No full-capture-sized GPU buffer. */
++    const u8* pixels = n && manifest_ok ? vk_readback_buffer(maximum, &buffer) : NULL;
++    if (n && manifest_ok && !pixels) {
++        LOG("material-snapshot: readback allocation of %llu bytes failed\n", (unsigned long long)maximum);
++        manifest_ok = fprintf(manifest, "# readback-allocation-failed bytes=%llu\n",
++                              (unsigned long long)maximum) >= 0;
++        failures++;
++    }
++    for (u32 i = 0; i < n && pixels && manifest_ok; i++) {
++        Surf* s = selected[i].surf;
++        u64 size = selected[i].bytes;
++        written = snprintf(file_path, sizeof file_path, "%s_%02u.bin", prefix, i);
++        if (written < 0 || (size_t)written >= sizeof file_path) {
++            LOG("material-snapshot: attachment path is too long\n");
++            failures++;
++            break;
++        }
++        FILE* out = fopen(file_path, "wb");
++        if (!out) {
++            LOG("material-snapshot: cannot open %s\n", file_path);
++            failures++;
++        }
++        int ok = out != NULL;
++        VkImageLayout layout = s->layout;
++        VkPipelineStageFlags2 stage = s->stage;
++        VkAccessFlags2 access = s->access;
++        if (out) {
++            VkCommandBuffer cb = vk_cmd();
++            vk_surf_use(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
++                        VK_ACCESS_2_TRANSFER_READ_BIT);
++            VkBufferImageCopy copy = {.bufferOffset = 0,
++                .imageSubresource = {selected[i].aspect, 0, 0, s->layers},
++                .imageExtent = {s->sw, s->sh, 1}};
++            rec_CmdCopyImageToBuffer(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
++            /* Restore both the Vulkan layout and the renderer's tracked use. */
++            vk_surf_use(cb, s, layout, stage ? stage : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, access);
++            VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
++                .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
++            VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++                                   .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
++            rec_CmdPipelineBarrier2(cb, &di);
++            vk_finish();
++            /* Same-layout read/read use deliberately unions stages in
++               vk_surf_use. The copy is now completed, so discard only its
++               extra tracking and restore the caller's exact original state. */
++            s->layout = layout;
++            s->stage = stage;
++            s->access = access;
++            vk_readback_ready();
++            ok = fwrite(pixels, 1, (size_t)size, out) == (size_t)size;
++            if (fclose(out)) ok = 0;
++            if (!ok) {
++                LOG("material-snapshot: incomplete write of %s\n", file_path);
++                failures++;
++            } else succeeded++;
++        }
++        manifest_ok = fprintf(manifest,
++            "%u\t%s\t%s\t%u\t%llx\t%x\t%u\t%s\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t0\t%llu"
++            "\t%llu\t%llu\t%d\t%d\t%u\t%u\t%llu\t%u\t%llu\n",
++            i, ok ? "ok" : "write-failed", file_path, present, (unsigned long long)s->gva, s->fkey,
++            (u32)s->f.vk, s->f.depth ? "depth" : "color", selected[i].bpp, s->w, s->h, s->sw, s->sh,
++            s->layers, s->levels, (unsigned long long)size, (unsigned long long)s->sw * selected[i].bpp,
++            (unsigned long long)s->sw * s->sh * selected[i].bpp, s->is_rt, s->took_drawn, s->wgen,
++            s->drawn_at, (unsigned long long)s->last_used, (u32)layout, (unsigned long long)s->wseq) >= 0;
++    }
++    if (manifest_ok)
++        manifest_ok = fprintf(manifest, "# completed=%u failures=%u\n", succeeded, failures) >= 0;
++    if (fclose(manifest)) manifest_ok = 0;
++    if (!manifest_ok) LOG("material-snapshot: incomplete manifest %s\n", manifest_path);
++    LOG("material-snapshot: present=%u wrote=%u selected=%u eligible=%u bounded_out=%u failures=%u manifest=%s\n",
++        present, succeeded, n, eligible, bounded_out, failures, manifest_path);
++}
++
++static u32 reflection_block_bytes(const Surf* s, VkImageAspectFlags* aspect) {
++    *aspect = s->f.depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
++    if (s->f.depth) {
++        switch (s->f.vk) {
++            case VK_FORMAT_D16_UNORM:
++            case VK_FORMAT_D16_UNORM_S8_UINT: return 2;
++            case VK_FORMAT_X8_D24_UNORM_PACK32:
++            case VK_FORMAT_D24_UNORM_S8_UINT:
++            case VK_FORMAT_D32_SFLOAT:
++            case VK_FORMAT_D32_SFLOAT_S8_UINT: return 4;
++            default: return 0;
++        }
++    }
++    /* Vulkan storage bytes, not f.bpp: converted guest textures can differ. No
++       native compressed/packed-YUV images or guessed bytes-per-pixel. */
++    switch (s->f.vk) {
++        case VK_FORMAT_BC6H_SFLOAT_BLOCK:
++        case VK_FORMAT_BC6H_UFLOAT_BLOCK: return 16;
++        case VK_FORMAT_R8_UNORM:
++        case VK_FORMAT_R8_UINT: return 1;
++        case VK_FORMAT_R16_UNORM:
++        case VK_FORMAT_R16_SFLOAT: return 2;
++        case VK_FORMAT_R16G16_UNORM:
++        case VK_FORMAT_R16G16_SNORM:
++        case VK_FORMAT_R8G8B8A8_UNORM:
++        case VK_FORMAT_R8G8B8A8_SRGB:
++        case VK_FORMAT_R32_SFLOAT:
++        case VK_FORMAT_B10G11R11_UFLOAT_PACK32: return 4;
++        case VK_FORMAT_R16G16B16A16_SFLOAT:
++        case VK_FORMAT_R32G32_SFLOAT: return 8;
++        case VK_FORMAT_R32G32B32A32_SFLOAT: return 16;
++        default: return 0;
++    }
++}
++
++static int reflection_surface_size(const Surf* s, u32 present, u32 mip, u32* bpp,
++                                   VkImageAspectFlags* aspect, u64* size) {
++    if (!s->img || (s->type != VK_IMAGE_VIEW_TYPE_CUBE && s->type != VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) ||
++        (u32)(present - (u32)s->last_used) > 2 || !s->sw || !s->sh || !s->layers ||
++        s->layout == VK_IMAGE_LAYOUT_UNDEFINED || s->pred_undefined || s->volume ||
++        s->type == VK_IMAGE_VIEW_TYPE_3D || s->depth3d > 1) return 0;
++    if (s->type != VK_IMAGE_VIEW_TYPE_2D && s->type != VK_IMAGE_VIEW_TYPE_2D_ARRAY &&
++        s->type != VK_IMAGE_VIEW_TYPE_CUBE && s->type != VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) return 0;
++    *bpp = reflection_block_bytes(s, aspect);
++    if (!*bpp) return 0;
++    /* Bound each multiply before doing it, including corrupt/unexpected extents. */
++    u32 w = s->sw >> mip, h = s->sh >> mip;
++    if (!w) w = 1; if (!h) h = 1;
++    if (w > DIAG_SURF_IMAGE_BYTES || h > DIAG_SURF_IMAGE_BYTES) return 0;
++    u32 block = s->f.vk == VK_FORMAT_BC6H_SFLOAT_BLOCK || s->f.vk == VK_FORMAT_BC6H_UFLOAT_BLOCK ? 4 : 1;
++    w = (w + block - 1) / block; h = (h + block - 1) / block;
++    u64 n = *bpp;
++    if (w > DIAG_SURF_IMAGE_BYTES / n) return 0;
++    n *= w;
++    if (h > DIAG_SURF_IMAGE_BYTES / n) return 0;
++    n *= h;
++    if (s->layers > DIAG_SURF_IMAGE_BYTES / n) return 0;
++    *size = n * s->layers;
++    return 1;
++}
++
++static void vk_surf_reflection_capture(const char* prefix) {
++    const char* enabled = getenv("SNX_REFLECTION_CAPTURE");
++    if (!enabled || strcmp(enabled, "1") || !prefix || !*prefix) return;
++    char manifest_path[DIAG_SURF_PATH], file_path[DIAG_SURF_PATH];
++    /* TSV paths cannot contain separators; reject rather than produce ambiguous metadata. */
++    if (strpbrk(prefix, "\t\r\n")) {
++        LOG("reflection-snapshot: invalid control character in prefix\n");
++        return;
++    }
++    int written = snprintf(manifest_path, sizeof manifest_path, "%s_reflections.tsv", prefix);
++    if (written < 0 || (size_t)written >= sizeof manifest_path) {
++        LOG("reflection-snapshot: prefix is too long\n");
++        return;
++    }
++    FILE* manifest = fopen(manifest_path, "wb");
++    if (!manifest) {
++        LOG("reflection-snapshot: cannot open %s\n", manifest_path);
++        return;
++    }
++    /* Safe only after present's acquire-wait submission. Finish/land prior work
++       before gathering pointers; recycle the new command slot before that too.
++       No cache allocation, trim or eviction is performed after gathering. */
++    vk_finish();
++    vk_render_end();
++    vk_cmd();
++    const u32 present = g_vk_present;
++    struct {
++        Surf* surf;
++        u64 bytes;
++        u32 bpp, mip;
++        VkImageAspectFlags aspect;
++    } selected[256u];
++    u32 n = 0, eligible = 0, bounded_out = 0, succeeded = 0, failures = 0;
++    u64 total = 0, maximum = 0;
++    const int lists[] = {VK_LRU_RT, VK_LRU_RT + LRU_AGED, VK_LRU_TEX, VK_LRU_TEX + LRU_AGED};
++    /* Newest first. Gather without changing recency or calling allocation/flush
++       helpers while walking the LRU. Each Surf occurs in exactly one list. */
++    for (u32 l = 0; l < sizeof lists / sizeof lists[0]; l++)
++        for (Surf* s = g_lru[lists[l]].tail; s; s = s->lru_prev) {
++          for (u32 mip = 0; mip < s->levels && mip < 16; mip++) {
++            u32 bpp; u64 size; VkImageAspectFlags aspect;
++            if (!reflection_surface_size(s, present, mip, &bpp, &aspect, &size)) continue;
++            eligible++;
++            if (n == 256u || size > (64ull << 20) - total) {
++                bounded_out++;
++                continue;
++            }
++            selected[n].surf = s; selected[n].bytes = size;
++            selected[n].bpp = bpp; selected[n].mip = mip; selected[n].aspect = aspect;
++            n++; total += size;
++            if (size > maximum) maximum = size;
++        }
++          }
++    int manifest_ok = fprintf(manifest,
++        "# reflection-snapshot v1 present=%u selected=%u eligible=%u bounded_out=%u total_bytes=%llu "
++        "scope=raw-all-cube-mips-all-faces-BC6-blocks-or-uncompressed\n"
++        "index\tstatus\tfile\tpresent\tgva\tfkey\tvkformat\taspect\tbpp\tguest_w\tguest_h\timage_w\timage_h"
++        "\tlayers\tlevels\tmip\tbytes\trow_bytes\tlayer_bytes\tis_rt\ttook_drawn\twgen\tdrawn_at\tlast_used"
++        "\toriginal_layout\twseq\tblock_width\tblock_height\n",
++        present, n, eligible, bounded_out, (unsigned long long)total) >= 0;
++    VkBuffer buffer = VK_NULL_HANDLE;
++    /* One bounded host buffer reused serially. This helper directly allocates
++       through VMA, without vk_mem_trim. No full-capture-sized GPU buffer. */
++    const u8* pixels = n && manifest_ok ? vk_readback_buffer(maximum, &buffer) : NULL;
++    if (n && manifest_ok && !pixels) {
++        LOG("reflection-snapshot: readback allocation of %llu bytes failed\n", (unsigned long long)maximum);
++        manifest_ok = fprintf(manifest, "# readback-allocation-failed bytes=%llu\n",
++                              (unsigned long long)maximum) >= 0;
++        failures++;
++    }
++    for (u32 i = 0; i < n && pixels && manifest_ok; i++) {
++        Surf* s = selected[i].surf;
++        u64 size = selected[i].bytes;
++        u32 mip = selected[i].mip, w = s->sw >> mip, h = s->sh >> mip;
++        if (!w) w = 1; if (!h) h = 1;
++        u32 block = s->f.vk == VK_FORMAT_BC6H_SFLOAT_BLOCK || s->f.vk == VK_FORMAT_BC6H_UFLOAT_BLOCK ? 4 : 1;
++        u64 row = (u64)((w + block - 1) / block) * selected[i].bpp;
++        u64 layer = row * ((h + block - 1) / block);
++        written = snprintf(file_path, sizeof file_path, "%s_reflection_%02u.bin", prefix, i);
++        if (written < 0 || (size_t)written >= sizeof file_path) {
++            LOG("reflection-snapshot: attachment path is too long\n");
++            failures++;
++            break;
++        }
++        FILE* out = fopen(file_path, "wb");
++        if (!out) {
++            LOG("reflection-snapshot: cannot open %s\n", file_path);
++            failures++;
++        }
++        int ok = out != NULL;
++        VkImageLayout layout = s->layout;
++        VkPipelineStageFlags2 stage = s->stage;
++        VkAccessFlags2 access = s->access;
++        if (out) {
++            VkCommandBuffer cb = vk_cmd();
++            vk_surf_use(cb, s, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
++                        VK_ACCESS_2_TRANSFER_READ_BIT);
++            VkBufferImageCopy copy = {.bufferOffset = 0,
++                .imageSubresource = {selected[i].aspect, mip, 0, s->layers},
++                .imageExtent = {w, h, 1}};
++            rec_CmdCopyImageToBuffer(cb, s->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer, 1, &copy);
++            /* Restore both the Vulkan layout and the renderer's tracked use. */
++            vk_surf_use(cb, s, layout, stage ? stage : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, access);
++            VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
++                .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT, .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
++                .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
++            VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
++                                   .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
++            rec_CmdPipelineBarrier2(cb, &di);
++            vk_finish();
++            /* Same-layout read/read use deliberately unions stages in
++               vk_surf_use. The copy is now completed, so discard only its
++               extra tracking and restore the caller's exact original state. */
++            s->layout = layout;
++            s->stage = stage;
++            s->access = access;
++            vk_readback_ready();
++            ok = fwrite(pixels, 1, (size_t)size, out) == (size_t)size;
++            if (fclose(out)) ok = 0;
++            if (!ok) {
++                LOG("reflection-snapshot: incomplete write of %s\n", file_path);
++                failures++;
++            } else succeeded++;
++        }
++        manifest_ok = fprintf(manifest,
++            "%u\t%s\t%s\t%u\t%llx\t%x\t%u\t%s\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%u\t%llu"
++            "\t%llu\t%llu\t%d\t%d\t%u\t%u\t%llu\t%u\t%llu\t%u\t%u\n",
++            i, ok ? "ok" : "write-failed", file_path, present, (unsigned long long)s->gva, s->fkey,
++            (u32)s->f.vk, s->f.depth ? "depth" : "color", selected[i].bpp, s->w, s->h, w, h,
++            s->layers, s->levels, mip, (unsigned long long)size, (unsigned long long)row,
++            (unsigned long long)layer, s->is_rt, s->took_drawn, s->wgen,
++            s->drawn_at, (unsigned long long)s->last_used, (u32)layout, (unsigned long long)s->wseq, block, block) >= 0;
++    }
++    if (manifest_ok)
++        manifest_ok = fprintf(manifest, "# completed=%u failures=%u\n", succeeded, failures) >= 0;
++    if (fclose(manifest)) manifest_ok = 0;
++    if (!manifest_ok) LOG("reflection-snapshot: incomplete manifest %s\n", manifest_path);
++    LOG("reflection-snapshot: present=%u wrote=%u selected=%u eligible=%u bounded_out=%u failures=%u manifest=%s\n",
++        present, succeeded, n, eligible, bounded_out, failures, manifest_path);
++}
+--- a/src/nx/gpu/vk/texture.c
++++ b/src/nx/gpu/vk/texture.c
+@@ -552,8 +552,10 @@
+         c->gva = rt->gva;
+         c->w = w;
+         c->h = h;
+-        c->sw = vk_sc(w) < rt->sw ? vk_sc(w) : rt->sw; /* the same region of the scaled target */
+-        c->sh = vk_sc(h) < rt->sh ? vk_sc(h) : rt->sh;
++        u32 cw = rt->sw == rt->w ? w : vk_sc(w);
++        u32 ch = rt->sh == rt->h ? h : vk_sc(h);
++        c->sw = cw < rt->sw ? cw : rt->sw; /* the same region of the scaled target */
++        c->sh = ch < rt->sh ? ch : rt->sh;
+         c->layers = rt->layers;
+         c->levels = c->depth3d = 1;
+         c->f = f;
+--- a/src/nx/gpu/vk/vk.h
++++ b/src/nx/gpu/vk/vk.h
+@@ -550,6 +550,8 @@
+ void vk_surf_add(Surf* s); /* a texture, into the table and the textures' recency list */
+ /* s used now: last_used is this present, and it moves to the recent end of its list */
+ void vk_surf_touch(Surf* s);
++/* Optional local raw attachments, under vk_lock after a completed game present. */
++void vk_surf_diagnostic_capture(const char* prefix);
+ /* s's pixels can be had again now: off the list of old ones whose pixels would be lost, if it is on it */
+ void vk_surf_relist(Surf* s);
+ VkImageAspectFlags vk_aspect(const VkFmt* f);
+--- a/src/nx/gpu/vk/writeback.c
++++ b/src/nx/gpu/vk/writeback.c
+@@ -2,6 +2,9 @@
+    Copyright 2026 the ScarletNX contributors */
+ /* Reconcile a shader's mapped output with guest memory. The host may have written the guest range while the GPU was
+    running: shader-changed bytes land only where the guest still holds the value the shader originally read. */
++#if defined(__SSE2__)
++#include <immintrin.h>
++#endif
+ #include <stdlib.h>
+ #include <string.h>
+ #include "nx/gpu/gpu.h"
+@@ -17,6 +20,28 @@
+ 
+ /* whether [p, p + n) overlaps the guest's address space, where pages the GPU holds fault when read */
+ static int in_guest(const u8* p, u32 n) { return p < g_mem + AS_SIZE && p + n > g_mem; }
++
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++/* Masked guest accesses touch only bytes changed by the shader. A guest
++   write that differs from the original snapshot wins the merge. */
++__attribute__((target("avx512f,avx512bw")))
++static int merge_mapped_wide(u8* dst, const u8* res, const u8* org, u32 bytes) {
++    int changed = 0;
++    for (u32 i = 0; i < bytes; i += 64) {
++        __m512i original = _mm512_loadu_si512(org + i);
++        __m512i result = _mm512_loadu_si512(res + i);
++        __mmask64 dirty = _mm512_cmpneq_epi8_mask(result, original);
++        if (!dirty) continue;
++        __m512i current = _mm512_maskz_loadu_epi8(dirty, dst + i);
++        __mmask64 commit = _mm512_mask_cmpeq_epi8_mask(dirty, current, original);
++        if (commit) {
++            _mm512_mask_storeu_epi8(dst + i, commit, result);
++            changed = 1;
++        }
++    }
++    return changed;
++}
++#endif
+ 
+ void vk_write_changed(u64 addr, const u8* res, const u8* org, u32 size) {
+     /* res and org are host copies: the shader's output read back into host-cached memory, and the bytes it started
+@@ -37,7 +62,14 @@
+         gmem_read(addr, tmp, size);
+         cur = tmp;
+     }
+-    for (u32 i = 0; i < size;) {
++    u32 i = 0;
++#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
++    if (dst && size >= 64 && __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512f")) {
++        i = size & ~63u;
++        changed = merge_mapped_wide(dst, res, org, i);
++    }
++#endif
++    for (; i < size;) {
+         u32 n = size - i < 1024 ? size - i : 1024, end = i + n;
+         /* Large storage bindings often change only a few bytes: the host's vectorized comparison of the two host
+            copies skips their unchanged ranges, and guest memory is read only where the shader changed a byte */
+@@ -45,6 +77,32 @@
+             i = end;
+             continue;
+         }
++#if defined(__SSE2__)
++        /* The mapped path can commit individual bytes directly. Compare the two
++           host snapshots first so an unchanged shader lane never touches guest memory. */
++        if (dst) {
++            while (end - i >= 16) {
++                __m128i old = _mm_loadu_si128((const __m128i *)(org + i));
++                __m128i result = _mm_loadu_si128((const __m128i *)(res + i));
++                unsigned pending = 0xffffu ^ (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(old, result));
++                if (pending == 0xffffu && !memcmp(dst + i, org + i, 16)) {
++                    memcpy(dst + i, res + i, 16);
++                    changed = 1;
++                } else {
++                    while (pending) {
++                        unsigned lane = (unsigned)__builtin_ctz(pending);
++                        if (dst[i + lane] == org[i + lane]) {
++                            dst[i + lane] = res[i + lane];
++                            changed = 1;
++                        }
++                        pending &= pending - 1;
++                    }
++                }
++                i += 16;
++            }
++            if (i == end) continue;
++        }
++#endif
+         do {
+             if (end - i >= 8 && !memcmp(res + i, org + i, 8)) {
+                 i += 8;
+--- a/src/nx/hle/filesystem/fs.c
++++ b/src/nx/hle/filesystem/fs.c
+@@ -1011,10 +1011,20 @@
+ }
+ /* size bytes of the file at offset rel into dst: 0, or -1 with the part that couldn't be read zeroed. quiet: the
+    runtime's own read, which doesn't count as the game's first of the file */
++extern u64 arceus_land_request;
++u64 arceus_land_request;
+ static int rfile_read(RFile* rf, u64 rel, u8* dst, u64 size, int quiet) {
+     FsNode* node = rf->node;
+     i64 got = (i64)size;
+     if (!node) return image_read(rf->base + rel, dst, size, 0, quiet); /* the game's image's, under the mods' */
++    if(!quiet && !rel && size && node->parent && !strcmp(node->parent->name,"terrain") &&
++        !strncmp(node->name,"ha_area",7) && node->name[7]>='0' && node->name[7]<='9' &&
++        node->name[8]>='0' && node->name[8]<='9'){
++        u32 area=(node->name[7]-'0')*10+node->name[8]-'0';
++        u64 request=!strcmp(node->name+9,".gfpak") && area<12 ? ((u64)node->size<<8)|(area+1) : 0;
++        if(area==0 && !strcmp(node->name+9,"_s01.gfpak"))request=((u64)node->size<<8)|13;
++        __atomic_store_n(&arceus_land_request,request,__ATOMIC_RELEASE);
++    }
+     if (!quiet && !__atomic_exchange_n(&rf->logged, 1, __ATOMIC_RELAXED))
+         LOG("RomFS: reading %s (%.1f KB)\n", node->name, (double)node->size / 1024.0);
+     if (fs_tree_mapped(node)) { /* mapped for the rest of the run, and never changes */
+--- a/src/nx/memory/mem.c
++++ b/src/nx/memory/mem.c
+@@ -177,7 +177,8 @@
+ #define MEM_RUNS 64
+ #define MEM_RUN_SLOT(a) (((a) >> 20) & (MEM_RUNS - 1))
+ static __thread struct {
+-    u64 lo[MEM_RUNS], hi[MEM_RUNS], gen;
++    struct { u64 lo, hi; } slot[MEM_RUNS];
++    u64 gen;
+ } t_runs;
+ static void runs_stale_nl(void) { __atomic_add_fetch(&g_unmap_gen, 1, __ATOMIC_RELEASE); }
+ 
+@@ -750,15 +751,10 @@
+     *out = g_blk[blk_index_nl(addr)];
+     mem_unlock();
+ }
+-u64 mem_mapped_run(u64 addr, u64 size) {
++/* Keep the lock and block walk out of the cached lookup's register frame. */
++static __attribute__((noinline)) u64 mapped_run_miss(u64 addr, u64 size, u32 i) {
+     u64 end, lo, lim = addr, run, gen;
+-    u32 i;
+-    int mine = !t_mem_held; /* a crash report's queries come from the thread that holds the lock */
+-    if (!size) return 0;
+-    i = MEM_RUN_SLOT(addr);
+-    if (__atomic_load_n(&g_unmap_gen, __ATOMIC_ACQUIRE) == t_runs.gen && addr >= t_runs.lo[i] &&
+-        addr < t_runs.hi[i] && size <= t_runs.hi[i] - addr)
+-        return size;
++    int mine = !t_mem_held;
+     if (mine) mem_lock();
+     gen = __atomic_load_n(&g_unmap_gen, __ATOMIC_RELAXED);
+     if (!g_nblk)
+@@ -782,12 +778,21 @@
+                 memset(&t_runs, 0, sizeof t_runs);
+                 t_runs.gen = gen;
+             }
+-            t_runs.lo[i] = lo;
+-            t_runs.hi[i] = lim;
++            t_runs.slot[i].lo = lo;
++            t_runs.slot[i].hi = lim;
+         }
+     }
+     if (mine) mem_unlock();
+     return run;
++}
++u64 mem_mapped_run(u64 addr, u64 size) {
++    if (!size) return 0;
++    u32 i = MEM_RUN_SLOT(addr);
++    if (__atomic_load_n(&g_unmap_gen, __ATOMIC_ACQUIRE) == t_runs.gen &&
++        addr >= t_runs.slot[i].lo && addr < t_runs.slot[i].hi &&
++        size <= t_runs.slot[i].hi - addr)
++        return size;
++    return mapped_run_miss(addr, size, i);
+ }
+ /* the state and permission of mapped memory (the loader's sections, ldr's code views, the memory SVCs) */
+ int mem_set_state(u64 addr, u64 size, u32 state, u32 perm) {
+--- a/src/nx/runtime/main.c
++++ b/src/nx/runtime/main.c
+@@ -4,6 +4,7 @@
+    order they depend on each other, the shaders made before the game draws (prepare_wait), the game's main thread;
+    then the frontend's loop at the display's rate until the run ends, saving what outlives it */
+ #include "nx/runtime/main.h"
++#include "nx/runtime/arceus_clock.h"
+ #include "common/cpu/recompiler/llvm/gdb_jit.h"
+ #include "common/cpu/recompiler/llvm/ir.h"
+ #include "common/utilities/build_info.h"
+@@ -954,9 +955,11 @@
+     kernel_load_symbols();
+     nvn_native_init(); /* before the trace, which wraps the slots that the native layer fills */
+     nvn_trace_init();
++    arceus_clock_init();
+     /* after the trace, which says whether calls must go through the slots it wraps. The JIT compiles A64: a 32-bit
+        game's blocks are arm.c's, and its hints are A32 block keys the JIT must not warm-compile */
+     if (!g_arm_mod) jit_init();
++    if (!g_arm_mod) arceus_clock_post_jit();
+     read_npdm();
+     svc_core_init();
+     {
+--- a/src/nx/runtime/platform/backend/sdl3.c
++++ b/src/nx/runtime/platform/backend/sdl3.c
+@@ -1670,8 +1670,7 @@
+                 break;
+             case SDL_EVENT_KEY_DOWN:
+                 if (keymap(e.key.scancode) && g_settings.mouse_look) g_use_mouse = 1;
+-                if (e.key.key == SDLK_ESCAPE) { /* a fresh press: the repeats of the Esc that closed the menu don't */
+-                    if (!e.key.repeat) g_quit = 1;
++                if (e.key.key == SDLK_ESCAPE) { /* Dismiss overlays above; never quit gameplay with Escape. */
+                     break;
+                 }
+                 if (e.key.key == SDLK_RETURN && (e.key.mod & SDL_KMOD_ALT)) {
+--- a/src/multicall/CMakeLists.txt
++++ b/src/multicall/CMakeLists.txt
+@@ -123,8 +123,9 @@
+         if(WIN32)
+             add_custom_command(TARGET scarletnx POST_BUILD
+                 COMMAND "${CMAKE_COMMAND}" -E rm -f "${PROJECT_BINARY_DIR}/${name}.exe"
+-                COMMAND "${CMAKE_COMMAND}" -E create_hardlink "$<TARGET_FILE:scarletnx>"
+-                        "${PROJECT_BINARY_DIR}/${name}.exe"
++                COMMAND "${CMAKE_COMMAND}" "-DSOURCE=$<TARGET_FILE:scarletnx>"
++                        "-DDESTINATION=${PROJECT_BINARY_DIR}/${name}.exe"
++                        -P "${PROJECT_SOURCE_DIR}/cmake/world_pt_driver_alias.cmake"
+                 VERBATIM)
+         else()
+             add_custom_command(TARGET scarletnx POST_BUILD
+--- a/src/nx/gpu/vk/device.c
++++ b/src/nx/gpu/vk/device.c
+@@ -1,3 +1,4 @@
++#include "graphics-options.h"
+ /* SPDX-License-Identifier: GPL-3.0-or-later
+    Copyright 2026 the ScarletNX contributors */
+ /* Vulkan instance, device, queues and swapchain. Vulkan 1.3 is required: timeline semaphores (1.2),
+@@ -607,7 +608,8 @@
+     const char *slotLimit=getenv("ARCEUS_PT_TEXTURE_LIMIT");
+     unsigned long cap=slotLimit?strtoul(slotLimit,NULL,10):0;
+     if(cap>=2 && cap<arceus_texture_slots)arceus_texture_slots=(u32)cap;
+-    int supported=q12.bufferDeviceAddress && q12.shaderSampledImageArrayNonUniformIndexing &&
++    arceus_contact_supported=0;
++    int supported=arceus_ray_tracing_requested() && q12.bufferDeviceAddress && q12.shaderSampledImageArrayNonUniformIndexing &&
+         arceus_texture_slots>=2 && snx_vk_device_extensions(g_vk.phys,&available);
+     for(unsigned i=0;i<3 && supported;i++)supported=snx_vk_extensions_has(&available,contact_exts[i]);
+     snx_vk_extensions_free(&available);
+@@ -625,7 +627,7 @@
+             arceus_contact_supported=1;
+         }
+     }
+-    LOG("arceus-rt: Vulkan ray queries %s\n",arceus_contact_supported?"enabled":"unavailable");
++    LOG("arceus-rt: Vulkan ray queries %s\n",arceus_contact_supported?"enabled":arceus_ray_tracing_requested()?"unavailable":"disabled");
+     if(arceus_contact_supported)LOG("arceus-rt: %u material texture slots\n",arceus_texture_slots);
+     VkPhysicalDeviceFaultFeaturesEXT fault={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+     if(getenv("ARCEUS_RT_DIAGNOSTICS")){
+--- a/src/nx/gpu/vk/render.c
++++ b/src/nx/gpu/vk/render.c
+@@ -1,3 +1,4 @@
++#include "graphics-options.h"
+ #include <math.h>
+ /* SPDX-License-Identifier: GPL-3.0-or-later
+    Copyright 2026 the ScarletNX contributors */
+@@ -2740,6 +2741,7 @@
+ }
+ static void upscale_scene(Surf *col,Surf *z,bool opaqueStage);
+ static void taa_after(GpuChannel *ch,VkSh *fs,TexRes *tex,Surf *col){
++ if(!arceus_upscaling_requested())return;
+  // A second fullscreen material pass writes opaque terrain into the same HDR target.
+  // Trace after that pass so later forward draws blend onto the traced opaque scene.
+  if(fs && fs->hash==0xfddd1ce88da11da0ull && !ch->render_pred && cap_valid &&
+@@ -2808,7 +2810,7 @@
+ 
+ #include "opaque-scene.inc"
+ static void upscale_scene(Surf *col,Surf *z,bool opaqueStage){
+- if(upscale_disabled)return;
++ if(!arceus_upscaling_requested() || upscale_disabled)return;
+  if(opaqueStage && (!tready || tlast+1!=g_vk_present || previous_color!=cap_color || tzaddr!=cap_depth))return;
+  if(!col||!z||col->sw!=1920||col->sh!=1080||z->sw!=1920||z->sh!=1080)return;
+  if(tready && tlast==g_vk_present){
+@@ -3834,7 +3836,7 @@
+         }
+         scissor[i] = sc;
+     }
+-    if(tready && tlast+1==g_vk_present && zt && zt->gva==tzaddr && zt->sw==1920 && zt->sh==1080 && r[0x4B3] && viewports==1 && fabsf(viewport[0].width-1920)<1 && fabsf(fabsf(viewport[0].height)-1080)<1){
++    if(arceus_upscaling_requested() && tready && tlast+1==g_vk_present && zt && zt->gva==tzaddr && zt->sw==1920 && zt->sh==1080 && r[0x4B3] && viewports==1 && fabsf(viewport[0].width-1920)<1 && fabsf(fabsf(viewport[0].height)-1080)<1){
+         float j[2];tjitter(j);viewport[0].x+=j[0];viewport[0].y+=j[1];tjitframe=g_vk_present;tjitvalid=1;
+     }
+     static u32 inspectedPresent=~0u;
+--- a/src/nx/runtime/settings.txt
++++ b/src/nx/runtime/settings.txt
+@@ -158,6 +158,24 @@
+     help The corner stats draws in, as showcase_corner's; in showcase's own corner it goes beside showcase's box
+ 
+ table g_graphics_ini
++setting Arceus DLSS
++    key arceus_dlss
++    label DLSS Super Resolution
++    int 0 1
++    default 0
++    words Off|On
++    startup
++    help Reconstruct the Arceus scene with NVIDIA DLSS. Requires a supported NVIDIA GPU and DLSS runtime.
++    help Saved for the next game launch. Restart the game after changing this setting.
++setting Arceus ray tracing
++    key arceus_ray_tracing
++    label Ray tracing
++    int 0 1
++    default 0
++    words Off|On
++    startup
++    help Enable the Arceus world path tracer on a GPU with Vulkan ray queries. Uses FSR when DLSS is off.
++    help Saved for the next game launch. Restart the game to recreate the Vulkan device.
+ setting Resolution scale
+     key resolution
+     float 0.25 16
+--- a/src/nx/gpu/vk/device.c
++++ b/src/nx/gpu/vk/device.c
+@@ -609,7 +609,7 @@
+     unsigned long cap=slotLimit?strtoul(slotLimit,NULL,10):0;
+     if(cap>=2 && cap<arceus_texture_slots)arceus_texture_slots=(u32)cap;
+     arceus_contact_supported=0;
+-    int supported=arceus_ray_tracing_requested() && q12.bufferDeviceAddress && q12.shaderSampledImageArrayNonUniformIndexing &&
++    int supported=arceus_ray_tracing_requested(g_settings.arceus_ray_tracing) && q12.bufferDeviceAddress && q12.shaderSampledImageArrayNonUniformIndexing &&
+         arceus_texture_slots>=2 && snx_vk_device_extensions(g_vk.phys,&available);
+     for(unsigned i=0;i<3 && supported;i++)supported=snx_vk_extensions_has(&available,contact_exts[i]);
+     snx_vk_extensions_free(&available);
+@@ -627,7 +627,7 @@
+             arceus_contact_supported=1;
+         }
+     }
+-    LOG("arceus-rt: Vulkan ray queries %s\n",arceus_contact_supported?"enabled":arceus_ray_tracing_requested()?"unavailable":"disabled");
++    LOG("arceus-rt: Vulkan ray queries %s\n",arceus_contact_supported?"enabled":arceus_ray_tracing_requested(g_settings.arceus_ray_tracing)?"unavailable":"disabled");
+     if(arceus_contact_supported)LOG("arceus-rt: %u material texture slots\n",arceus_texture_slots);
+     VkPhysicalDeviceFaultFeaturesEXT fault={.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+     if(getenv("ARCEUS_RT_DIAGNOSTICS")){
+--- a/src/nx/gpu/vk/render.c
++++ b/src/nx/gpu/vk/render.c
+@@ -2741,7 +2741,7 @@
+ }
+ static void upscale_scene(Surf *col,Surf *z,bool opaqueStage);
+ static void taa_after(GpuChannel *ch,VkSh *fs,TexRes *tex,Surf *col){
+- if(!arceus_upscaling_requested())return;
++ if(!arceus_upscaling_requested(g_settings.arceus_dlss, g_settings.arceus_ray_tracing))return;
+  // A second fullscreen material pass writes opaque terrain into the same HDR target.
+  // Trace after that pass so later forward draws blend onto the traced opaque scene.
+  if(fs && fs->hash==0xfddd1ce88da11da0ull && !ch->render_pred && cap_valid &&
+@@ -2810,7 +2810,7 @@
+ 
+ #include "opaque-scene.inc"
+ static void upscale_scene(Surf *col,Surf *z,bool opaqueStage){
+- if(!arceus_upscaling_requested() || upscale_disabled)return;
++ if(!arceus_upscaling_requested(g_settings.arceus_dlss, g_settings.arceus_ray_tracing) || upscale_disabled)return;
+  if(opaqueStage && (!tready || tlast+1!=g_vk_present || previous_color!=cap_color || tzaddr!=cap_depth))return;
+  if(!col||!z||col->sw!=1920||col->sh!=1080||z->sw!=1920||z->sh!=1080)return;
+  if(tready && tlast==g_vk_present){
+@@ -3836,7 +3836,7 @@
+         }
+         scissor[i] = sc;
+     }
+-    if(arceus_upscaling_requested() && tready && tlast+1==g_vk_present && zt && zt->gva==tzaddr && zt->sw==1920 && zt->sh==1080 && r[0x4B3] && viewports==1 && fabsf(viewport[0].width-1920)<1 && fabsf(fabsf(viewport[0].height)-1080)<1){
++    if(arceus_upscaling_requested(g_settings.arceus_dlss, g_settings.arceus_ray_tracing) && tready && tlast+1==g_vk_present && zt && zt->gva==tzaddr && zt->sw==1920 && zt->sh==1080 && r[0x4B3] && viewports==1 && fabsf(viewport[0].width-1920)<1 && fabsf(fabsf(viewport[0].height)-1080)<1){
+         float j[2];tjitter(j);viewport[0].x+=j[0];viewport[0].y+=j[1];tjitframe=g_vk_present;tjitvalid=1;
+     }
+     static u32 inspectedPresent=~0u;

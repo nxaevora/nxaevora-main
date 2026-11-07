@@ -1,0 +1,43 @@
+ARCEUS PASS6 VERIFICATION
+2026-11-06. These are bounded local tests, not a full-game correctness proof.
+
+Original guest-instruction fixtures:
+  Turn/TurnKey motion and original SDK yaw projection:9,843 checks,0 failures,
+    13 compiled entries. Includes host-controlled proposed elapsed/residual
+    experiments; not a patched scheduler or complete action lifecycle.
+  Message state, readiness, auto advance and timed closure:1,752 checks,
+    0 failures,26 compiled entries from12 complete functions. Resource/layout,
+    sound and close-request side effects use declared stubs.
+  Resolution mode application and setters:1,307 checks,0 failures,
+    10 compiled entries. Parameter service is stubbed; no GPU rendering.
+  Total:12,902 checks,0 failures,49 compiled entries.
+
+Physics findings use static constructor/call/graph evidence and the completed
+user capture. No new physics JIT tests were run or claimed in this pass.
+
+Log-summary checks passed for:
+  exact(count,ns,world) joins with interleaved/reversed logs;
+  alternate worlds, absent/duplicate matches and multiple simulations;
+  uint32 serial wrap retained raw, changed simulation pointers retained;
+  exclusion of ambiguous or alternate serial observations;
+  legacy logs without new fields, nonfinite values and zero/missing time.
+No automatic per-world cadence is inferred from global sample counters.
+
+Runtime: scarletnx target built successfully after the observation-only serial
+addition. Independent diff review found no material issues. The existing guarded
+readable range contains the extra four-byte read. No new hook, guest write or
+timing correction was added. Source and mirror hashes match.
+The new diagnostic candidate is staged for a future launch, not gameplay-tested.
+
+Native desktop launcher compiled and actually launched the prior candidate.
+The live log confirms DualSense Edge Wireless Controller and both sensors.
+User manually closed the game; launch-status records exit0, log ends Exit.
+No refused patch guards or JIT compile failures were found by the summary.
+User feedback: camera/menu better, visuals good, stillbelow1440p as expected
+with rendering experiments off. This is a120FPS-target run, not proof of
+sustained displayed120FPS. PresentMon was not captured.
+
+Independent review covered native launch/manual-close behavior, resolution
+fixture authenticity and mode/override semantics, and serial logging scope.
+All game assets, extracted instructions, saves and private test fixtures remain
+local. No game was restarted after the user reported closing it.

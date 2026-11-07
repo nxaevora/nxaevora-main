@@ -1,0 +1,20 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=64) in;
+void main(){
+    int id=int(gl_GlobalInvocationID.x),key=int(gl_GlobalInvocationID.y);
+    if(id>=materialCount)return;
+    ivec2 entry=ivec2(key,id);
+    vec4 proposal=imageLoad(candidates,entry);
+    if(proposal.z==0.)return;
+    int scores[9];
+    for(int n=0;n<9;++n)scores[n]=imageAtomicExchange(stats,statAt(key,16+n,id),0);
+    int best=4;
+    for(int n=0;n<9;++n)if(scores[n]<scores[best])best=n;
+    int samples=imageLoad(stats,statAt(key,visibleCount,id)).r;
+    if(scores[4]-scores[best]>max(4,samples*2)){
+        proposal.xy+=vec2(best%3-1,best/3-1)*pc.refineStep;
+        imageStore(candidates,entry,proposal);
+    }
+}

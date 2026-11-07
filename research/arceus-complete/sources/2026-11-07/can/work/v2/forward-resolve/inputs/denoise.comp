@@ -1,0 +1,119 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(buffer_reference,std430,buffer_reference_align=8) readonly buffer PrimaryLight {uvec2 values[];};
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D rawColor;
+layout(binding=1) uniform sampler2D depth;
+layout(binding=2) uniform sampler2D motion;
+layout(binding=3) uniform sampler2D albedo;
+layout(binding=4) uniform sampler2D history;
+layout(binding=5) uniform usampler2D metadata;
+layout(binding=6,rgba16f) uniform writeonly image2D filtered;
+layout(binding=7,rg32ui) uniform writeonly uimage2D nextMeta;
+layout(binding=8) uniform sampler2D materialMap;
+layout(push_constant) uniform Frame {
+    mat4 previousClip;
+    vec2 jitter;
+    vec2 previousJitter;
+    uint historyValid;
+    float hasMaterial;
+    uvec2 primaryLight;
+    uint layer;
+} frame;
+vec4 baseAt(ivec2 p,ivec2 size,uint layer){
+    if(all(equal(frame.primaryLight,uvec2(0))))return vec4(0,0,0,1);
+    uint index=layer*uint(size.x*size.y)+uint(p.y*size.x+p.x);
+    uvec2 v=PrimaryLight(frame.primaryLight).values[index];
+    return vec4(unpackHalf2x16(v.x),unpackHalf2x16(v.y).x,float(v.y>>16u));
+}
+vec3 guideNormal(uint tag){
+    vec2 xy=vec2(tag&127u,(tag>>7u)&127u)*(2./127.)-1.;
+    vec3 n=vec3(xy,1.-abs(xy.x)-abs(xy.y));
+    n.xy-=mix(vec2(-1),vec2(1),greaterThanEqual(n.xy,vec2(0)))*max(-n.z,0.);
+    return normalize(n);
+}
+uint materialAt(ivec2 p){
+    if(frame.hasMaterial==0.)return 4095u;
+    uvec2 tag=uvec2(round(texelFetch(materialMap,p,0).ba*255.));
+    return min((tag.x<<8u)|tag.y,4095u);
+}
+void main() {
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy), size=imageSize(filtered);
+    if(any(greaterThanEqual(p,size)))return;
+    vec4 raw=texelFetch(rawColor,p,0);
+    vec4 base=baseAt(p,size,frame.layer);
+    vec3 noisy=max(vec3(0),raw.rgb-base.rgb);
+    float z=texelFetch(depth,p,0).r;
+    vec3 surface=clamp(texelFetch(albedo,p,0).rgb,0.,1.);
+    uint materialID=materialAt(p);
+    vec3 result=noisy;
+    float age=z>0. && base.a>0.?1.:0.;
+    vec3 hi=noisy,lo=noisy,spatial=noisy;
+    float spatialWeight=1.;
+    if(age>0.)for(int i=0;i<4;i++){
+        const ivec2 offsets[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+        ivec2 q=clamp(p+offsets[i],ivec2(0),size-1);
+        if(abs(texelFetch(depth,q,0).r-z)>.015*z || distance(texelFetch(albedo,q,0).rgb,surface)>.1 || materialAt(q)!=materialID)continue;
+        vec4 neighborBase=baseAt(q,size,frame.layer);
+        if(neighborBase.a==0. || dot(guideNormal(uint(neighborBase.a)),guideNormal(uint(base.a)))<.96)continue;
+        vec3 neighbor=max(vec3(0),texelFetch(rawColor,q,0).rgb-neighborBase.rgb);
+        if((uint(base.a)&0xc000u)==0x8000u && (uint(neighborBase.a)&0x4000u)==0u){
+            vec3 neighborSurface=texelFetch(albedo,q,0).rgb;
+            float w=.5*exp2(-40.*distance(neighborSurface,surface));
+            spatial+=w*neighbor*clamp((surface+.08)/(neighborSurface+.08),vec3(.75),vec3(1.33));
+            spatialWeight+=w;
+        }
+        lo=min(lo,neighbor);hi=max(hi,neighbor);
+    }
+
+    result=spatial/spatialWeight;
+    if(age>0. && frame.historyValid!=0){
+        vec2 uv=(vec2(p)+.5-frame.jitter)/vec2(size);
+        vec4 clip=frame.previousClip*vec4(uv*vec2(2,-2)+vec2(-1,1),z,1);
+        vec2 delta=texelFetch(motion,p,0).xy+frame.previousJitter-frame.jitter;
+        vec2 projected=vec2(p)+delta;
+        if(clip.w>0. && all(greaterThanEqual(projected,vec2(0))) && all(lessThan(projected,vec2(size-1)))){
+            ivec2 origin=ivec2(floor(projected));
+            vec2 fraction=fract(projected);
+            // Narrow the reconstruction footprint without negative weights at silhouettes.
+            // Keep the four independent depth and material tests below.
+            fraction=mix(fraction,smoothstep(vec2(0),vec2(1),fraction),.75);
+            float sum=0.,previousAge=0.;
+            vec3 previous=vec3(0);
+            for(int y=0;y<=1;y++)for(int x=0;x<=1;x++){
+                ivec2 q=origin+ivec2(x,y);
+                uvec2 data=texelFetch(metadata,q,0).rg;
+                vec4 material=unpackUnorm4x8(data.y);
+                if((data.x&4095u)!=materialID)continue;
+                float previousZ=uintBitsToFloat(data.x&0xfffff000u);
+                float expected=clip.z/clip.w;
+                if(material.a==0. || abs(expected-previousZ)>max(2e-6,.015*expected) ||
+                   distance(material.rgb,surface)>.09)continue;
+                float weight=(x==1?fraction.x:1.-fraction.x)*(y==1?fraction.y:1.-fraction.y);
+                // Reproject incident light while preserving the current texture detail.
+                // The floor bounds amplification in dark paint and at metallic edges.
+                vec3 correction=clamp((surface+.08)/(material.rgb+.08),vec3(.75),vec3(1.33));
+                vec4 oldBase=baseAt(q,size,frame.layer^1u);
+                bool glossy=(uint(base.a)&0x4000u)!=0u;
+                if(((uint(oldBase.a)^uint(base.a))&0x4000u)!=0u || dot(guideNormal(uint(oldBase.a)),guideNormal(uint(base.a)))<(glossy?.985:.88))continue;
+                previous+=weight*max(vec3(0),texelFetch(history,q,0).rgb-oldBase.rgb)*correction;
+                previousAge+=weight*material.a*255.;
+                sum+=weight;
+            }
+            if(sum>.5){
+                vec3 margin=.03+.35*(hi-lo);
+                // Shorter histories retain contrast on high-frequency surface boundaries.
+                float contrast=length(hi-lo)/max(.15,length(noisy));
+                float limit=mix(6.,2.,smoothstep(.25,1.,contrast));
+                if((uint(base.a)&0x4000u)!=0u)limit=mix(limit,1.,smoothstep(3.,16.,length(delta)));
+                age=min(previousAge/sum+1.,limit);
+                result=mix(clamp(previous/sum,max(vec3(0),lo-margin),hi+margin),spatial/spatialWeight,1./age);
+            }
+        }
+    }
+    imageStore(filtered,p,vec4(base.rgb+result,raw.a));
+    // Preserve the float exponent and eleven mantissa bits for reversed depth.
+    imageStore(nextMeta,p,uvec4((floatBitsToUint(z)&0xfffff000u)|materialID,packUnorm4x8(vec4(surface,age/255.)),0,0));
+}
+

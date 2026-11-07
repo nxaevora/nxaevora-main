@@ -1,0 +1,61 @@
+ARCEUS1440P CONTROLLER TEST
+2026-11-06. User requested a concrete fix and a test.
+
+Change being tested
+Enable the previously prepared precise screen-pixel texture-fetch correction.
+It avoids converting a screen position to a lower-resolution integer coordinate
+and then scaling that rounded coordinate back up. At4/3 scale the old path can
+skip/reuse physical texels; the corrected recognized path selects the physical
+pixel directly when the sampled texture is marked scaled. This addresses a
+concrete rendering arithmetic defect. It does not yet prove that this defect
+was the only cause of the earlier1440p visual distortion.
+
+This test changes rendering configuration, not accepted gameplay timing:
+  Vulkan (--nvn_native=0), docked mode, resolution scale4/3;
+  fullscreen so the result is not downsampled into the previous1280x720 window;
+  SNX_ARCEUS_SCREEN_FETCH=1;
+  SNX_ARCEUS_FIXED_RESOLUTION=1 (automatic governor bypass only);
+  SNX_RESOLUTION_TRACE=1 for actual viewport/scissor/target evidence.
+Explicit scene half/custom resolution modes remain intact. A2560x1440 allocated
+image alone is not proof that gameplay geometry uses a2560x1440 viewport.
+
+Accepted120FPS target, camera multiplier2.2, menu-repeat, blink, effects, water,
+event camera and other existing timing corrections remain enabled.
+Controller background input remains enabled. Use the native desktop launcher:
+  outputs/Arceus-1440p-Controller-Test.exe
+The baseline outputs/Arceus-Controller-Test.exe is unchanged and still available.
+Both use one shared lock and refuse a second game instance. The user saves and
+closes manually; no timeout or Escape-to-quit is added.
+
+Validation before launch
+29 targeted shader recognition/metadata cases passed;0 failures.
+13,768 emitted-coordinate cases passed;0 failures, including actual lighting
+shader fetches. Two independent source reviews found no blocking issue for this
+opt-in comparison. Existing full-corpus translation evidence is historical,
+not claimed as newly rerun. The new native launch profile compiled successfully.
+The shader flag is part of the cache key; no manual cache deletion was required.
+
+Scope of the visual test
+Inspect3D world sharpness, character/building edges, shadows, ambient occlusion,
+fog and water. These effects share some corrected fetch paths. UI clarity alone
+is not sufficient. Judge performance separately:120FPS is a target, not a
+guarantee while rendering more pixels. Keep normal controller movement/menu
+checks as a regression comparison. All assets, saves and fixtures remain local.
+
+Runtime SHA256:
+c88b5a620f1f627a2a07bc695eca49dc05dfddebecddc708d020a2c7d610a5df
+This candidate also contains the observation-only physics serial frompass6.
+No further timing patch was added for this rendering test.
+
+Launch verified
+Capture: C:\Users\brett\Documents\Codex\work\arceus-runs\timing-20261106-164839-938
+DualSense Edge and sensors detected. Both rendering changes active.
+Fullscreen swapchain2560x1440. Five-color-target, depth-tested3D draws used
+image2560x1440, viewport2560x1440 and scissor2560x1440. No refused patch guards
+at this startup snapshot. The user was testing; this snapshot is historical.
+
+Post-test update
+The game closed normally with game_exit=0. The user confirmed proper1440p
+sharpness but reported a screen-door grid on environment surfaces. Investigation
+found a missed depth-coordinate correction after conditional KIL. See
+arceus-1440p-grid-investigation.txt for the prepared fix and current test status.

@@ -1,0 +1,28 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=64) in;
+int now(int field,int id){return imageLoad(stats,statAt(int(gl_GlobalInvocationID.y),field,id)).r;}
+int then(int field,int id){return imageLoad(previousStats,statAt(int(gl_GlobalInvocationID.y),field,id)).r;}
+void main() {
+    int id = int(gl_GlobalInvocationID.x);
+    if (id >= materialCount) return;
+    ivec2 entry = ivec2(int(gl_GlobalInvocationID.y),id);
+    imageStore(candidates,entry,vec4(0));
+    if (pc.historyValid == 0u || id == 0) return;
+    int old=then(countField,id), visible=now(visibleCount,id);
+    if (min(visible,old)<12) return;
+    float ratio = float(visible)/float(old);
+    if (ratio < .70 || ratio > 1.43) return;
+    ivec2 size = imageSize(motionImage);
+    ivec2 box = ivec2(now(projectedMaxX,id)+now(projectedInvX,id),now(projectedMaxY,id)+now(projectedInvY,id))-size+2;
+    ivec2 previousBox = ivec2(then(maxX,id)+then(invX,id),then(maxY,id)+then(invY,id))-size+2;
+    vec2 sizeRatio = vec2(max(box,1)) / vec2(max(previousBox,1));
+    if (any(lessThan(sizeRatio,vec2(.65))) || any(greaterThan(sizeRatio,vec2(1.54)))) return;
+    vec2 projected = vec2(now(projectedX,id),now(projectedY,id)) / (4.0*visible);
+    vec2 prior = vec2(then(sumX,id),then(sumY,id)) / (4.0*old);
+    vec2 residual = prior-projected;
+    float distancePx = length(residual);
+    if (distancePx<.7 || distancePx>64.) return;
+    imageStore(candidates,entry,vec4(round(residual),1,0));
+}

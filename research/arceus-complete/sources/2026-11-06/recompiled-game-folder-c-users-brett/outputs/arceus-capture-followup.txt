@@ -1,0 +1,23 @@
+Capture follow-up and rendering direction
+
+Run175234-874 closed cleanly. Four full attachment captures succeeded (64 each,
+zero failures). Later screenshots remain ordinary screenshots due to cap4.
+First inspected view: capture175313. Final image has strong step striping;
+basecolor attachment45 does not; decoded normal attachment44 is much smoother
+on step faces. Lighting/later-pass investigation is the next priority. This is
+an initial visual localization, not a completed causal diagnosis or fix.
+
+Preferred sequence: correct the artifact; identify stable depth, motion vectors,
+camera jitter/history and HUD-free color; implement temporal AA; integrate
+compatible temporal upscalers; assess hybrid ray-traced effects; only then
+assess path tracing. TAA may suppress aliasing/shimmer but cannot establish
+correct source lighting. DLSS/FSR are integrations requiring valid temporal
+inputs, not interchangeable final-image filters. Ray/path tracing require a
+separate scene/material/light representation and animated geometry handling;
+feasibility and visual fidelity to the game's art remain research questions.
+
+Official integration references:
+https://gpuopen.com/manuals/fidelityfx_sdk/techniques/super-resolution-upscaler/
+https://developer.nvidia.com/rtx/streamline/get-started
+
+No game launches, asset changes or TAA implementation in this follow-up.

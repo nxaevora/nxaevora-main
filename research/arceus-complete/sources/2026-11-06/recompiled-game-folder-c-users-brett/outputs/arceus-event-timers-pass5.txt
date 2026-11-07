@@ -1,0 +1,239 @@
+ARCEUS 1.1.1 — REAL-TIME EVENT COORDINATION CLOCKS
+Fifth offline pass, 2026-11-06. All addresses are hexadecimal main-relative.
+
+RESULT
+
+The four fixed 1/30 sites belong to event_script::RealTimeEventManager's
+catch-up / warning / navigation recovery flow. This owner identification is
+confirmed by local type-name strings and the script registration table. The
+three long-delay fields are not generic dialogue/typewriter counters.
+
+New concrete distinctions:
+  +190: a configurable, capped delay while IsWaitCatchUp remains true.
+  +198: a six-second overall recovery timeout, then a fade/reposition fallback.
+  +1A0: cumulative in-range time; stops pathfinding after two nominal seconds.
+  +19C: a one-second hold between repositioning and the fade back in.
+These remain live-cadence risks, not demonstrated active gameplay bugs. No game
+was launched, driven or closed. No runtime/package/shared report, save or asset
+was changed. All new evidence and this report are private in work/pass5-events/.
+
+IDENTITY AND VERIFIED LOCAL NAMES
+
+Registration14FB540 references RealTimeEventManager at14FB56C and installs:
+  IsWarning                    ->1681154 (pair at14FB654; reads byte+171)
+  SetCanPlayerControl          ->168115C (function at14FB65C/66C;
+                                         name at14FB6A0 and14FB724)
+  SetRealTimeEventInfo         ->16811E8 (pair at14FB680)
+  SetRealTimeEventWarningInfo  ->1681ABC (name14FB6B4/14FB728;
+                                         function14FB688/14FB694)
+  IsWaitCatchUp                ->168038C (function14FB69C/14FB6A8;
+                                         name14FB6C8/14FB72C)
+The local string at main+381EED0 explicitly contains
+event_script::RealTimeEventManager *. This is not a name inferred from vicinity.
+
+CharacterNavigatorController registration1EFC370 independently establishes:
+  SetDestination              ->171BB88 (1EFC4D4..4E4 and1EFC4E8..50C)
+  IsPathfinding               ->171AE88 (1EFC5A4..5CC)
+  StopPathfinding             ->171B198 (pair at1EFC5D8)
+  SetPreferredMoveState       ->171D458 (pair at1EFC5F8)
+Do not confuse IsPathfinding with IsPathMoving: the latter is171AEC8.
+
+FadeManager registrationDA9710 establishes:
+  RequestOut    ->C264CC (pair atDA9818)
+  RequestInDisp ->C265C8 (pair atDA986C)
+  IsEnd         ->C26428 (DA9870..DA98A8)
+
+OBJECTS, INPUTS AND LIFETIME
+
+Let R denote the RealTimeEventManager object, and W the helper at R+58.
+C92C50 obtains R through global manager+100, then object+118, and calls167F988
+atC92D4C. The getter15B6250 returns that same object+118 for W's callbacks.
+
+R fields:
+  +58  warning/coordination helper; W+118 is its state (0,1,2).
+  +70  first character reference; +80 its navigator reference.
+  +90  player-control reference used by SetCanPlayerControl.
+  +A0  second character reference; +B0 its navigator reference.
+  +170 update enabled; +171 the value exposed by IsWarning.
+  +178 selected-event-valid byte; +180 selected event key/hash.
+  +188 selected route-point index.
+  +190 wait-catch-up delay; +194 fallback substate; +198 total recovery timer;
+  +19C fallback hold timer; +1A0 in-range timer.
+  +1B0 cached position used as recovery destination.
+
+1681B68 receives the first character in X1 and a player-control object in X2.
+1973640 supplies the first character reference copied to R+70 at1681BB0..BB8;
+1974A30 supplies its navigator copied to R+80 at1681C98..CA0. The X2-derived
+reference is copied to R+90 at1681D64..D78. Caller157A298 obtains these from
+189C138 and189D14C respectively. The evidence strongly associates the first
+character with the player; the report retains first/second labels where a
+literal GetPlayer binding was not established.
+
+SetRealTimeEventInfo16811E8 stores the key from *X1 into R+180, enables R+178,
+and derives the second character and navigator from its X2 argument, copying
+them to R+A0 and R+B0 at1681244..24C and168132C..334. It clears +190/+194/+198/
++19C together via STP XZR,XZR at16815F4, clears +1A0 at16815F0, initializes
+cached position+1B0 at1681608, then enables +170 at16816A8 or16816F0.
+Constructor167EF84 also zeros these fields at167F068..70.
+Cleanup1683B7C clears +170 at1683BB4 and stops the first navigator if it is
+still pathfinding. No timer work runs when update-enabled +170 is zero.
+
+167FFD8 looks up R+180 in the map at R+D0/+D8, only while R+178 is set, and
+returns an optional copy of its record. Callers return early if invalid. Four
+record floats are loaded by167F240 from serialized fields at offsets6/8/A/C
+in the record's vtable, at167F32C,167F358,167F384,167F3B0. Defaults are zero.
+Their operational uses, measured from the copied payload (after validity):
+  payload+0 = first separation threshold D0.
+  payload+4 = duration T used to cap +190.
+  payload+8 = other separation threshold D2.
+  payload+C = angular cone extent A (the code compares against A/2).
+Serialized field names, values for specific scenes, and D0/D2 ordering are not
+established. They should not be described as fixed global distances.
+
+WAIT-CATCH-UP GATE AND +190
+
+168038C (IsWaitCatchUp) resolves both references, projects their positions onto
+the horizontal plane by zeroing vector lane1, and tests squared separation
+against D0 squared at1680488..498. It returns true only when that test passes
+and1680680 returns false (1680664..670).
+
+1680680 takes the selected route-point record's second vector (entry+10,
+32-byte entries) at1680A30..A60, normalizes its horizontal projection and the
+horizontal first-character-minus-second-character displacement, obtains their
+angle from the dot product, and compares the resulting angle against A/2 at
+1680C88..CA0. It is an angular predicate, not a timer. Exact human-facing
+direction labels such as behind/in-front are left open.
+
+In167F988 the old +190 is compared against T at167FA08. W receives four booleans
+at167FC6C..FC80 through168790C:
+  W1 = IsWaitCatchUp && old(+190)>=T
+  W2 = horizontal separation>D2
+  W3 = angular predicate1680680
+  W4 = horizontal separation>D0
+After W's update, IsWaitCatchUp is evaluated again at167FC88. If false, +190
+is reset to zero. If true,167FF0C..FF28 adds float bits3D088889 (1/30) and caps
+the result to T. The final store is167FC9C. Thus the threshold decision uses
+the previous value, and this timer measures consecutive qualifying callbacks.
+
+Both branches also maintain R+1B0: once the second character moves at least
+two horizontal units from the cached position (squared threshold4 at167FD0C),
+its current position replaces the cache at167FE14. This is a spatial sample
+threshold, not another elapsed clock.
+
+RECOVERY STATE AND +198 / +1A0
+
+168790C dispatches W+118. Only state2 calls168300C (at16879BC), so these two
+timers do not run in every RealTimeEventManager update. State2 also disables
+player control through1682F68->SetCanPlayerControl(false). On exit1682F70 first
+requires a nonnull R+80 navigator reference and successful navigator resolution
+(1682F88 /1682FA8). Only then it calls SetCanPlayerControl(true), stops
+pathfinding, sets preferred move state2, and clears R+194/+198/+19C/+1A0 together
+(STP XZR,XZR through alias R+194 at1682FCC/FD0); it also zeros the cached position.
+Either missing-navigator case returns before these changes. The outer helper
+returns to state1 regardless of this cleanup routine's early return.
+
+168300C requires valid first character, first navigator, second character and
+selected record. Its horizontal separation comparison uses D2 at1683088 and
+1683158..3160.
+  When separation>D2: set preferred move state1 via171D458 at16831F8, then set
+  the first navigator destination to R+1B0 via171BB88 at1683204.
+  Otherwise: compare old(+1A0) against2 at16832A4..B0; when >=2, call
+  StopPathfinding at16832B8; then increment +1A0 by1/30 at16832C0..D0.
+The far branch does not reset +1A0. This is cumulative in-range time during
+the recovery episode, not necessarily an uninterrupted two-second dwell.
+
+Both paths then test old(+198)>=6 at16832D4..E0. Before expiry, +198 advances
+by1/30 at16832E4..F8 and the function returns IsPathfinding (16832FC). At expiry,
+it calls the fallback1683528 at1683424. During fallback it returns true while
+R+194!=4; when substate4 is reached it clears +198 and returns false.
+Outer state2 ends only when that return is false AND W2 is false (1687A04..08).
+Thus six seconds is a navigation-recovery deadline, not an unconditional wait
+before an ordinary NPC conversation.
+
+FALLBACK +194 STATES AND +19C
+
+The jump table at397C590 maps:
+  state0 ->1683588: RequestOut(C264CC), channel0, duration30 authored frames;
+                       set state1 at16835BC.
+  state1 ->16835D0: wait IsEnd(C26428), resolve first character/navigator and
+                       second character; StopPathfinding at168361C; request
+                       first-character reposition to R+1B0 via198AF40 at1683628;
+                       set state2 at1683630.
+  state2 ->1683698: compare old(+19C)>=1. Once true, RequestInDisp(C265C8),
+                       channel0, duration30 at16836C0; set state3. In either
+                       case this callback adds1/30 to +19C at16836D0..E0.
+  state3 ->16836E8: wait IsEnd(C26428), then set state4.
+  state4 or above: return without executing a state branch.
+
+198AF40 is a position request rather than a destination update: it forwards
+the target vector and existing orientation to1989BD4 with a100.0 parameter.
+That helper performs placement queries and, on success, calls1983770 to apply
+position/orientation, then198AC20. Failure returns false, but1683528 ignores
+that return and advances to state2. Do not promise every attempted recovery
+successfully repositions the character.
+
+The 30-frame fade durations and the +19C second-valued timer are separate
+clocks. Correcting the common fade updater alone would leave this fixed1/30
+hold unchanged. The same is true of +190/+198/+1A0.
+
+RELATIONSHIP TO THE ACTIVE MESSAGE MANAGER
+
+This is more than adjacency in C92C50, but it is not evidence of a shared timer:
+  C92D88 obtains global manager+D0; C92DA4 obtains that object's +68 and calls
+  24858F4 at C92DC4. In168790C the same global+D0 receiver is passed to C853BC,
+  which simply returns +68 (C853BC..C853DC). Thus W operates on the same
+  message-manager object that the parent update subsequently advances.
+  W passes descriptors at W+58/+88/+B8/+E8 through248705C, for example at
+  1687E7C,168831C,1687FCC,1688064. These are the warning descriptors prepared
+  through SetRealTimeEventWarningInfo1681ABC->16889F0.
+  248705C examines manager+58, can call2737C00 on the active object's +68 at
+  24870BC, then calls2485A40 at2487100 for a supplied descriptor. It sets
+  manager+78 at24870EC. The complementary2487234 is called at1687D18 and clears
+  manager+78 at2487290, with an optional2485A40 restoration request first.
+
+The parent investigation independently traced active-message updates from
+24858F4 through active+58 to2484ED8/27379B8. The shared receiver and request
+edges above establish an event-warning relationship to that active manager.
+They do not establish that +190/+198/+19C/+1A0 drive its typewriter/skip clocks,
+or that ordinary NPC dialogue enters this event catch-up flow.
+
+ORIGINAL CPU CHECKS AND NEXT EVIDENCE
+
+All four increments load float bits3D088889. They do not consume incoming
+elapsed time. The private float-cadence-model.json is a binary32 arithmetic
+model; a subsequent isolated guest-code harness confirmed its boundary results.
+Final event-checks.txt: 750 checks, zero failures, 10 compiled functions.
+
+The test runs original instructions from the capped +190 block, the combined
++1A0/+198 branch region, complete fallback1683528, and complete cleanup1682F70.
+Only unrelated extraction continuations were replaced with return markers.
+Original arithmetic, comparisons, branches and the fallback jump table are
+retained. The exact extraction/return-marker provenance is event-fixtures.json.
+External fade/navigation/reference/placement helpers are deterministic stubs;
+this test does not exercise their implementation or a game/rendering process.
+
+Confirmed cases include capped +190 values below/at/above configured limits,
+its false-predicate continuation resetting it, the far-path timer continuation
+preserving +1A0 (entry16832D4, after the actual far-navigation branch),
+all fallback entry states0..5 with pending/completed fade status, missing
+character references, failed placement still advancing to state2, and cleanup
+with a resolved first navigator clearing the three recovery clocks while
+preserving the separate +190 clock. Cleanup cases with R+80 null or navigator
+resolution returning null preserve those fields and cached position and bypass
+navigation/player-control side effects. The far-navigation calls and distance
+branch are not executed by the timer continuation fixture.
+From zero, the actual old-value checks first act on eligible visits31,62,182
+for1,2,6 respectively. Binary32 accumulation reaches2 and6 after61 and181
+increments. Preserve comparison order and rounding; these are not bug claims.
+
+The strongest next manual observation is an active scripted walking/catch-up
+sequence: identify R, sample W+118/R+194, the four timers and elapsed wall time,
+and note control disable/restore and any fade/reposition recovery. This can
+establish actual callback frequency at30/60/120. Ordinary dialogue-spam testing
+alone may never activate this path. The current static evidence does not prove
+that this flow caused the earlier reported NPC interaction problems.
+
+If a correction is eventually warranted, the four scalar increments are much
+narrower candidates than throttling167F988 or168790C: those functions also
+process geometry, route progression, warnings and player-control transitions.
+No correction, hook, game launch or package mutation was made in this pass.

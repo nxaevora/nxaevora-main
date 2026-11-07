@@ -1,0 +1,23 @@
+--- a/src/nx/hle/filesystem/fs.c
++++ b/src/nx/hle/filesystem/fs.c
+@@ -1011,10 +1011,20 @@
+ }
+ /* size bytes of the file at offset rel into dst: 0, or -1 with the part that couldn't be read zeroed. quiet: the
+    runtime's own read, which doesn't count as the game's first of the file */
++extern u64 arceus_land_request;
++u64 arceus_land_request;
+ static int rfile_read(RFile* rf, u64 rel, u8* dst, u64 size, int quiet) {
+     FsNode* node = rf->node;
+     i64 got = (i64)size;
+     if (!node) return image_read(rf->base + rel, dst, size, 0, quiet); /* the game's image's, under the mods' */
++    if(!quiet && !rel && size && node->parent && !strcmp(node->parent->name,"terrain") &&
++        !strncmp(node->name,"ha_area",7) && node->name[7]>='0' && node->name[7]<='9' &&
++        node->name[8]>='0' && node->name[8]<='9'){
++        u32 area=(node->name[7]-'0')*10+node->name[8]-'0';
++        u64 request=!strcmp(node->name+9,".gfpak") && area<12 ? ((u64)node->size<<8)|(area+1) : 0;
++        if(area==0 && !strcmp(node->name+9,"_s01.gfpak"))request=((u64)node->size<<8)|13;
++        __atomic_store_n(&arceus_land_request,request,__ATOMIC_RELEASE);
++    }
+     if (!quiet && !__atomic_exchange_n(&rf->logged, 1, __ATOMIC_RELAXED))
+         LOG("RomFS: reading %s (%.1f KB)\n", node->name, (double)node->size / 1024.0);
+     if (fs_tree_mapped(node)) { /* mapped for the rest of the run, and never changes */

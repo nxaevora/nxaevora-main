@@ -1,0 +1,204 @@
+ARCEUS 1.1.1 DIALOGUE AND INPUT RESEARCH, PASS 5
+2026-11-06. All addresses below are hexadecimal main-relative; loaded base
+0x8005000. Local main.bin SHA256:
+d13df31aef8e3bdf9dce8fcb12518900218091b8f33a6880b36cfaaf2acf44c0.
+
+RESULT
+The field-message update path is now traced through the concrete text processor.
+It contains a byte-counted reveal delay, an embedded message wait, held-input
+acceleration, fresh-press advancement, and an explicit repeat-until-finished
+path. They must not all be paced by treating every text-processor call as one
+rendered frame. The repeat path intentionally processes many such calls in one
+outer update. No timing change or runtime probe was installed in this pass.
+
+These findings strengthen the next diagnostic but do not prove the remaining
+reported NPC-dialogue skipping has one of these specific causes. Current live
+objects, selected message type, owner flags and observed callback cadence remain
+unmeasured. User reports of improved reveal speed are retained as observations;
+this pass does not reclassify them as a proven code correction.
+
+1. FIELD MESSAGE MANAGER AND OLD PROBE COVERAGE
+C92C50 calls24858F4 atC92DC4. Within24858F4:
+  manager+58 nonnull ->2484ED8 at248592C.
+  active-object+68 points to the message implementation; state at impl+80.
+  impl state7 causes active-message cleanup (2485938..44).
+  manager+60 is a SEPARATE optional object. Only when its+68 == -2 does the
+  function tail-call the previously instrumented2482818 (2485980..94).
+Thus the old2482818 probe does not cover all active-message processing. A zero
+callback count from that probe cannot rule out execution of the+58 branch.
+
+2484ED8 has its own readiness state+98. In state1 it invokes27379B8 on+68;
+its+88 flag first invokes the message's virtual+60 with+78 when set.
+27379B8 calls2737ABC, prepares text-object+178 from message state+80, invokes
+text-object virtual+50, stores returned status at message+B8, then tail-calls
+message virtual+88. The text object is message+A8.
+
+2736778 constructs that text object throughFBEFE4 at2736964 and stores it at
+message+A8 at27369E8. FBEFE4 sets text vtable40F0150 atFBF094. Slot+50 is
+FBFBD0, the concrete text-processing wrapper studied here. The same message
+base code has other callers; this is not an NPC-only type.
+
+The constructor chain accepts different layouts, including msg_demo_00.bflyt
+(2738978) and msg_sys_00.bflyt (2749AA4). Identifying the active layout/owner in
+live tests remains necessary before applying a conversation-specific policy.
+
+2. INPUT PROVENANCE: ADVANCE IS DISTINCT FROM AUTOREPEAT
+Field constructor24841E4 obtains the shared input service through the global
+pointer referenced at42796C0, retains it inX24 at2484268, adds+70 at2484344,
+and supplies that pointer asX2 to2747068 at24843A8. The latter preserves X2 in
+X20; selected constructors store it at message+D0. For example2736344 stores
+X1 at+D0; 2749AA4 stores its X1 at+D0. 2736778 copies+D0 into text+118 at27369EC.
+
+C8EE14 obtains the same global service and callsC9A9B4 with service+70 atC8EE84.
+Inside that collector, new bits are compared against the prior mask at+E8:
+  +A0: current held bits, written atC9ACCC;
+  +A8: fresh press bits, current & ~previous, written atC9ACDC;
+  +B0: release bits, previous & ~current, written atC9ACEC;
+  +B8: repeat bits, held and repeat-countdown-expired, written atC9ACF8.
+Additional aggregation/remapping branches exist, but these slots remain distinct.
+
+FBFBD0 checks byte(input+A4)&6 for accelerated reveal, i.e. bits33/34 of the
+64-bit held mask at+A0. FC1078 andFC10E4 check byte(input+AC)&6 for advancement,
+i.e. the corresponding fresh-press bits at+A8. These methods do NOT read+B8.
+Consequently the existing menu-repeat correction (which adjusts+B8/countdown
+while retaining fresh presses) cannot directly limit this fresh-press path.
+This is a source-level distinction, not a claim about a measured minimum delay.
+The numeric button mapping is kept as mask6 here rather than assumed from names.
+
+3. ADVANCE GATES, VERIFIED IN THE ORIGINAL METHODS
+Virtual slots+68/+70 on40F0150 resolve toFC1078/FC10E4.
+Both implement these checks, in order:
+  text+178 nonzero -> reject;
+  text+179 nonzero -> accept;
+  text+17A nonzero -> clear it and accept once;
+  otherwise fresh-press mask6 must be present AND text+17B must be nonzero.
+FC1078 additionally sends the configured sound event when manual input accepts
+and the sound string is nonempty. FC10E4 omits that sound side effect.
+The lock at+178 dominates both override flags and leaves+17A unconsumed.
+Neither small method has a timer/cooldown increment. Its callers add state gates:
+2B315E8 calls virtual+68/+70 only in selected base states, with+114==2 at
+2B31658..74 and2B3182C..48. A minimum-delay fix cannot be inferred from these
+small predicates alone; the containing state machine must remain authoritative.
+
+4. EMBEDDED WAIT IS A DISTINCT MESSAGE TOKEN
+FC1170 is text virtual+88. It inspects a16-bit token:
+  token high byte != BE -> unhandled;
+  BE02 -> reads16-bit payload+8 into text+188 and returns1;
+  BE05 -> queries optional external text+190 virtual+40 with payload+8.
+          If that condition is active, sets+198 and saves payload+8 at+19A.
+This confirms+188 is an embedded text wait count, not a generic NPC advance
+cooldown. Its serialized author-facing name has not been recovered.
+
+At the beginning ofFBFBD0, an active external condition (+190 nonnull,+198=1)
+is polled first. While it reports busy, the wrapper returns1 without reducing
++188 or processing text. Once false,+198 clears and normal processing resumes.
+
+If+188 is nonzero,FBFBD0 subtracts1. If the new signed value is still>=1 AND
+the16-bit+19C mode is zero, it subtracts a second count. It returns1 without
+processing a glyph that call. Therefore a positive count30 resumes normal text
+on call31 when+19C!=0, or call16 when+19C==0. This behavior is original, including
+its next-call boundary. Do not erase the existing mode's deliberate factor2.
+FBF57C initializes+19C from a constructor argument bit; this pass does not assign
+a human-facing name to that mode or assume its live value.
+
+5. REVEAL DELAY, QUOTA AND TEMPORARY ACCELERATION
+The underlying processor2B315E8 has a switch table at39847F8. State4 dispatches
+to2B3175C, then the byte-delay path at2B31850 when+BA is clear. That path:
+  increments text+9E as an8-bit count;
+  compares its new value against byte delay+9D;
+  returns while new_count<=delay;
+  otherwise clears+9E and enters glyph/token processing.
+The byte arithmetic wraps at255. Tests exercised only the non-parsing delay
+path; the complete glyph/layout algorithm was not simulated.
+
+FBFBD0 has an inner repeat loop around2B315E8. Out-status1 stops it immediately;
+any other nonzero out-status repeats without checking the return value or quota.
+Only out-status0 with returnW0==1 consumes the per-call quota at+A4. The real base
+processor writes out-status2 at2B31BA0 and2B31E34. This is another reason wrapper
+invocations and individual text steps are not synonymous with rendered frames.
+When held-mask6 is present, acceleration additionally requires
++179==0,+17B!=0,+17D!=0,+198==0.
+If delay+9D is nonzero it is temporarily reduced by1; otherwise quota+A4 is
+multiplied by2 and stored as a byte. After processing, the wrapper restores
++9D from+A5 and+A4 from+A6. These are transient controls; scaling one stored
+byte once would be overwritten by the normal restore.
+
+6. CRITICAL MULTIPLE-CALL PATH: DO NOT THROTTLE THE WHOLE WRAPPER
+2737ABC returns immediately when message+D9 is zero. When nonzero it forces
+text+9D=0 and+A4=100, then calls text virtual+50. With message+D8=0 it repeats
+while that return equals1, recording the terminal result at message+B8.
+This allows multipleFBFBD0 calls within ONE invocation of2737ABC.27379B8 calls
+2737ABC before its own normal text update.
+
+The offline fixture executes the actual2737ABC body and actualFBFBD0 body. With
+an embedded wait30, one enabled2737ABC invocation reduces the entire wait to0
+and reaches the terminal step, for both+19C modes. When+D9 is zero, neither the
+wait nor the processor is touched. Only the terminal glyph step is stubbed.
+
+A proposed wrapper throttle that repeatedly returns1 without advancing state
+when no30Hz tick is available could keep this original loop running indefinitely.
+A timer correction must distinguish this repeat/finish operation from ordinary
+per-update progression. Call counts here cannot directly be labeled FPS.
+This is a demonstrated control-flow constraint, not a reported live hang.
+
+7. FALSE LEADS CORRECTLY CLASSIFIED
+The InputSkip handlers1078BC4/107962C are initialized by the expedition result
+view, whose layout1077A40 names advresult_00_lyt.bin/uikit_advresult_00.bin.
+131C1B4/131C600/131E494 belong to the Pokédex result view, whose loader131C06C
+names pokedex_result_00_lyt.bin/uikit_pokedex_result_00.bin. Its state update
+131B938 contains actual30-count waits at+9C, but those are result sequencing.
+They are not evidence for a universal NPC text debounce.
+
+SingleInputEnableFrame inC6F420 belongs to common/tips.dat / appli_tips and is
+stored at tips-view+798; C6F2D8 loads tips_00_lyt.bin/uikit_tips_00.bin. It is
+not a shared input-service parameter based on this reference. Its full consumer
+was not traced in this pass. These named UI timers remain separate audit targets.
+
+8. NEXT OBSERVATION, BEFORE ANY TIMING CHANGE
+The smallest useful paired observation is message update27379B8 plus its text
+processorFBFBD0, recording:
+  message/text identity, message+80/+D8/+D9;
+  original caller and outer-update serial;
+  text+188 before/after,+19C,+198, +A8 and+114 states;
+  +9D/+9E/+A4/+A5/+A6, flags+178..+17D;
+  held/fresh masks from the known input pointer, and wrapper return status.
+Count repeated text calls within each owner update separately from owner updates.
+Sample stable objects and transitions sparingly. A hook atFBFBD0 alone cannot
+know why it is being called repeatedly, and must not claim live NPC coverage
+without an observed owner/layout. All pointer reads need the runtime's readable
+checks; a partially readable object must not be interpreted as zero-valued state.
+
+Verified prospective FBFBD0 guards (not installed):
+  function offset FBFBD0, exact indexed size15C;
+  +000=D100C3FF, +024=B9418A68, +12C=7100053F, +158=17FFFFE7.
+An equivalent final B->CBZ XZR would useB4FFFCFF, still targetingFBFCC4. This
+follows instruction semantics and matches the existing JIT-clone mechanism, but
+was not applied to runtime or tested as a live replacement here.
+
+For the paired parent:27379B8 size104, entryA9BE4FF4, +0C=AA0003F3,
++40=D63F0100. Its+0C MOV X19,X0 can in principle be represented as ADD X19,X0,#0
+for an equivalent clone, subject to full guard/design review. No hook is ready
+or installed merely because these guards are documented.
+
+9. REPRODUCIBLE OFFLINE VERIFICATION
+Final result: dialogue instruction checks=344 failures=0 compiled_functions=9.
+Eight complete functions were extracted locally; a dynamic branch destination
+within the base processor compiled as one additional entry. Two direct call
+instructions were relocated to explicit host fixture addresses: one base text
+step in the wrapper and the manual-advance sound call. Get/set rate helpers,
+advance predicates, tag handler, wrapper, drain body and selected base delay
+paths execute original instructions. External wait readiness is a host stub.
+fixture-provenance.json records each range, alteration and mock boundary.
+
+Coverage includes token acceptance, wait modes and next-call boundaries,
+external-condition polling, all low4input-mask values with enable gates,
+one-shot/automatic flags, lock priority, sound invocation, transient reveal
+acceleration/restoration, byte-delay progression/wrap, original drain-loop
+behavior, and inner-loop status2 bypass versus status0 quota accounting. The
+inner-loop outcomes are supplied by an explicit sequential host step fixture;
+they verify wrapper control flow, not full glyph implementation. Full glyph
+rendering, scene/UI setup, live input sampling and callback
+frequency are outside this test. No in-game success is claimed.
+
+New files are only in work/pass5-dialogue and the final outputs copies.
+Runtime/source/packages, game files, save and Vulkan settings were not changed.

@@ -39,6 +39,8 @@ typedef enum {
     NVN_OP_COPY_TEXTURE,
     NVN_OP_REPORT_COUNTER,
     NVN_OP_BIND_IMAGE,
+    NVN_OP_RESET_COUNTER,
+    NVN_OP_TRANSFORM_FEEDBACK,
     NVN_OP_COUNT
 } NvnOpCode;
 
@@ -133,6 +135,8 @@ typedef struct {
     uint32_t src_region[6];
 } NvnOpCopyTexture;
 typedef struct { uint32_t type, reserved; uint64_t address; } NvnOpReportCounter;
+typedef struct { uint32_t type, reserved; } NvnOpResetCounter; /* the counter type as the game gave it */
+typedef struct { uint32_t kind, reserved; uint64_t address; } NvnOpTransformFeedback; /* kind: NvnXfbKind */
 typedef struct {
     uint32_t stage, first, count, reserved;
     uint64_t handle[NVN_IMAGE_BINDS_MAX];
@@ -142,6 +146,8 @@ _Static_assert(sizeof(NvnOpClearDepthStencil) <= NVN_OP_MAX_PAYLOAD, "NvnOpClear
 _Static_assert(sizeof(NvnOpClearTexture) <= NVN_OP_MAX_PAYLOAD, "NvnOpClearTexture fits an op payload");
 _Static_assert(sizeof(NvnOpCopyTexture) <= NVN_OP_MAX_PAYLOAD, "NvnOpCopyTexture fits an op payload");
 _Static_assert(sizeof(NvnOpReportCounter) <= NVN_OP_MAX_PAYLOAD, "NvnOpReportCounter fits an op payload");
+_Static_assert(sizeof(NvnOpResetCounter) <= NVN_OP_MAX_PAYLOAD, "NvnOpResetCounter fits an op payload");
+_Static_assert(sizeof(NvnOpTransformFeedback) <= NVN_OP_MAX_PAYLOAD, "NvnOpTransformFeedback fits an op payload");
 _Static_assert(sizeof(NvnOpBindImage) <= NVN_OP_MAX_PAYLOAD, "NvnOpBindImage fits an op payload");
 _Static_assert(sizeof(NvnOpBindProgram) <= NVN_OP_MAX_PAYLOAD, "NvnOpBindProgram fits an op payload");
 

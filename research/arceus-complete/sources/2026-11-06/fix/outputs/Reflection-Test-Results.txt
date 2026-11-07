@@ -1,0 +1,15 @@
+PINK BOX REFLECTION TEST RESULTS
+Run timing-20261106-190606-402; game_exit=0; DualSense Edge and both sensors detected.
+User reports pink persists. This was a diagnostic capture, not a rendering fix.
+
+Three F3 captures succeeded: 190711/190722/190723. Each has 15 cube mip payloads across three addresses, 64 ordinary attachments, one targeted lighting draw, no dropped draws or capture failures. All shader-bound cube addresses have full mip chains; captured constant snapshots were valid CPU data with no pending/unmapped omissions. Recorded draw is one present before capture, as expected for this present hook.
+
+Decoded the actual signed BC6H reflection cubes using the local project's CPU decoder. The active diffuse cube57a8f0000 has no texels meeting the defined purple criterion (R/G>1.5,B/G>1.5,G>.001). The active specular cube57a9a0000 has one such texel at mip0 and none at other mips; imagery is ordinary outdoor scenery. This does not prove GPU sampling correctness or rule out all reflected lighting contributions.
+
+Stronger lead: the lighting shader's material-category-selected color. Basecolor alpha70 selects category1 through guest word328 BFE offset2,width3. Words624/659/660/661/663 address cbuf3 color tables using category*16. The captured category1 entry at0x150 is linear RGBA=(0.45641106,0.18782076,0.73791051,0.47058824), corresponding to sRGB RGB(180,120,223). Identical across all three captures. The alternate entry at0xd0 is warmer. Static shader dataflow blends these colors into the lighting result. All1740 classified-purple pixels in the sampled x700..1799,y735..819 tabletop ROI select category1.
+
+Interpretation: game-supplied purple rim/highlight lighting is now a stronger hypothesis than corrupt reflection data. This is NOT a complete pixel-shader replay, proof of intended intensity, proof of correct normals, or a matched-console comparison. No color suppression, shader fix or asset edit applied. Exact original appearance remains unverified.
+
+Reproducible local analysis: work/check_reflection_capture.py; work/analyze_reflections.py; work/probe_lighting.py; work/rim_evidence.py. Detailed JSON and decoded cube images under work/decoded-reflections, work/rim-evidence.json and work/lighting-pixels.json. CPU decoder compiled from existing tests/support/bcn.c. No game data uploaded.
+
+Next discriminating step: isolate/replay the selected rim contribution using these saved inputs, or obtain a matched original-game reference. A deliberately neutralized rim-light test would establish contribution but would be a diagnostic alteration, not by itself a correctness fix. No repeat reflection or shadow-toggle capture needed.

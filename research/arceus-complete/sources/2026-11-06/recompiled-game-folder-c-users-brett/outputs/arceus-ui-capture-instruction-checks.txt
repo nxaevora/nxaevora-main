@@ -1,0 +1,18 @@
+fade mode=0 authored_frames=0 callbacks_to_idle=1
+fade mode=0 authored_frames=1 callbacks_to_idle=2
+fade mode=0 authored_frames=2 callbacks_to_idle=3
+fade mode=0 authored_frames=10 callbacks_to_idle=11
+fade mode=0 authored_frames=30 callbacks_to_idle=31
+fade mode=0 authored_frames=60 callbacks_to_idle=61
+fade mode=0 authored_frames=120 callbacks_to_idle=121
+fade mode=2 authored_frames=0 callbacks_to_idle=1
+fade mode=2 authored_frames=1 callbacks_to_idle=2
+fade mode=2 authored_frames=2 callbacks_to_idle=3
+fade mode=2 authored_frames=10 callbacks_to_idle=11
+fade mode=2 authored_frames=30 callbacks_to_idle=31
+fade mode=2 authored_frames=60 callbacks_to_idle=61
+fade mode=2 authored_frames=120 callbacks_to_idle=121
+UI assumed_update_hz=30 normalized_units_in_one_second=30.000000000
+UI assumed_update_hz=60 normalized_units_in_one_second=29.999999404
+UI assumed_update_hz=120 normalized_units_in_one_second=30.000000000
+UI/capture guest checks=1779 failures=0 compiled_functions=7

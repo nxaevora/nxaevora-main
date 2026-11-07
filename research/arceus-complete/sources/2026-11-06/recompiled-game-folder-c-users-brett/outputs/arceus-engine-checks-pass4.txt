@@ -1,0 +1,40 @@
+ARCEUS FOURTH-PASS OFFLINE INSTRUCTION CHECKS
+All execution used synthetic guest memory. No interactive game was run.
+
+Physics translation
+translation assumed_calls_per_second=30 dt_mode=fixed_1_30 dt=0.0333333351 x_after_one_second=3.000000268
+translation assumed_calls_per_second=60 dt_mode=fixed_1_30 dt=0.0333333351 x_after_one_second=6.000000536
+translation assumed_calls_per_second=120 dt_mode=fixed_1_30 dt=0.0333333351 x_after_one_second=12.000001073
+translation assumed_calls_per_second=30 dt_mode=elapsed dt=0.0333333351 x_after_one_second=3.000000268
+translation assumed_calls_per_second=60 dt_mode=elapsed dt=0.0166666675 x_after_one_second=3.000000268
+translation assumed_calls_per_second=120 dt_mode=elapsed dt=0.00833333377 x_after_one_second=3.000000268
+physics translation guest checks=447 failures=0 compiled_functions=1
+
+AI waits and turning
+WaitFrame duration=30 frame_delta=1 calls_to_success=31 assumed_hz=30 elapsed=1.033333333
+WaitFrame duration=30 frame_delta=1 calls_to_success=31 assumed_hz=60 elapsed=0.516666667
+WaitFrame duration=30 frame_delta=1 calls_to_success=31 assumed_hz=120 elapsed=0.258333333
+Turn/TurnKey: 50 quaternion pairs tested at frame deltas 0,1,4; 32 noncommuting pairs distinguish step * current order.
+AI guest checks=665 failures=0 compiled_functions=8
+
+Field timer branches
+respawn threshold=0 callbacks_until_old_count_exceeds_threshold=2
+respawn threshold=1 callbacks_until_old_count_exceeds_threshold=3
+respawn threshold=30 callbacks_until_old_count_exceeds_threshold=32
+respawn threshold=120 callbacks_until_old_count_exceeds_threshold=122
+field timer guest checks=310 failures=0 compiled_functions=4
+
+Attention timer branches
+attention instruction checks=391 failures=0 compiled_functions=2
+
+TOTAL: 1813 checks; zero failures; 15 compiled functions.
+
+The corresponding component reports describe extracted instruction boundaries,
+external stubs, continuation returns and limits. No live cadence is inferred.
+
+Runtime build: succeeded.
+Log summarizer: new/old-log fixtures passed, including unknown simulation paths.
+Existing instruction/function guards: 11 verified against local main.bin.
+Simulation vtable method identities: both verified against relocation data.
+Regular package: hash unchanged. Prior candidate retained; new build/package match.
+Runtime source/mirror: identical. Manual launchers: Vulkan, no time limit.

@@ -1,0 +1,55 @@
+SPDX-License-Identifier: GPL-3.0-or-later
+Copyright 2026 the NXAevora contributors
+
+Arceus timing investigation, November 6, 2026
+
+STATUS
+A working, optional Vulkan presentation diagnostic was built and smoke-tested. No normal-speed 60 FPS implementation was established. No game timing was changed. The original fps_limit=game and nvn_native=0 settings remain. No pushes, PRs, or commits were made. Game data and raw logs remain local.
+
+Checkout: C:\Users\brett\Documents\Codex\2026-11-06\files-pasted-by-the-user-project\work\nxaevora-main
+Origin: https://github.com/colardocookie/nxaevora-main.git
+Base: 59c7e1780e50c74a8f92a53dcd77d017fd00cbf6
+Branch: experiment/arceus-present-trace
+Build source: C:\Users\brett\Documents\Codex\work\nvn-src
+Installed runtime: C:\Users\brett\Documents\Codex\work\arceus-games\ArceusTest\ArceusTest.exe
+Previous executable: C:\Users\brett\Documents\Codex\2026-11-06\recompiled-game-folder-c-users-brett\work\ArceusTest-before-trace.exe
+
+PRIORITY 1: WHAT Z-A ACTUALLY DOES
+The inspected PokeZ-ARecomp checkout is dfb47e9d8130d6ecde1c0afa1010fb1a102e50f6. tools/za_patches.py guards the frame-mode instruction by build ID and instruction word. runtime/hle/framepace.c changes the configured vsyncs-minus-one value from 1 to 0, coupling a one-vsync presentation interval with a 1/60-second world step.
+Its newer timing hooks accumulate host elapsed time in 16,666,667 ns steps, carry fractional debt, limit stalls, and feed clock channels. It also switches frame mode on late frames and exempts channel 0 under specific transitions. Comments document stuck movement and battle banner problems that motivated those exceptions. These are upstream findings, not independently reproduced here. The minimum one tick per rendered frame means this algorithm is not itself a solution for rendering above 60 FPS.
+Source: https://github.com/Hexveil404/PokeZ-ARecomp/blob/pokemon-za/runtime/hle/framepace.c
+Patch sites: https://github.com/Hexveil404/PokeZ-ARecomp/blob/pokemon-za/tools/za_patches.py
+
+The borgox no-speed-up cheat is different: it branches forward 0x2c bytes at main+0x019E37A8 and writes 16,666,667 at main+0x031E6A78. The ordinary FPS file is actually labelled 15FPS and writes MOV W1,#3. Names alone are unreliable. The second write's full data flow was not verified without a Z-A game dump. No Z-A addresses or code were copied into Arceus.
+https://github.com/borgox/Pokemon-Legends-Z-A-Mods/blob/main/0100F43008C44000/FPS%20No%20Speed-up%20v1.0.1/cheats/7222E13ECF6ADB32.txt
+
+VERIFIED LOCALLY IN ARCEUS 1.1.1
+The supplied ExeFS identifies main build AEE8F150DDA1B5A8, matching the public 1.1.1 cheat. Cached main image layout uses base 0x08005000. Addresses below are offsets from main, not Z-A addresses.
+- main+0x0397E8D0 contains five 64-bit durations: 16,666,667; 33,333,334; 50,000,000; 66,666,667; 83,333,334 ns.
+- main+0x02783048 selects that table with signed index W2, loads a duration into X2, and tail-dispatches through a virtual method at vtable+0x10.
+- The constructor starting main+0x0277BD74 initializes four duration fields at object+0x80, +0x90, +0xA0, +0xB0 to 33,333,334 ns, and stores the object at main+0x042EC1F8.
+- main+0x0277BEF4 stores a duration in an indexed 16-byte record. main+0x0278303C returns an indexed record address.
+- Near main+0x027814B4 a returned duration is converted to seconds and passed onward. The identities and reach of its consumers remain unverified.
+- No equivalent of Z-A's checked mode-read instruction was found. A broader search for its signed-byte load at offset 0x20 found unrelated code. This does not prove Arceus lacks an equivalent with a different layout.
+
+The public Arceus cheat edits only the second table duration and a separate pointer-chain value. Its author explicitly reports menu/effect acceleration, possible title-screen crashes, and slowdown below 60 FPS. The table and separate initialized clock durations show why changing one constant is not evidence that every gameplay subsystem was corrected. The exact cause of each reported defect remains unproven.
+https://gbatemp.net/threads/60-fps-cheats-for-nswitch.592464/
+
+In ScarletNX, vi.c receives the guest swap interval. runtime/present.c waits in DequeueBuffer using 60 Hz divided by that interval, or the user FPS override. This override changes pacing, not game delta time. The Vulkan renderer can skip display acquisition while its frame bookkeeping still advances. Actual vkQueuePresentKHR runs later in gpu/vk/record.c. That is where this patch records timestamps and results.
+
+PRIORITY 2: TRANSFERABLE LESSONS
+Whatcookie's historical Demon's Souls patch changes the fixed timestep to 1/60 or 1/120 alongside emulator clock/vblank settings. It is a matched-rate technique, not evidence of arbitrary-rate correctness in Arceus.
+https://github.com/RPCS3/rpcs3/wiki/Game-Patches/1e4400f9f442213174aa472569d62133bc70a885
+FPS++ computes game speed from elapsed ticks, with smoothing and separate fixes. Its ragdoll patch removes inappropriate timestep scaling of impulses; its water patch corrects nonlinear scaling. These illustrate subsystem audits Arceus needs, not portable offsets.
+https://github.com/cemu-project/cemu_graphic_packs/tree/master/src/BreathOfTheWild/Mods/FPS%2B%2B
+Chuck's DynamicFPS release notes describe delta-time changes plus distinct cloth, camera, cutscene and Havok solver fixes, with remaining rope/climbing issues. This review used the author's documentation, not a complete source audit of that mod.
+https://www.reddit.com/user/ChucksFeedAndSeed/comments/14fe0ca/release_totk_dynamic_fps_v153_release_physics/
+
+IMPLEMENTATION AND TESTS
+SNX_PRESENT_TRACE=<new CSV filename> records begin/end CPU nanoseconds, swapchain, image, and Vulkan result around the actual API call. Unset is off. Existing files are refused. Buffering limits disk interference but a crash can lose the buffered tail. No display-completion claim is made from these timestamps.
+Targeted runtime build passed. Opening-scene smoke test: 35 seconds, exit 0, 1,018 successful API calls, zero JIT misses. Two swapchains were observed. Discarding 10 seconds per swapchain, the stable chain has 611 calls: mean interval 33.333636 ms, median 33.3389 ms, p95 33.9056 ms. Mean API duration 0.1587 ms.
+Two additional 8-second smoke runs passed: tracing disabled and existing output file. The existing file's SHA-256 was unchanged. Four analyzer tests passed, covering separate swapchains, failed calls, warmup and invalid timestamp order/empty data. git diff --check passed.
+PresentMon was attempted twice. It exited 1 without diagnostics or CSV. Display completion was therefore NOT measured. The automated runs did not validate visual output, movement, physics, encounters, battles, input latency, or fluctuating-rate behavior.
+
+NEXT TECHNICAL OBSTACLE
+Identify the clock update and its consumers, then instrument duration values at a simulation boundary in live gameplay. Determine whether lowering the configured frame mode updates every relevant clock or leaves per-frame systems behind. Start with a build-guarded 60 FPS hook only after that data flow is established. Above 60, the Z-A integer-tick method needs either smaller verified simulation steps or independent rendering with state interpolation. Re-presenting the same image does not meet the objective.

@@ -1,0 +1,222 @@
+Independent review request: Arceus 1440p patterned shadows
+========================================================
+
+Please independently investigate the persistent repeating bumps/stripes on
+stone, brick, a wooden bridge and a waterwheel. Review the evidence and code
+critically; do not assume Codex's latest explanation is correct. Try to find a
+root cause and a narrow, testable correction before adding TAA.
+
+USER CONSTRAINTS
+- All game files, extracted modules, saves, screenshots and fixtures stay local.
+  Do not upload them to external services or repositories.
+- Keep the established Vulkan path: --nvn_native=0. Experimental native NVN
+  currently renders black.
+- Preserve target120FPS and accepted normal-speed timing fixes, controller
+  camera multiplier2.2, menu repeat, blinking, dialogue, water, cutscene camera
+  and Pokemon release effects. Do not conflate these with the graphics issue.
+- Every game launch must support the user's controller. Existing native
+  controller helpers work when launched from the desktop session. Restricted
+  shell game launches previously enumerated no controllers. Read AGENTS.md and
+  outputs/controller-test-launch-notes.txt before any launch.
+- User saves and closes the game. Do not kill, time-limit, restart, hot-patch,
+  send gameplay input, or make Escape quit. After closure, do not automatically
+  launch another test. Offline work is authorized.
+- User confirmed proper1440p sharpness. Allocated image size or sharp UI alone
+  does not establish the actual 3D viewport resolution.
+- Future interests: TAA, temporal FSR/DLSS, eventually ray tracing/path tracing.
+  Current priority is this artifact without masking it with TAA.
+
+PATHS
+Workspace / notes / scripts:
+C:\Users\brett\Documents\Codex\2026-11-06\recompiled-game-folder-c-users-brett
+Runtime source:
+C:\Users\brett\Documents\Codex\work\nvn-src
+Runtime build:
+C:\Users\brett\Documents\Codex\work\nvn-build
+Recompiled game:
+C:\Users\brett\Documents\Codex\work\arceus-games\ArceusTest
+Extracted game/update1.1.1:
+C:\Users\brett\Documents\Codex\work\arceus-dump
+Source mirror, maintained manually:
+C:\Users\brett\Documents\Codex\2026-11-06\files-pasted-by-the-user-project\work\nxaevora-main\third_party\ScarletNX
+
+Read workspace AGENTS.md first. Runtime source is not a normal git checkout;
+preserve existing modifications and backups. Do not reset it to upstream.
+
+LATEST TEST / BUILD
+Run timing-20261106-175234-874 is CLOSED, game_exit=0:
+C:\Users\brett\Documents\Codex\work\arceus-runs\timing-20261106-175234-874
+User says pattern remains after pass10 and took many screenshots.
+This used outputs/Arceus-Surface-Capture.exe, native_bc=1, Vulkan, docked4/3
+resolution scale, fullscreen, target120FPS and accepted gameplay settings.
+
+Staged runtime and runtime used by this latest test:
+AAAD4627683A6218594A7E0952E1E0EF2C748487C8B1F476271EA36DA07C06B3
+Workspace work/ArceusEngineCandidate-runtime.exe
+Workspace work/ArceusSurfaceCapture-runtime.exe
+Verify installed EXE hash yourself before changing anything.
+Previous candidate FBE5A06B... is preserved as:
+work/ArceusEngineCandidate-before-pass10-runtime.exe
+Older before-pass8 and before-pass6 candidates also remain.
+Shader cache token is direct_flow=3.
+No new runtime patch was staged after the user's latest failed visual test.
+
+CAPTURES: PRIMARY NEW EVIDENCE
+Directory:
+C:\Users\brett\Documents\Codex\work\arceus-games\ArceusTest\captures
+Four detailed captures succeeded,64 attachments each, no failures:
+screenshot_20261106_175250_buffers_1  present1266
+screenshot_20261106_175257_buffers_2  present1678
+screenshot_20261106_175310_buffers_3  present2657
+screenshot_20261106_175313_buffers_4  present3020
+
+For each prefix:
+  _attachments.tsv: raw filenames, formats, dimensions, layers, addresses,
+                    write generations and last-use/draw age
+  _NN.bin: exact raw Vulkan base-mip bytes, all array layers
+  _final.ppm: final guest image paired with this capture
+  _pair.tsv: present, final address, dimensions, crop, transform and hash
+The ordinary F3 screenshot is EARLIER and is not the attachment pair.
+After four extra captures, subsequent F3 presses still saved ordinary images.
+
+Capture limits: newest recently used RTs and textures copied from RTs, not a
+complete replayable GPU frame. Some selected surfaces can be2 presents old;
+check drawn_at/last_used/wseq. Raw orientation is guest image order. Final PPM
+applies crop/flip and excludes runtime postfx, letterboxing and overlays.
+D24 depth-copy upper8 bits are undefined, NOT stencil; mask0x00ffffff.
+Raw fp16/packed float previews may clip; inspect numerical bytes when needed.
+
+Fourth capture already decoded with the stdlib-only script:
+work/decode-surface-capture.py MANIFEST [--normal-address HEX]
+Output:
+work/pass10-captures/screenshot_20261106_175313_buffers_4_attachments
+Includes summary.json and decoded normal preview for552210000.
+Do not globally assume that address always holds normals; confirm bindings.
+
+FOURTH CAPTURE: KEY ATTACHMENTS
+00 553550000 final RGBA8,2560x1440: pronounced stone/step pattern.
+32 540a88000 shadow-receiver R8_UNORM,2560x1440: same pronounced stripes.
+48 5508c0000 lit scene B10G11R11_UFLOAT,2560x1440: pattern already present.
+44 552210000 packed normal RGBA8_UNORM,2560x1440: step normals look smoother.
+45 552a80000 basecolor RGBA8_SRGB,2560x1440: lacks pronounced step striping.
+35 54ddd0000 half-resolution lighting,1280x720.
+46 54fc10000 scene depth D24S8,2560x1440.
+51 54a8a0000 shadow depth D32,1365x1365, first cascade/source.
+49 54aca0000 shadow depth D32,1365x1365, second cascade/source.
+52/50 53aca0000/53ada0000 companion R8_UINT tags,1365x1365.
+62 54a8a0000 sampled shadow depth D32 array,1024x1024,two layers.
+61 53aca0000 sampled tag R8_UINT array,1024x1024,two layers.
+
+CONFIRMED FINDINGS VS HYPOTHESIS
+Confirmed:
+1. The visible stripes are present in shadow-receiver output before main
+   lighting/final postprocessing. Visual comparison alone does not establish
+   which receiver input or arithmetic first becomes incorrect.
+2. Shadow source targets are1365x1365, their producer viewport1365.333 square
+   at4/3 scale, but the sampled array is1024 square.
+3. All2,097,152 depth-array texels are bitwise identical to nearest-neighbor
+   reduction of those two captured source images. Exact check script:
+   work/check-shadow-resampling.py
+   Results: outputs/arceus-shadow-resampling-evidence.json
+4. This copy comes from src/nx/gpu/vk/texture.c:copy_layers. Scaled RTs are
+   blitted using vk_sc(w/h) source extents into native-size texture layers,
+   VK_FILTER_NEAREST. Receiver manually compares depth; its ShTex.shadow is0,
+   with linear min/mag sampling. Integer tag samplers are forced nearest.
+5. Captured raster depth-bias values/enables are zero. Shader-computed bias
+   has NOT been ruled out or fully measured.
+
+Current hypothesis, NOT established root cause:
+Nearest reduction moves depth samples relative to receiver positions, causing
+repeating self-shadowing on sloped surfaces. A local planar estimate shows
+phase-dependent depth errors. It is not a replay of actual receiver comparisons,
+does not know bias sufficiency, and is not proof of the full cause.
+Please challenge this: inspect receiver translation, projection/reconstruction,
+manual comparison/filter semantics, normal offset/bias and sampler coordinates.
+Look for causes Codex missed instead of only confirming the resampling theory.
+
+POSSIBLE CORRECTIONS TO EVALUATE, NOT READY PATCHES
+- Preserve native resolution for the entire shadow pass (depth AND integer
+  tags), matched viewport/scissor/shader scale, then direct array copies.
+- Or preserve scaled shadow arrays and consistent sampling throughout.
+- Do not merely shrink depth allocation; other attachments and per-pass state
+  must match. Do not globally add shadow bias or force an invalid linear depth
+  blit to hide the artifact.
+Renderer currently assumes global scale in several paths. Audit at least:
+  surface.c:surf_create, vk_sc, vk_scf
+  render.c:clear scissor, viewport, draw scissor, frame_consts/SNX_RS
+  texture.c:copy_layers, tex_take_drawn, allocation/view/cache identities
+  source/copy dimensions and any screen-fetch scale masks
+Normal scene rendering must remain1440p.
+
+PREVIOUS WORK: VALID FIXES THAT WERE VISUALLY INSUFFICIENT
+Pass8: conditional KIL incorrectly blocked dataflow recognition of a direct
+screen-depth fetch. Fixed direct_can_reach and hardened MOV masks. Actual
+shadow-receiver cached SPIR-V confirmed all3 direct reads corrected. User still
+saw the pattern. Do not assume stale caches or missing deployment.
+
+Pass10: half-resolution light shader1d0676ab12f2bfeb multiplies FragCoord by2
+before F2I when reading full-resolution normals. Old correction recognized
+only direct1x, leaving normal coords0,3,4,7,... rather than1,3,5,7,... at4/3.
+Narrow exact FMUL.FTZ-by-2 recognition added; both axes must match and existing
+dominance/modifier/rounding guards remain. Six shipped light/probe shaders
+change; flag-off output identical. All52 regression cases,30774 emitted-coordinate
+assertions,931 shipped and334 captured+constant-buffer replay translations pass.
+These expression/corpus tests are NOT complete GPU visual correctness tests.
+Latest user test confirms pass10 did not remove the reported pattern.
+
+TEXTURE INVESTIGATION: NEGATIVE EVIDENCE
+Prior run timing-20261106-172820-124 used native_bc=0 and STILL showed pattern.
+245 BC5 bindings really used software conversion22 -> RG16; known material
+normal inputs had complete mips, linear/trilinear filters, zero bias, no sRGB.
+Native GPU BC1-5 decode differed from reference, but changing decoder did not
+resolve the visual issue. Do not repeat that as a confirmed cause.
+Actual BC5 upload/deswizzle/conversion test passed all11 mips of a local wood
+normal asset. Finite sampling tests passed documented device precision bounds.
+The asset was not matched conclusively to the pictured stone/bridge.
+Packed-normal arithmetic checked separately; a336 material outputs normal at
+location2, UNORM, not the adjacent sRGB albedo attachment.
+
+KEY REPORTS / REPRODUCTION MATERIAL
+outputs/arceus-shadow-buffer-investigation.txt
+outputs/arceus-shadow-pattern.png (receiver visualization)
+outputs/arceus-shadow-resampling-evidence.json
+outputs/arceus-1440p-lighting-fix.txt
+outputs/arceus-1440p-lighting-fix-provenance.json
+work/pass10-render/findings.txt and snapshot-review.txt
+work/pass10-texture/findings.txt and capture-findings.txt
+work/pass10-material/findings.txt
+work/pass10-snapshot/integration-notes.txt
+work/pass8-shader/e9e7255e7594a006.txt (guest instruction listing)
+work/pass8-render/e9e7255e7594a006.spv.txt
+work/pass10-render/consumer-shaders.json and gbuffer-consumers.json
+work/parse-material-trace.py RUN_DIRECTORY
+  Parses game-err.txt into local work/pass9-captures/<run>/materials.json.
+  Trace configurations are first occurrences, not every draw or GPU lifetime.
+
+BUILD / TOOL NOTES
+PowerShell. Python: C:\Users\brett\.local\bin\python3.14.exe
+Python scripts under work should remove sys.path[0] before stdlib imports:
+work/inspect.py otherwise shadows stdlib inspect. NumPy/Pillow are not available
+in that interpreter; current capture decoder uses stdlib only.
+CMake:
+C:\Users\brett\Documents\Codex\work\nvn-src\deps\tools\cmake-4.4.4-windows-x86_64\bin\cmake.exe
+Build: --build C:\Users\brett\Documents\Codex\work\nvn-build --target scarletnx -j8
+Compiler:
+C:\Users\brett\Documents\Codex\work\llvm-mingw-20261104-ucrt-x86_64\bin\clang.exe
+Standalone shader tests/build examples: work/pass10-render and
+work/pass10-integration. Runtime build testing is disabled in CMake; tests have
+been linked separately against actual production objects.
+
+WHAT I WOULD LIKE BACK
+1. Your independent diagnosis, with evidence and confidence level.
+2. Any incorrect assumptions, translation bugs or missing tests in this handoff.
+3. A narrow candidate fix, preserving1440p/120FPS/controller/timing behavior,
+   with offline validation and a clear description of what visual testing remains.
+4. No automatic game launch; prepare a reviewable candidate and let the user
+   control the next test, saving and closing.
+LATEST FOLLOW-UP: the user tested private native-shadow candidate B32D40B0.
+Original pattern visually resolved in stone, bridge and wheel scenes. See
+outputs/arceus-shadow-test-results.txt for completed run181617-047, exact
+depth/tag copy checks and new pink crafting-box lighting localization.
+Preserve the shadow correction. Pink box root cause is not yet proven.
+

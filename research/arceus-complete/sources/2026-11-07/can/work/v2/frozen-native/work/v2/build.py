@@ -1,0 +1,408 @@
+from pathlib import Path
+import hashlib,json,re,shlex,shutil,struct,subprocess,sys
+root=Path.cwd(); w=root/'work';tmp=w/'v2'
+out=Path(sys.argv[1]).resolve() if len(sys.argv)>1 else root/'outputs'
+(out/'world-pt-v2-runtime').mkdir(exist_ok=True,parents=True)
+shared=Path.home()/'Documents/Codex/work';fix=shared.parent/'2026-11-06/fix';ups=fix/'work/ups';build=shared/'nvn-build'
+compiler=next((shared/'nvn-src/.cache/cpm/glslang-tools').glob('*/bin/glslang.exe'))
+reflection_flags=(['-DFORWARD_REFLECTIONS','-DREFLECTION_WITNESS','-DREFLECTION_PAIR'] if '--reflection-pair' in sys.argv[2:] else ['-DFORWARD_REFLECTIONS','-DREFLECTION_WITNESS'] if '--reflection-witness' in sys.argv[2:]
+                  else ['-DFORWARD_REFLECTIONS'] if '--forward-reflections' in sys.argv[2:] else [])
+defs=[]
+field_variants=[('fieldWitness',['-DGROVE_TRACE_TEST'])] if '--grove-witness' in sys.argv[2:] else [('fieldWitness',['-DFIELD_WITNESS'])] if '--field-witness' in sys.argv[2:] else []
+if '--emission-witness' in sys.argv[2:]:field_variants.append(('emissionWitness',['-DEMISSION_WITNESS']))
+for name,flags in field_variants+[('reference',['-DQA_REFERENCE']),('skyDistribution',['-DSKY_DISTRIBUTION']),('verifyObjects',['-DVERIFY_OBJECTS']),('verifyTrees',['-DVERIFY_TREES']),('mesh',['-DBUILD_MESH']),('calibrate',['-DCALIBRATE']),('trianglePower',['-DEMITTER_TRIANGLES']),('emitterCdf',['-DEMITTER_DISTRIBUTION']),('particleGrid',['-DPARTICLE_GRID']),('contact',[]),('rrContact',['-DRR_GUIDES'])]:
+    target=tmp/(name+'.spv')
+    subprocess.run([compiler,'-V','--target-env','vulkan1.2',*flags,'-o',target,tmp/'contact.comp'],check=True)
+    defs.append('static const u32 '+name+'_words[]={'+','.join(hex(a[0]) for a in struct.iter_unpack('<I',target.read_bytes()))+'};')
+target=tmp/'denoise.spv'
+subprocess.run([compiler,'-V','--target-env','vulkan1.2','-o',target,tmp/'denoise.comp'],check=True)
+defs.append('static const u32 denoise_words[]={'+','.join(hex(a[0]) for a in struct.iter_unpack('<I',target.read_bytes()))+'};')
+if '--compare-filter' in sys.argv[2:]:
+    target=tmp/'denoise-baseline.spv'
+    subprocess.run([compiler,'-V','--target-env','vulkan1.2','-o',target,tmp/'denoise-baseline.comp'],check=True)
+    defs.append('static const u32 baseline_words[]={'+','.join(hex(a[0]) for a in struct.iter_unpack('<I',target.read_bytes()))+'};')
+target=tmp/'material-tile.spv'
+subprocess.run([compiler,'-V','--target-env','vulkan1.2','-o',target,tmp/'material-tile.comp'],check=True)
+(tmp/'material-tile-words.h').write_text('static const u32 material_tile_words[]={'+','.join(hex(x[0]) for x in struct.iter_unpack('<I',target.read_bytes()))+'};')
+target=tmp/'overlay-mask.spv' 
+subprocess.run([compiler,'-V','--target-env','vulkan1.2','-o',target,tmp/'overlay-mask.comp'],check=True)
+defs.append('static const u32 overlay_mask_words[]={'+','.join(hex(a[0]) for a in struct.iter_unpack('<I',target.read_bytes()))+'};')
+(tmp/'contact_words.h').write_text('\n'.join(defs))
+# The reversed-Z sky has no finite world position. Reproject its direction with
+# homogeneous w=0 so translations leave it fixed while camera rotation moves it.
+prepare=(ups/'prepare.comp').read_text()
+prepare=prepare.replace('uint valid;}','uint valid;float skyDepth;}')
+prepare=prepare.replace('z>0 && z<=1','z>=0 && z<=1').replace('vec4(clip,z,1)','vec4(clip,z>0.?z:u.skyDepth,1)')
+assert 'z>0.?z:u.skyDepth' in prepare and 'float skyDepth;' in prepare
+seed=(ups.parent/'motion/seed.comp').read_text()
+seed=seed.replace('    vec2 velocity=vec2(0);','    if(z==0.)return; // Preserve the sky rotation computed by prepare.\n    vec2 velocity=vec2(0);')
+for name,source,symbol in [('prepare_sky',prepare,'up_words'),('seed_sky',seed,'sky_seed_words')]:
+    (tmp/(name+'.comp')).write_text(source)
+    target=tmp/(name+'.spv')
+    subprocess.run([compiler,'-V','--target-env','vulkan1.2','-I'+str(ups.parent/'motion'),'-o',target,tmp/(name+'.comp')],check=True)
+    (tmp/(name+'.h')).write_text('static const unsigned int '+symbol+'[]={'+','.join(hex(a[0]) for a in struct.iter_unpack('<I',target.read_bytes()))+'};')
+flow=(ups.parent/'motion/material_flow.h').read_text().replace('#include "flow_words.h"','#include "../motion/flow_words.h"\n#include "seed_sky.h"').replace('apply_spv,seed_spv','apply_spv,sky_seed_words').replace('sizeof seed_spv','sizeof sky_seed_words')
+(tmp/'material_flow_sky.h').write_text(flow)
+db=json.loads((build/'compile_commands.json').read_text())
+clock=shared/'nvn-src/src/nx/runtime/arceus_clock.c'
+source=clock.read_text()
+marker='    if (!tracing && !experimental && !message_trace) return;'
+assert source.count(marker)==1
+source=source.replace(marker,'''    const char *fixed = getenv("SNX_ARCEUS_FIXED_RESOLUTION");
+    if (!tracing && !experimental && !message_trace && !(fixed && !strcmp(fixed, "1"))) return;''')
+(tmp/'arceus_clock.c').write_text(source)
+row=next(e for e in db if e['file'].endswith('/nx/runtime/arceus_clock.c'))
+cmd=[v.strip('"') for v in shlex.split(row['command'],posix=False)]
+cmd[cmd.index('-o')+1]=str(tmp/'arceus_clock.obj');cmd[-1]=str(tmp/'arceus_clock.c')
+subprocess.run(cmd+['-I'+str(clock.parent)],cwd=build,check=True)
+e=next(e for e in db if e['file'].endswith('/nx/gpu/vk/render.c'))
+args=[v.strip('"') for v in shlex.split(e['command'],posix=False)]
+args[args.index('-o')+1]=str(tmp/'render.obj');args[-1]=str(tmp/'render.c')
+if '--capture-window' in sys.argv[2:] or '--field-route' in sys.argv[2:]:
+    source=(tmp/'render.c').read_text()
+    marker=' rr_capture_previous();'
+    assert source.count(marker)==1
+    source=source.replace(marker,''' static bool tookMotionSample;
+ if(!tookMotionSample && temporal_snapshot.frame==1960 && g_vk_present==1961){
+    const char *prefix=getenv("ARCEUS_QA_MOTION");
+    if(prefix){
+        tookMotionSample=true;
+        LOG("arceus-qa: sky depth %.9g at frame %u\\n",-tprev[15]/tprev[11],temporal_snapshot.frame);
+        temporal_snapshot_capture(prefix);
+    }
+ }
+'''+marker)
+    (tmp/'capture-render.c').write_text(source)
+    args[-1]=str(tmp/'capture-render.c')
+if '--forward-bindings' in sys.argv[2:]:
+    instrument=Path(args[-1]).read_text()
+    marker='    u32 inputVertices=indexed?icount:count;'
+    assert instrument.count(marker)==1
+    instrument=instrument.replace('#include "opaque-scene.inc"','#include "opaque-scene.inc"\n#include "forward-bindings.inc"')
+    instrument=instrument.replace(marker,marker+'\n    if(n && (writes&1))forward_bindings(fs,vs,fres,rt[0],inputVertices,instances);')
+    (tmp/'forward-bindings.c').write_text(instrument)
+    args[-1]=str(tmp/'forward-bindings.c')
+if '--terrain-uniforms' in sys.argv[2:]:
+    instrument=Path(args[-1]).read_text()
+    marker='    u32 inputVertices=indexed?icount:count;'
+    assert instrument.count(marker)==1
+    instrument=instrument.replace(marker,"""    static bool terrainUniforms;
+    if(!terrainUniforms && g_vk_present>=1950 && fs && fs->hash==0xea4d86b0272a581full){
+        terrainUniforms=true;
+        for(u32 id=4;id<=8;id++){
+            u32 bytes=cb_range(ch,4,fs,id);
+            u64 addr=ch->cbind[4][id];
+            if(!addr || !bytes || bytes>65536 || vk_buf_pending(addr,bytes) || vk_compute_pending(addr,bytes))continue;
+            const void *source=gmem_host(addr,bytes);
+            if(source){
+                char path[1024];
+                const char *dir=getenv("ARCEUS_QA_TERRAIN_PARAMS");
+                if(dir && snprintf(path,sizeof path,"%s/cb%u.bin",dir,id)<(int)sizeof path){
+                    FILE *out=fopen(path,"wb");
+                    if(out){fwrite(source,1,bytes,out);fclose(out);}
+                }
+            }
+        }
+    }
+"""+marker)
+    (tmp/'terrain-uniforms.c').write_text(instrument)
+    args[-1]=str(tmp/'terrain-uniforms.c')
+if '--audit-overlay-rows' in sys.argv[2:]:
+    source=Path(args[-1]).read_text()
+    where='#include "opaque-scene.inc"'
+    source=source.replace(where,where+'\n#include "overlay-audit.inc"')
+    marker=' rr_capture_previous();'
+    source=source.replace(marker,' overlay_audit_save();\n'+marker)
+    marker='    if(n && (writes&1))taa_after(ch,fs,fres,rt[0]);'
+    source=source.replace(marker,marker+'\n    if(n && (writes&1))overlay_audit(rt[0],fs,k->blend[0].en);')
+    (tmp/'audit-render.c').write_text(source)
+    args[-1]=str(tmp/'audit-render.c')
+if '--trace-overlays' in sys.argv[2:]:
+    source=Path(args[-1]).read_text()
+    marker='    if(n && (writes&1))taa_after(ch,fs,fres,rt[0]);'
+    assert source.count(marker)==1
+    source=source.replace(marker,marker+"""
+    if(fs && n && (writes&1) && (g_vk_present==600 || g_vk_present==1440 || g_vk_present==1960) && getenv("ARCEUS_QA_OVERLAYS")){
+        Surf *color=rt[0];
+        LOG("world-pass: f=%u draw=%u fs=%llx rt=%llx w=%u h=%u seq=%llu cap=%llx capFrame=%u resolve=%u z=%llx zWrite=%u blend=%u src=%u dst=%u op=%u rgba=%u targets=%u indices=%u instances=%u\\n",
+            g_vk_present,(u32)g_vk_drawn,(unsigned long long)fs->hash,(unsigned long long)color->gva,color->sw,color->sh,
+            (unsigned long long)color->wseq,(unsigned long long)cap_color,cap_frame,tlast,
+            (unsigned long long)(zt?zt->gva:0),!!(zt && r[0x4BA]),k->blend[0].en,k->blend[0].sc,k->blend[0].dc,
+            k->blend[0].cop,k->blend[0].mask,n,(u32)captureCount,instances);
+    }
+""")
+    (tmp/'trace-overlays.c').write_text(source)
+    args[-1]=str(tmp/'trace-overlays.c')
+witness_flags=['-DPARTICLE_WITNESS'] if '--particle-witness' in sys.argv[2:] else []
+subprocess.run(args+reflection_flags+(['-DEMISSION_WITNESS'] if '--emission-witness' in sys.argv[2:] else [])+(['-DCOMPARE_FILTER'] if '--compare-filter' in sys.argv[2:] else [])+witness_flags+(['-DFIELD_WITNESS'] if '--grove-witness' in sys.argv or '--field-witness' in sys.argv else [])+(['-DGROVE_TRACE_TEST'] if '--grove-witness' in sys.argv[2:] else [])+['-I'+str(ups)],cwd=build,check=True)
+# Use the same Vulkan configuration as the renderer for the local NGX binding.
+ngx=(ups/'ngx.c').read_text()
+start=ngx.index('        // the model:')
+end=ngx.index('        // DLAA',start)
+ngx=ngx[:start]+'''        const char *quality_presets[] = {
+            "DLSS.Hint.Render.Preset.DLAA", "DLSS.Hint.Render.Preset.Quality",
+            "DLSS.Hint.Render.Preset.Balanced", "DLSS.Hint.Render.Preset.Performance",
+            "DLSS.Hint.Render.Preset.UltraPerformance", "DLSS.Hint.Render.Preset.UltraQuality"
+        };
+        const unsigned presets[] = {11, 11, 11, 13, 12, 11}; // K, K, K, M, L, K
+        for (unsigned i = 0; i < sizeof quality_presets / sizeof *quality_presets; ++i) {
+            unsigned requested = 0;
+            p_setu(p, quality_presets[i], presets[i]);
+            if (!p_getu(p, quality_presets[i], &requested) || requested != presets[i])
+                return fail("DLSS model preset parameter verification", 0);
+        }
+        LOG("[dlaa] NGX preset M for Performance, L for Ultra Performance, K otherwise: verified parameter readback\\n");
+'''+ngx[end:]
+start=ngx.index("        // DLAA's quality value")
+end=ngx.index('        N.fw =',start)
+ngx=ngx[:start]+'''        // The 4K build reconstructs twice the scene width and height.
+        p_seti(p, "PerfQualityValue", 0); // NVSDK_NGX_PerfQuality_Value_MaxPerf
+        NgxResult r = N.create(cmd, NGX_FEATURE_SUPERSAMPLING, p, &N.feat);
+        if (!NGX_OK(r) || !N.feat) return fail("DLSS Performance feature creation", r);
+        LOG("[dlaa] DLSS Performance mode created\\n");
+'''+ngx[end:]
+ngx=ngx.replace('void vk_dlaa_init(VkInstance inst', '''typedef struct {
+    struct { const wchar_t *const *paths; unsigned count; } search;
+    void *internal;
+    struct { void (*callback)(const char *,int,int); int level; bool exclusive; } logging;
+} NgxCommonInfo;
+
+static void ngx_diagnostic(const char *message, int level, int feature) {
+    fprintf(stderr, "[ngx:%d:%d] %s\\n", feature, level, message);
+}
+
+void vk_dlaa_init(VkInstance inst''')
+ngx=ngx.replace('    NgxResult r = N.init(','''    static const NgxCommonInfo info = {.logging = {ngx_diagnostic, 2, false}};
+    const bool diagnostics = getenv("ARCEUS_NGX_LOG") != NULL;
+    NgxResult r = N.init(''').replace('NGX_VERSION_API, NULL);','NGX_VERSION_API, diagnostics ? &info : NULL);')
+ngx=ngx.replace('#else  // (NGX is Windows-only)', '#include "rr-ngx.inc"\n#else  // (NGX is Windows-only)')
+# Fault injection is limited to separately staged regression binaries.
+if '--test-rr-create-failure' in sys.argv[2:] or '--test-rr-evaluate-failure' in sys.argv[2:]:
+    rr_source=(tmp/'rr-ngx.inc').read_text()
+    if '--test-rr-create-failure' in sys.argv[2:]:
+        call='N.create(cb,13,p,&rr_feature)'
+        replacement='(NgxResult)0xbad00001u'
+    else:
+        call='NgxResult result=N.evaluate(cb,rr_feature,p,NULL);'
+        replacement='static unsigned evaluations; NgxResult result=++evaluations==300?(NgxResult)0xbad00002u:N.evaluate(cb,rr_feature,p,NULL);'
+    assert rr_source.count(call)==1
+    ngx=ngx.replace('#include "rr-ngx.inc"',rr_source.replace(call,replacement))
+if '--test-no-ngx' in sys.argv[2:]:
+    marker='void vk_dlaa_init(VkInstance inst, VkPhysicalDevice phys, VkDevice dev) {'
+    assert marker in ngx
+    ngx=ngx.replace(marker,marker+' return;',1)
+(tmp/'ngx.c').write_text(ngx)
+ngx_args=args.copy()
+ngx_args[ngx_args.index('-o')+1]=str(tmp/'ngx.c.obj')
+ngx_args[-1]=str(tmp/'ngx.c')
+subprocess.run(ngx_args+['-I'+str(ups),'-include','volk.h'],cwd=build,check=True)
+fsr=(ups/'fsr.cpp').read_text()
+entry='be.deviceContext = {dev, phys, vkGetDeviceProcAddr};'
+assert fsr.count(entry)==1
+fsr=fsr.replace('        ffxCreateBackendVKDesc be', '        fsr_output_format = f->out_format == VK_FORMAT_R16G16B16A16_SFLOAT ? ImageFormat::Rgba16f : ImageFormat::Unknown;\n        ffxCreateBackendVKDesc be')
+fsr=fsr.replace('static bool load(void)', '#include "fsr-formats.inc"\nstatic bool load(void)').replace(entry,'be.deviceContext = {dev, phys, fsr_device_proc};')
+(tmp/'fsr.cpp').write_text(fsr)
+cache=shared/'nvn-src/.cache/cpm'
+sdk=fix.parent/'files-pasted-by-the-user-project/work/za/third_party/ffx_api'
+subprocess.run([shared/'llvm-mingw-20261104-ucrt-x86_64/bin/clang.exe','-O2','-DVK_NO_PROTOTYPES','-include','volk.h',
+                '-I'+str(next((cache/'volk').glob('*/volk.h')).parent),'-I'+str(next((cache/'vulkan-headers').glob('*/include'))),
+                '-I'+str(compiler.parent.parent/'include'),'-I'+str(sdk),'-I'+str(ups),'-c',tmp/'fsr.cpp','-o',tmp/'fsr.cpp.obj'],check=True)
+# Apply the secondary blend-color interface to both new and replayed shader variants.
+pipeline=shared/'nvn-src/src/nx/gpu/vk/pipeline.c'
+translate=shared/'nvn-src/src/nx/gpu/shader/spirv_translate.c'
+source=translate.read_text()
+source=source.replace('} DirectCtx;', '} DirectCtx;\n#include "smoke-program.h"')
+marker='    shader_hash(code, max_bytes, &len);'
+assert source.count(marker)==1
+source=source.replace(marker,'    u64 materialHash=shader_hash(code,max_bytes,&len); bool worldSmoke=world_smoke_program(materialHash) && stage==ST_FS;')
+source=source.replace('    int needs_fragcoord = 0;', '    int needs_fragcoord = worldSmoke;')
+marker='    u32 texture_scalar[SH_MAXTEX], texture_vec4[SH_MAXTEX];'
+source=source.replace(marker, """    u32 smokeSampler=0,smokeType=0,smokeWitness=0,smokePointer=0;
+    if(worldSmoke && texture_count<SH_MAXTEX){
+        smokeSampler=spv_emit_sampler_image(&c->emit,c->f32_type,shader_vk_set(stage),SNX_VKB_TEX+SH_MAXTEX-1,2,0,0,0,&smokeType);
+        interfaces[count++]=smokeSampler;
+#ifdef PARTICLE_WITNESS
+        u32 array=spv_emit_type_runtime_array(&c->emit,c->u32_type,4);
+        u32 structure=spv_emit_type_struct_one(&c->emit,array);
+        smokePointer=spv_emit_type_storage_pointer(&c->emit,c->u32_type);
+        smokeWitness=spv_emit_storage_buffer(&c->emit,structure,shader_vk_set(stage),SNX_VKB_SSBO+15);
+        interfaces[count++]=smokeWitness;
+#endif
+    }
+"""+marker)
+source=source.replace('} DirectCtx;', '} DirectCtx;\n#include "particle-translate.inc"')
+marker='                    u32 color = spv_emit_vec4_construct(&c->emit, color_type, components);'
+assert source.count(marker)==1
+source=source.replace(marker,'                    if(rt==0 && !integer && smokeSampler)particle_modulate(c,components,vec4,vec3,fragcoord,smokeSampler,smokeType,smokeWitness,smokePointer,materialHash==0x202b8339af5ac97cull?3:0);\n'+marker)
+(tmp/'particle-translate.c').write_text(source)
+row=next(e for e in db if e['file'].endswith('/shader/spirv_translate.c'))
+cmd=[v.strip('"') for v in shlex.split(row['command'],posix=False)]
+cmd[cmd.index('-o')+1]=str(tmp/'particle-translate.obj');cmd[-1]=str(tmp/'particle-translate.c')
+subprocess.run(cmd+witness_flags+['-I'+str(translate.parent)],cwd=build,check=True)
+source=pipeline.read_text().replace('static u32* sh_spirv(', '#include "smoke-program.h"\nstatic u32* sh_spirv(')
+# Older cached shaders for the smoke material predate the volume input.
+marker='    if (r->si.ntex < 0 ||'
+assert source.count(marker)==1
+source=source.replace(marker,'    if(world_smoke_program(r->hash) && r->stage==ST_FS)return NULL;\n'+marker)
+source=source.replace('if (!s && (s = pf_ship_take(', 'if (!s && !(world_smoke_program(h) && stage==ST_FS) && (s = pf_ship_take(')
+mark='static u32* sh_spirv('
+assert source.count(mark)==1
+source=source.replace(mark,'#include "dual-source.inc"\n'+mark)
+mark='    SNX_ZONE_VALUE(z_translate, *nw);'
+assert source.count(mark)==1
+source=source.replace(mark,'''    if(spv && stage==ST_FS && mask[6]==1 && !blend_source_module(&spv,nw)){
+        free(spv);spv=NULL;
+        snprintf(s->si.first_unsupported,sizeof s->si.first_unsupported,"secondary blend color interface");
+    }
+'''+mark)
+marker='    SNX_ZONE_VALUE(z_translate, *nw);'
+source=source.replace(marker,"""    if(spv && stage==ST_FS && world_smoke_program(h)){
+        const char *dump=getenv(h==0x202b8339af5ac97cull?"ARCEUS_QA_VILLAGE_SMOKE_SPV":"ARCEUS_QA_PARTICLE_SPV");
+        if(dump){FILE *file=fopen(dump,"wb");if(file){fwrite(spv,4,*nw,file);fclose(file);}}
+    }
+"""+marker)
+(tmp/'pipeline.c').write_text(source)
+mark='    p->k.fs = mod_handle(m[4]);'
+assert source.count(mark)==1
+source=source.replace(mark,mark+'''
+    if(p->k.alpha_to_coverage){
+        const VkSh *frag=g_pf.sh;
+        while(frag && frag->mod!=p->k.fs)frag=frag->next;
+        if(!frag || !(frag->si.sph[18]&8))p->k.alpha_to_coverage=0;
+    }''')
+if '--forward-modules' in sys.argv[2:]:
+    source=source.replace('#include "smoke-program.h"', '#include "smoke-program.h"\n#include "reflection-program.h"')
+    source=source.replace('world_smoke_program(r->hash)', '(world_smoke_program(r->hash) || world_reflection_program(r->hash))')
+    source=source.replace('world_smoke_program(h) && stage==ST_FS', '(world_smoke_program(h) || world_reflection_program(h)) && stage==ST_FS')
+    marker='    SNX_ZONE_VALUE(z_translate, *nw);'
+    source=source.replace(marker,"""
+    if(spv && stage==ST_FS && world_reflection_program(h)){
+        const char *dir=getenv("ARCEUS_QA_FORWARD_MODULES");
+        if(dir){
+            u64 digest=14695981039346656037ull;
+            for(size_t i=0;i<*nw;i++)digest=(digest^spv[i])*1099511628211ull;
+            char file[1024];
+            if(snprintf(file,sizeof file,"%s/%016llx-%016llx.spv",dir,(unsigned long long)h,(unsigned long long)digest)<(int)sizeof file){
+                FILE *out=fopen(file,"wb");if(out){fwrite(spv,4,*nw,out);fclose(out);}
+            }
+        }
+    }
+"""+marker)
+# Persist original guest SPIR-V. Apply the validated reflection module only at device-module creation.
+marker='static u32* sh_spirv('
+source=source.replace(marker,'#include "reflection-program.h"\n#include "reflect-module.inc"\n'+marker)
+start=source.index('        VkShaderModuleCreateInfo mi =',source.index('static VkSh* sh_make('))
+end=source.index('            s->failed = 1;',start)
+source=source[:start]+'        if(!(s->mod=make_reflection_module(s,spv,nw))){\n'+source[end:]
+source=source.replace('s->mod = vk_module_spv(spv, r->nspv)', 's->mod = make_reflection_module(s,spv,r->nspv)').replace('s->mod = vk_module_spv(spv, nw)', 's->mod = make_reflection_module(s,spv,nw)')
+# A shader with extra SPIR-V inputs must never be replayed by the stock executable or another instrumentation build.
+guest_abi=hashlib.sha256(repr(reflection_flags).encode())
+for dependency in (tmp/'reflect-module.inc',tmp/('reflection-pair.h' if '--reflection-pair' in sys.argv[2:] else 'reflection-witness.h' if '--reflection-witness' in sys.argv[2:] else 'reflection-production.h'),tmp/'reflection-program.h',tmp/'particle-translate.c',tmp/'particle-translate.inc',tmp/'smoke-program.h',tmp/'dual-source.inc',tmp/'smoke-material.inc'):
+    guest_abi.update(dependency.read_bytes())
+guest_abi.update(source.encode());guest_abi.update(repr(witness_flags).encode())
+shader_directory='shader_cache_world_pt_'+guest_abi.hexdigest()[:16]
+marker='"%sshader_cache", g_cachedir'
+assert source.count(marker)==1
+source=source.replace(marker,'"%s'+shader_directory+'", g_cachedir')
+(tmp/'pipeline.c').write_text(source)
+entry=next(e for e in db if e['file'].endswith('/nx/gpu/vk/pipeline.c'))
+args=[v.strip('"') for v in shlex.split(entry['command'],posix=False)]
+args[args.index('-o')+1]=str(tmp/'pipeline.obj');args[-1]=str(tmp/'pipeline.c')
+subprocess.run(args+reflection_flags+['-I'+str(pipeline.parent)],cwd=build,check=True)
+# Report area changes at real guest reads of a terrain archive header, including revisits.
+filesystem=shared/'nvn-src/src/nx/hle/filesystem/fs.c'
+src=filesystem.read_text()
+mark='    if (!quiet && !__atomic_exchange_n(&rf->logged, 1, __ATOMIC_RELAXED))'
+assert src.count(mark)==1
+src=src.replace('static int rfile_read(RFile* rf, u64 rel, u8* dst, u64 size, int quiet) {', 'extern u64 arceus_land_request;\nu64 arceus_land_request;\nstatic int rfile_read(RFile* rf, u64 rel, u8* dst, u64 size, int quiet) {')
+src=src.replace(mark,"""    if(!quiet && !rel && size && node->parent && !strcmp(node->parent->name,"terrain") &&
+        !strncmp(node->name,"ha_area",7) && node->name[7]>='0' && node->name[7]<='9' &&
+        node->name[8]>='0' && node->name[8]<='9'){
+        u32 area=(node->name[7]-'0')*10+node->name[8]-'0';
+        u64 request=!strcmp(node->name+9,".gfpak") && area<12 ? ((u64)node->size<<8)|(area+1) : 0;
+        if(area==0 && !strcmp(node->name+9,"_s01.gfpak"))request=((u64)node->size<<8)|13;
+        __atomic_store_n(&arceus_land_request,request,__ATOMIC_RELEASE);
+    }
+"""+mark)
+if '--field-route' in sys.argv[2:]:
+    marker='    overlays();'
+    assert src.count(marker)==1
+    src=src.replace(marker,marker+"""
+    const char *assets=getenv("ARCEUS_QA_ROMFS_ROOT");
+    if(assets){
+        static const char* const readOnly[]={"romfs","romfs.bin",NULL};
+        static const char* const merged[]={NULL};
+        if(fs_tree_overlay(&g_hle.fs.tree,assets,readOnly,merged)!=FS_TREE_OK)fatal("Could not mount QA RomFS");
+    }
+""")
+(tmp/'fs.c').write_text(src)
+entry=next(e for e in db if e['file'].endswith('/nx/hle/filesystem/fs.c'))
+args=[v.strip('"') for v in shlex.split(entry['command'],posix=False)]
+args[args.index('-o')+1]=str(tmp/'fs.obj');args[-1]=str(tmp/'fs.c')
+subprocess.run(args+['-I'+str(filesystem.parent)],cwd=build,check=True)
+e=next(e for e in db if e['file'].endswith('/nx/gpu/vk/device.c'))
+args=[v.strip('"') for v in shlex.split(e['command'],posix=False)]
+args[args.index('-o')+1]=str(tmp/'device.obj');args[-1]=str(tmp/'device.c')
+subprocess.run(args+['-I'+str(ups)],cwd=build,check=True)
+s=(w/'build-merged.py').read_text().split('args=json.loads((fix/',1)[1]
+s='args=json.loads((fix/'+s
+s=s.replace("str(tmp/'query.obj')","str(w/'query.obj')").replace("str(ups/f) for f","str((tmp if f in ('device.obj','ngx.c.obj','fsr.cpp.obj') else ups)/f) for f").replace('village-v3-4k-runtime','world-pt-v2-runtime').replace('Arceus-Village-v3-DLSS-4K.exe','Arceus-World-PT-v2-4K.exe').replace('current-village-v3-DLSS-4K-test','current-world-pt-v2')
+s=s.replace("args[1:1]=[str(village/", "args[1:1]=[str(tmp/'pipeline.obj'),str(tmp/'particle-translate.obj'),str(tmp/'fs.obj'),str(tmp/'arceus_clock.obj'),str(village/")
+if '--capture-window' in sys.argv[2:] or '--field-route' in sys.argv[2:]:
+    # Capture consecutive presents during a pan without making screenshots stall scene loading.
+    unit=shared/'nvn-src/src/nx/runtime/platform/unattended.c'
+    original=unit.read_text()
+    marker='    bucket = frames_now() / g_settings.screenshot_every;'
+    assert original.count(marker)==1
+    source=original.replace(marker,'''    int presented=frames_now();
+    const char *first=getenv("ARCEUS_SHOT_FIRST"),*last=getenv("ARCEUS_SHOT_LAST");
+    if(first && presented<atoi(first))return 0;
+    if(last && presented>atoi(last))return 0;
+    bucket=presented/g_settings.screenshot_every;''')
+    source=source.replace('g_settings.screenshot, g_shot_count++','g_settings.screenshot, presented')
+    marker='        if (p->done) continue;'
+    assert source.count(marker)==1
+    source=source.replace(marker,'''        const char *duration=getenv("ARCEUS_PRESS_PRESENTS");
+        if(duration && p->at_present){
+            unsigned span=(unsigned)atoi(duration);
+            if(frames>=0 && (unsigned)frames>=p->at && (unsigned)frames-p->at<span)held|=p->mask;
+            continue;
+        }
+'''+marker)
+    if '--field-route' in sys.argv[2:]:
+        marker='    return held;'
+        assert source.count(marker)==1
+        source=source.replace(marker,"""
+    static int last=-1,through=-1;
+    static unsigned sequence;
+    static unsigned long long control;
+    if(frames!=last){
+        last=frames;
+        const char *path=getenv("ARCEUS_QA_CONTROLLER");
+        FILE *file=path?fopen(path,"r"):NULL;
+        if(file){
+            unsigned command,span;unsigned long long mask;
+            if(fscanf(file,"%u %u %llx",&command,&span,&mask)==3 && command>sequence && span<=2400){
+                sequence=command;through=frames+(int)span;control=mask;
+                LOG("field-route: command=%u frame=%d span=%u mask=%llx\\n",command,frames,span,mask);
+            }
+            fclose(file);
+        }
+    }
+    if(frames<through)held|=control;
+"""+marker)
+        marker='    if (g_settings.frames >= 0'
+        source=source.replace(marker,'''    const char *finish=getenv("ARCEUS_QA_END_ROUTE");
+    if(finish){FILE *f=fopen(finish,"r");if(f){fclose(f);return 1;}}
+'''+marker)
+        source=source.replace('g_settings.screenshot, presented','g_settings.screenshot, presented/60%2')
+    (tmp/'unattended.c').write_text('#include <stdlib.h>\n'+source)
+    row=next(e for e in db if e['file'].endswith('/platform/unattended.c'))
+    cmd=[v.strip('"') for v in shlex.split(row['command'],posix=False)]
+    cmd[cmd.index('-o')+1]=str(tmp/'unattended.obj');cmd[-1]=str(tmp/'unattended.c')
+    subprocess.run(cmd+['-Wno-unused-variable'],cwd=build,check=True)
+    s=s.replace("args[1:1]=[str(tmp/'pipeline.obj')","args[1:1]=[str(tmp/'unattended.obj'),str(tmp/'pipeline.obj')")
+s=s.replace("h=hashlib.sha256(exe.read_bytes()).digest()", """s=s.replace('env(L"ARCEUS_UPSCALER"', 'env(L"ARCEUS_TERRAIN_DIR",L"'+str(exe.parent/'terrain').replace(chr(92),chr(92)*2)+'");env(L"ARCEUS_UPSCALER"');h=hashlib.sha256(exe.read_bytes()).digest()""")
+exec(s)
+for name in ('amd_fidelityfx_loader_vk.dll','amd_fidelityfx_upscaler_vk.dll'):
+    shutil.copy2(fix/'outputs/upscale-runtime'/name,exe.parent/name)

@@ -1,0 +1,517 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright 2026 the NXAevora contributors */
+#include "nx/runtime/arceus_clock.h"
+#include "nx/runtime/loader.h"
+#include "nx/runtime/options.h"
+#include "nx/runtime/arceus_step.h"
+#include "nx/runtime/guest_jit.h"
+#include "nx/memory/mem.h"
+#include "nx/runtime/platform/log.h"
+#include "nx/runtime/platform/plat.h"
+#include <stdlib.h>
+#include <string.h>
+
+static GuestFn originals[3];
+static u64 counts[3];
+static u64 main_base;
+static int experimental, tracing;
+static ArceusStep step;
+static PMutex step_lock = PMUTEX_INIT;
+static GuestFn message_original;
+static u64 message_count;
+static u64 water_step_address;
+static int clocks_installed;
+static u64 blink_remainder;
+static unsigned blink_ticks;
+
+static void water_step_write(u64 ns) {
+    if (!water_step_address) return;
+    float seconds = (float)((double)ns / 1000000000.0);
+    u32 bits;
+    memcpy(&bits, &seconds, sizeof bits);
+    gw32(water_step_address, bits);
+}
+
+static void adjust_duration(CPU* c) {
+    static const u64 callers[4] = {0x278150c, 0x2781540, 0x2781574, 0x27815a8};
+    unsigned channel = (unsigned)c->x[1];
+    u64 value;
+    if (!experimental || c->x[1] > 3 || c->x[30] != main_base + callers[channel]) return;
+    if (c->x[2] != 33333334) {
+        WARN_LIMIT(4, "arceus-clock: unexpected main-loop duration %llu, left unchanged\n", (unsigned long long)c->x[2]);
+        return;
+    }
+    pm_lock(&step_lock);
+    if (arceus_step(&step, plat_ns(), c->x[0], channel, &value)) {
+        c->x[2] = value;
+        if (channel == 0) {
+            water_step_write(value);
+            /* Shared 30-Hz cadence for the isolated integer blink state machine. */
+            blink_remainder += value * 30;
+            blink_ticks = (unsigned)(blink_remainder / 1000000000);
+            blink_remainder %= 1000000000;
+        }
+    }
+    else WARN_LIMIT(4, "arceus-clock: clock update order changed, left unchanged\n");
+    pm_unlock(&step_lock);
+}
+
+static int readable(u64 address, u64 size) {
+    MemBlock block;
+    u64 end = address + size;
+    if (address < AS_BASE || end < address || end > AS_SIZE) return 0;
+    while (address < end) {
+        mem_query(address, &block);
+        if (!(block.perm & PERM_R) || block.addr + block.size <= address) return 0;
+        address = block.addr + block.size;
+    }
+    return 1;
+}
+
+static void trace_call(CPU* c, u64 entry, unsigned kind) {
+    u64 object = c->x[0], channel = c->x[1], input = c->x[2], caller = c->x[30];
+    u64 count = __atomic_add_fetch(&counts[kind], 1, __ATOMIC_RELAXED);
+    if (kind == 2) adjust_duration(c);
+    originals[kind](c, entry);
+    if (tracing && (count <= 40 || count % (kind == 0 ? 60000 : 600) == 0)) {
+        u64 record = kind == 0 ? c->x[0] : object + 8 + channel * 16;
+        u64 duration = readable(record, 16) ? gr64(record + 8) : 0;
+        LOG("arceus-clock: kind=%u count=%llu ns=%llu object=%llx channel=%llu input=%llu duration=%llu caller=main+%llx\n",
+            kind, (unsigned long long)count, (unsigned long long)plat_ns(),
+            (unsigned long long)object, (unsigned long long)channel, (unsigned long long)input,
+            (unsigned long long)duration, (unsigned long long)(caller - main_base));
+    }
+}
+static void read_clock(CPU* c, u64 entry) { trace_call(c, entry, 0); }
+static void set_mode(CPU* c, u64 entry) { trace_call(c, entry, 1); }
+static void set_duration(CPU* c, u64 entry) { trace_call(c, entry, 2); }
+
+/* Candidate MessageView update, identified through the MessageView string references
+   and its vtable. State meanings are not established: observe, never alter them. */
+static void message_view_probe(CPU* c, u64 entry) {
+    u64 object = c->x[0], caller = c->x[30], begin = plat_ns();
+    u64 count = __atomic_add_fetch(&message_count, 1, __ATOMIC_RELAXED);
+    u32 before = readable(object, 0xf8) ? gr32(object + 0xf0) : ~0u;
+    message_original(c, entry);
+    u32 after = readable(object, 0xf8) ? gr32(object + 0xf0) : ~0u;
+    if (count <= 10 || before != after || count % 60 == 0)
+        LOG("arceus-message: count=%llu ns=%llu object=%llx state_before=%u state_after=%u caller=main+%llx\n",
+            (unsigned long long)count, (unsigned long long)begin,
+            (unsigned long long)object, before, after, (unsigned long long)(caller - main_base));
+}
+
+/* The default probe only observes virtual calls. The optional experiment changes the four verified
+   main-loop duration writes. Build and instruction guards precede both hooks and the 60 FPS pacing override. */
+void arceus_clock_init(void) {
+    static const u8 id[32] = {0xae,0xe8,0xf1,0x50,0xdd,0xa1,0xb5,0xa8,0x38,0x80,0x6e,0x1a,0x5e,0xa6,0x82,0x7a,
+                              0xd9,0xf3,0xc5,0x1e,0,0,0,0,0,0,0,0,0,0,0,0};
+    static const u64 offsets[3] = {0x278303c, 0x2783048, 0x277bef4};
+    static const u32 words[3] = {0x8b21d008, 0xf0008fc8, 0x8b21d008};
+    static const GuestFn wrappers[3] = {read_clock, set_mode, set_duration};
+    const char* enabled = getenv("SNX_ARCEUS_CLOCK_TRACE");
+    const char* fps60 = getenv("SNX_ARCEUS_FPS60");
+    const char* target = getenv("SNX_ARCEUS_TARGET_FPS");
+    int target_fps = fps60 && !strcmp(fps60, "1") ? 60 : 0;
+    if (target && *target) {
+        if (!strcmp(target, "60")) target_fps = 60;
+        else if (!strcmp(target, "120")) target_fps = 120;
+        else {
+            WARN("arceus-clock: refused unsupported target FPS (use 60 or 120)\n");
+            return;
+        }
+    }
+    const char* message_flag = getenv("SNX_ARCEUS_DIALOGUE_TRACE");
+    int message_trace = message_flag && !strcmp(message_flag, "1");
+    const SnxModInfo* mod = NULL;
+    tracing = enabled && !strcmp(enabled, "1");
+    experimental = target_fps != 0;
+    if (!tracing && !experimental && !message_trace) return;
+    for (u32 i = 0; g_mod && i < g_mod->nmods; i++)
+        if (!strcmp(g_mod->mods[i].name, "main")) mod = &g_mod->mods[i];
+    if (!mod || memcmp(mod->build_id, id, sizeof id)) {
+        WARN("arceus-clock: refused unsupported main build\n");
+        return;
+    }
+    main_base = mod->base;
+    if (message_trace) {
+        u64 pc = main_base + 0x120ae38;
+        if (pc >= g_code_lo && pc < g_code_hi && readable(pc, 4) && gr32(pc) == 0xa9ba6ffc &&
+            g_disp[(pc - g_code_lo) / 4]) {
+            message_original = g_disp[(pc - g_code_lo) / 4];
+            g_disp[(pc - g_code_lo) / 4] = message_view_probe;
+            LOG("arceus-message: read-only candidate MessageView probe installed\n");
+        } else WARN("arceus-message: refused missing or changed MessageView entry\n");
+    }
+    if (!tracing && !experimental) return;
+    for (unsigned i = 0; i < 3; i++) {
+        u64 pc = mod->base + offsets[i];
+        if (pc < g_code_lo || pc >= g_code_hi || !readable(pc, 4) || gr32(pc) != words[i] ||
+            !g_disp[(pc - g_code_lo) / 4]) {
+            WARN("arceus-clock: refused missing or changed clock entry %u\n", i);
+            return;
+        }
+        originals[i] = g_disp[(pc - g_code_lo) / 4];
+    }
+    main_base = mod->base;
+    for (unsigned i = 0; i < 3; i++)
+        g_disp[(main_base + offsets[i] - g_code_lo) / 4] = wrappers[i];
+    if (experimental) {
+        step.initial_ns = (UINT64_C(1000000000) + target_fps / 2) / target_fps;
+        __atomic_store_n(&g_opt_fps, target_fps, __ATOMIC_RELAXED);
+        clocks_installed = 1;
+    }
+    LOG("arceus-clock: Arceus 1.1.1 %s, target_fps=%d, tracing=%d\n",
+        experimental ? "EXPERIMENT: elapsed-time clocks" : "read-only probe", target_fps, tracing);
+}
+
+/* WaterCurrentTime's verified update adds 1/30 second per rendered frame. Replace
+   only its two constant-building instructions with a load of the shared elapsed
+   seconds. Mark the containing AOT function stale so direct/inlined calls also
+   execute the changed instructions through the runtime's existing JIT path. */
+static void water_fix_init(void) {
+    u64 pc = main_base + 0x29faf8c;
+    if (!readable(pc, 8) || gr32(pc) != 0x52911128 || gr32(pc + 4) != 0x72a7a108 ||
+        !g_mod->nfns || !g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale || !g_mod->entry_fn) {
+        WARN("arceus-water: refused instruction or AOT invalidation guard\n");
+        return;
+    }
+    int covered = 0;
+    for (u32 i = 0; i < g_mod->nfns; i++)
+        if (g_mod->fn_lo[i] <= pc && g_mod->fn_lo[i] + g_mod->fn_len[i] >= pc + 8) covered = 1;
+    if (!covered) {
+        WARN("arceus-water: refused patch without AOT function coverage\n");
+        return;
+    }
+    u64 address = mem_find_free(main_base + 0x5000000, main_base + 0x40000000, 4096, 4096);
+    if (!address || mem_map(address, 4096, MS_STATIC, PERM_RW)) {
+        WARN("arceus-water: could not allocate elapsed-time cell\n");
+        return;
+    }
+    water_step_address = address;
+    water_step_write(step.initial_ns);
+    /* ADRP X8, cell; LDR W8,[X8,#0]. The cell is page aligned and within ADRP range. */
+    u64 pages = ((address >> 12) - (pc >> 12)) & 0x1fffff;
+    u32 adrp = 0x90000008 | (u32)((pages & 3) << 29) | (u32)((pages >> 2) << 5);
+    gw32(pc, adrp);
+    gw32(pc + 4, 0xb9400108);
+    jit_code_changed(pc, 8);
+    LOG("arceus-water: elapsed-time increment installed, cell=%llx\n", (unsigned long long)address);
+}
+
+static void effects_fix_init(void) {
+    u64 pc = main_base + 0x2b90040;
+    /* The original converts ns/16666666.0 to an integer and back to float.
+       At high FPS that drops the entire update. The downstream effect-group
+       calculation accepts float progress, so preserve the fractional value. */
+    if (!readable(pc, 16) || gr32(pc) != 0x1e780008 || gr32(pc + 4) != 0xbd402280 ||
+        gr32(pc + 8) != 0x1e220101 || gr32(pc + 12) != 0x1e210808 ||
+        !g_mod->nfns || !g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale || !g_mod->entry_fn) {
+        WARN("arceus-effects: refused instruction or AOT invalidation guard\n");
+        return;
+    }
+    int covered = 0;
+    for (u32 i = 0; i < g_mod->nfns; i++)
+        if (g_mod->fn_lo[i] <= pc && g_mod->fn_lo[i] + g_mod->fn_len[i] >= pc + 16) covered = 1;
+    if (!covered) {
+        WARN("arceus-effects: refused patch without AOT function coverage\n");
+        return;
+    }
+    gw32(pc, 0x1e624001); /* FCVT S1,D0 instead of FCVTZS W8,D0 */
+    gw32(pc + 8, 0xd503201f); /* NOP instead of SCVTF S1,W8; W8 is overwritten before its next use */
+    jit_code_changed(pc, 12);
+    LOG("arceus-effects: fractional effect-group progress installed\n");
+}
+
+
+/* EventCameraMove keeps a nominal per-30-Hz-update increment at +4b4.
+   Its update only reads that field and never destroys the object. Preserve the
+   nominal rate between calls; scale only the value seen by this update. */
+static GuestFn event_camera_original;
+static u64 event_camera_count;
+static void event_camera_update(CPU* c, u64 entry) {
+    u64 object = c->x[0];
+    MemBlock block;
+    if (!readable(object, 0x4c0) || gr32(object + 0x3e4) != 1) {
+        event_camera_original(c, entry);
+        return;
+    }
+    mem_query(object + 0x4b4, &block);
+    if (!(block.perm & PERM_W) || block.addr + block.size < object + 0x4b8) {
+        event_camera_original(c, entry);
+        return;
+    }
+    u32 nominal_bits = gr32(object + 0x4b4), adjusted_bits;
+    float nominal, adjusted;
+    memcpy(&nominal, &nominal_bits, sizeof nominal);
+    pm_lock(&step_lock);
+    u64 ns = step.step ? step.step : step.initial_ns;
+    pm_unlock(&step_lock);
+    adjusted = (float)((double)nominal * (double)ns / 33333334.0);
+    memcpy(&adjusted_bits, &adjusted, sizeof adjusted_bits);
+    gw32(object + 0x4b4, adjusted_bits);
+    event_camera_original(c, entry);
+    gw32(object + 0x4b4, nominal_bits);
+    u64 count = __atomic_add_fetch(&event_camera_count, 1, __ATOMIC_RELAXED);
+    if (count <= 8 || count % 120 == 0)
+        LOG("arceus-event-camera: count=%llu step_ns=%llu nominal=%g adjusted=%g\n",
+            (unsigned long long)count, (unsigned long long)ns, (double)nominal, (double)adjusted);
+}
+
+static void event_camera_init(void) {
+    const char* enabled = getenv("SNX_ARCEUS_EVENT_CAMERA_FIX");
+    if (!enabled || strcmp(enabled, "1")) return;
+    u64 pc = main_base + 0x19b2140;
+    if (pc < g_code_lo || pc + 0x198 > g_code_hi || !readable(pc, 0x198) ||
+        gr32(pc) != 0xd101c3ff || gr32(pc + 0x34) != 0xbd44b400 ||
+        gr32(pc + 0x44) != 0x1e212800 || gr32(pc + 0x194) != 0x17ffffb7 ||
+        !g_mod->nfns || !g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale || !g_mod->entry_fn) {
+        WARN("arceus-event-camera: refused instruction or AOT invalidation guard\n");
+        return;
+    }
+    int covered = 0;
+    for (u32 i = 0; i < g_mod->nfns; i++)
+        if (g_mod->fn_lo[i] == pc && g_mod->fn_len[i] >= 0x198) covered = 1;
+    if (!covered) {
+        WARN("arceus-event-camera: refused missing AOT function coverage\n");
+        return;
+    }
+    /* Equivalent B -> CBZ XZR at the final back edge prevents a hash-matched
+       original AOT variant being selected after invalidation. Both instructions
+       always branch to pc+0x70. Invalidate direct/inlined AOT callers, compile
+       this equivalent body, then install the wrapper before guest threads run.
+       Compilation failure leaves normal JIT dispatch without the correction. */
+    gw32(pc + 0x194, 0xb4fff6ff);
+    jit_code_changed(pc, 0x198);
+    event_camera_original = jit_wait(pc);
+    if (!event_camera_original) {
+        WARN("arceus-event-camera: original body did not compile; correction not installed\n");
+        return;
+    }
+    __atomic_store_n(&g_disp[(pc - g_code_lo) / 4], event_camera_update, __ATOMIC_RELEASE);
+    LOG("arceus-event-camera: experimental elapsed-time increment installed\n");
+}
+
+
+static GuestFn blink_original[3];
+static u64 blink_calls[3], blink_updates[3];
+static void blink_update(CPU* c, u64 entry, unsigned kind) {
+    pm_lock(&step_lock);
+    unsigned ticks = blink_ticks;
+    pm_unlock(&step_lock);
+    u64 object = c->x[0], return_pc = c->x[30];
+    u64 count = __atomic_add_fetch(&blink_calls[kind], 1, __ATOMIC_RELAXED);
+    if (!ticks) c->pc = return_pc;
+    for (unsigned i = 0; i < ticks; i++) {
+        c->x[0] = object;
+        c->x[30] = return_pc;
+        c->pc = entry;
+        blink_original[kind](c, entry);
+        __atomic_add_fetch(&blink_updates[kind], 1, __ATOMIC_RELAXED);
+        if (c->pc != return_pc) break;
+    }
+    if (count <= 4 || count % 12000 == 0)
+        LOG("arceus-blink: kind=%u calls=%llu updates=%llu ticks=%u\n", kind,
+            (unsigned long long)count,
+            (unsigned long long)__atomic_load_n(&blink_updates[kind], __ATOMIC_RELAXED), ticks);
+}
+static void blink_primary(CPU* c, u64 entry) { blink_update(c, entry, 0); }
+static void blink_secondary(CPU* c, u64 entry) { blink_update(c, entry, 1); }
+
+static void blink_inlined(CPU* c, u64 entry) { blink_update(c, entry, 2); }
+
+/* Three entries implement the same blink countdown, with the second
+   accepting the base subobject at +48. Only this small state machine is paced;
+   the skeletal/face animation system continues to update every rendered frame. */
+static void blink_fix_init(void) {
+    const char* enabled = getenv("SNX_ARCEUS_BLINK_FIX");
+    if (!enabled || strcmp(enabled, "1")) return;
+    const u64 offsets[3] = {0x194f110, 0x194f20c, 0x1aaf0b4};
+    const u32 sizes[3] = {0xfc, 0x100, 0x2a0};
+    const u32 prologues[3] = {0xf81e0ff3, 0xa9be4ff4, 0xa9ba6ffc};
+    const u64 decrements[3] = {0x194f150, 0x194f250, 0x1aaf12c};
+    const u32 tails[3] = {0x17ffffd5, 0x17ffffd5, 0x17ffffe7};
+    const u32 replacements[3] = {0xb4fffabf, 0xb4fffabf, 0xb4fffcff};
+    const GuestFn wrappers[3] = {blink_primary, blink_secondary, blink_inlined};
+    if (!g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale || !g_mod->entry_fn) return;
+    for (unsigned kind = 0; kind < 3; kind++) {
+        u64 pc = main_base + offsets[kind];
+        u64 tail = pc + sizes[kind] - 4;
+        int covered = 0;
+        for (u32 i = 0; i < g_mod->nfns; i++)
+            if (g_mod->fn_lo[i] == pc && g_mod->fn_len[i] == sizes[kind]) covered = 1;
+        if (!covered || pc < g_code_lo || tail >= g_code_hi || !readable(pc, sizes[kind]) ||
+            gr32(pc) != prologues[kind] || gr32(tail) != tails[kind] ||
+            gr32(main_base + decrements[kind]) != 0x71000508) {
+            WARN("arceus-blink: refused instruction/function guard for kind=%u\n", kind);
+            continue;
+        }
+        /* Equivalent CBZ XZR in place of the final B, avoiding original AOT variants. */
+        gw32(tail, replacements[kind]);
+        jit_code_changed(pc, sizes[kind]);
+        blink_original[kind] = jit_wait(pc);
+        if (!blink_original[kind]) {
+            WARN("arceus-blink: could not compile kind=%u; correction not installed\n", kind);
+            continue;
+        }
+        __atomic_store_n(&g_disp[(pc - g_code_lo) / 4], wrappers[kind], __ATOMIC_RELEASE);
+        LOG("arceus-blink: 30-Hz countdown experiment installed, kind=%u\n", kind);
+    }
+}
+
+
+static GuestFn camera_input_original;
+static u64 camera_input_calls;
+static float guest_float(u64 address) {
+    u32 bits = gr32(address); float value;
+    memcpy(&value, &bits, sizeof value);
+    return value;
+}
+static void guest_float_write(u64 address, float value) {
+    u32 bits; memcpy(&bits, &value, sizeof bits); gw32(address, bits);
+}
+/* Fractional authored updates preserve the original stick response and its
+   steady-state value. Scaling only the acceleration coefficients would change
+   the equilibrium for partial stick input, which also multiplies the state. */
+static void camera_input_update(CPU* c, u64 entry) {
+    u64 object = c->x[0], parameters = c->x[1], return_pc = c->x[30];
+    if (!readable(object, 0x444)) { camera_input_original(c, entry); return; }
+    pm_lock(&step_lock);
+    u64 ns = step.step ? step.step : step.initial_ns;
+    pm_unlock(&step_lock);
+    double remaining = (double)ns / 33333334.0;
+    do {
+        float old_yaw = guest_float(object + 0x434), old_pitch = guest_float(object + 0x438);
+        c->x[0] = object; c->x[1] = parameters; c->x[30] = return_pc; c->pc = entry;
+        camera_input_original(c, entry);
+        if (c->pc != return_pc) return;
+        if (remaining < 1.0) {
+            float yaw = guest_float(object + 0x434), pitch = guest_float(object + 0x438);
+            guest_float_write(object + 0x434, (float)(old_yaw + (yaw - old_yaw) * remaining));
+            guest_float_write(object + 0x438, (float)(old_pitch + (pitch - old_pitch) * remaining));
+        }
+        remaining -= 1.0;
+    } while (remaining > 0.0);
+    u64 count = __atomic_add_fetch(&camera_input_calls, 1, __ATOMIC_RELAXED);
+    if (count <= 8 || count % 600 == 0)
+        LOG("arceus-camera-input: count=%llu step_ns=%llu yaw=%g pitch=%g\n",
+            (unsigned long long)count, (unsigned long long)ns,
+            (double)guest_float(object + 0x434), (double)guest_float(object + 0x438));
+}
+static void camera_input_init(void) {
+    const char* enabled = getenv("SNX_ARCEUS_CAMERA_INPUT_FIX");
+    if (!enabled || strcmp(enabled, "1")) return;
+    u64 pc = main_base + 0x193c04c;
+    int covered = 0;
+    if (!g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale || !g_mod->entry_fn) return;
+    for (u32 i = 0; i < g_mod->nfns; i++)
+        if (g_mod->fn_lo[i] == pc && g_mod->fn_len[i] == 0x278) covered = 1;
+    if (!covered || pc < g_code_lo || pc + 0x278 > g_code_hi || !readable(pc, 0x278) ||
+        gr32(pc) != 0xfc1b0fec || gr32(pc + 0x130) != 0x1e222862 ||
+        gr32(pc + 0x274) != 0x17ffffee) {
+        WARN("arceus-camera-input: refused instruction/function guard\n"); return;
+    }
+    gw32(pc + 0x274, 0xb4fffddf); /* Equivalent CBZ XZR, pc+22c. */
+    jit_code_changed(pc, 0x278);
+    camera_input_original = jit_wait(pc);
+    if (!camera_input_original) { WARN("arceus-camera-input: original body did not compile\n"); return; }
+    __atomic_store_n(&g_disp[(pc - g_code_lo) / 4], camera_input_update, __ATOMIC_RELEASE);
+    LOG("arceus-camera-input: fractional acceleration/deceleration experiment installed\n");
+}
+
+
+/* The field camera's two manual-rotation callers multiply by this settings
+   rate once per update. Pace that angular integration as well as the response
+   above; otherwise full-stick turning still runs at the render frequency. */
+static GuestFn camera_rate_original;
+static u64 camera_rate_calls;
+static void camera_rate_update(CPU* c, u64 entry) {
+    u64 return_pc = c->x[30];
+    camera_rate_original(c, entry);
+    if (c->pc != return_pc) return;
+    pm_lock(&step_lock);
+    u64 ns = step.step ? step.step : step.initial_ns;
+    pm_unlock(&step_lock);
+    float authored = c->v[0].f[0];
+    c->v[0].f[0] = (float)(authored * ((double)ns / 33333334.0));
+    u64 count = __atomic_add_fetch(&camera_rate_calls, 1, __ATOMIC_RELAXED);
+    if (count <= 8 || count % 600 == 0)
+        LOG("arceus-camera-rate: count=%llu step_ns=%llu authored=%g scaled=%g\n",
+            (unsigned long long)count, (unsigned long long)ns,
+            (double)authored, (double)c->v[0].f[0]);
+}
+static void camera_rate_init(void) {
+    const char* enabled = getenv("SNX_ARCEUS_CAMERA_INPUT_FIX");
+    if (!enabled || strcmp(enabled, "1")) return;
+    u64 pc = main_base + 0x193c2c4;
+    int covered = 0;
+    if (!g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale || !g_mod->entry_fn) return;
+    for (u32 i = 0; i < g_mod->nfns; i++)
+        if (g_mod->fn_lo[i] == pc && g_mod->fn_len[i] == 0xea8) covered = 1;
+    if (!covered || pc < g_code_lo || pc + 0xea8 > g_code_hi || !readable(pc, 0xea8) ||
+        gr32(pc) != 0xfc1d0fe8 || gr32(pc + 0xea4) != 0x17fffec1) {
+        WARN("arceus-camera-rate: refused instruction/function guard\n"); return;
+    }
+    gw32(pc + 0xea4, 0xb4ffd83f); /* Equivalent CBZ XZR to pc+9a8. */
+    jit_code_changed(pc, 0xea8);
+    camera_rate_original = jit_wait(pc);
+    if (!camera_rate_original) { WARN("arceus-camera-rate: original body did not compile\n"); return; }
+    __atomic_store_n(&g_disp[(pc - g_code_lo) / 4], camera_rate_update, __ATOMIC_RELEASE);
+    LOG("arceus-camera-rate: elapsed-time manual rotation experiment installed\n");
+}
+
+static GuestFn field_message_original;
+static u64 field_message_calls;
+static void field_message_probe(CPU* c, u64 entry) {
+    u64 object = c->x[0];
+    field_message_original(c, entry);
+    u64 count = __atomic_add_fetch(&field_message_calls, 1, __ATOMIC_RELAXED);
+    if (count > 8 && count % 300 != 0) return;
+    u64 manager = readable(object, 0x68) ? gr64(object + 0x60) : 0;
+    u64 root = readable(manager, 0x60) ? gr64(manager + 0x58) : 0;
+    /* Resolve the update vtable entries of the actual live message tree. No
+       guessed state offsets are modified, and input is never consumed here. */
+    u64 queue[16] = {root}; unsigned tail = root ? 1 : 0;
+    for (unsigned head = 0; head < tail && head < 16; head++) {
+        u64 node = queue[head];
+        if (!readable(node, 0xa0)) continue;
+        u64 vt = gr64(node), update = readable(vt, 0x88) ? gr64(vt + 0x80) : 0;
+        LOG("arceus-field-message: count=%llu node=%llx update=main+%llx\n",
+            (unsigned long long)count, (unsigned long long)node, (unsigned long long)(update - main_base));
+        for (unsigned i = 0; i < 2; i++) {
+            u64 next = gr64(node + 0x90 + i * 8); int seen = !next;
+            for (unsigned j = 0; j < tail; j++) if (queue[j] == next) seen = 1;
+            if (!seen && tail < 16) queue[tail++] = next;
+        }
+    }
+}
+static void field_message_probe_init(void) {
+    const char* enabled = getenv("SNX_ARCEUS_DIALOGUE_TRACE");
+    if (!enabled || strcmp(enabled, "1")) return;
+    u64 pc = main_base + 0x2482818;
+    int covered = 0;
+    if (!g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale || !g_mod->entry_fn) return;
+    for (u32 i = 0; i < g_mod->nfns; i++)
+        if (g_mod->fn_lo[i] == pc && g_mod->fn_len[i] == 0xb8) covered = 1;
+    if (!covered || pc < g_code_lo || pc + 0xb8 > g_code_hi || !readable(pc, 0xb8) ||
+        gr32(pc) != 0xd10083ff || gr32(pc + 0xb4) != 0x17ffffda) {
+        WARN("arceus-field-message: refused instruction/function guard\n"); return;
+    }
+    gw32(pc + 0xb4, 0xb4fffb5f); /* Equivalent CBZ XZR, back to pc+1c. */
+    jit_code_changed(pc, 0xb8);
+    field_message_original = jit_wait(pc);
+    if (!field_message_original) { WARN("arceus-field-message: could not compile probe body\n"); return; }
+    __atomic_store_n(&g_disp[(pc - g_code_lo) / 4], field_message_probe, __ATOMIC_RELEASE);
+    LOG("arceus-field-message: read-only live message update probe installed\n");
+}
+
+void arceus_clock_post_jit(void) {
+    const char* enabled = getenv("SNX_ARCEUS_TIMING_FIXES");
+    if (!enabled || strcmp(enabled, "1") || !clocks_installed) return;
+    water_fix_init();
+    effects_fix_init();
+    event_camera_init();
+    blink_fix_init();
+    camera_input_init();
+    camera_rate_init();
+    field_message_probe_init();
+}

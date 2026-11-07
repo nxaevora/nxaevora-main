@@ -1,0 +1,158 @@
+ARCEUS 1.1.1 — INTEGER COUNTER TRIAGE
+2026-11-06, second pass inventory updated through fourth-pass follow-up
+
+Addresses are main-relative. Static callback-dependent arithmetic does not
+establish real-world speed: scheduling and active scene paths still matter.
+This list is deliberately separate from the earlier 1/30 constant inventory.
+
+PRIORITY TIMERS WITH DIRECT ARITHMETIC EVIDENCE
+
+Capture director, main+180C338
+  +F0 is the stage selector, NOT elapsed time. main+180C61C loads it and compares
+  against 0x12 before a jump table. The five strict-scan matches increment this
+  stage; do not scale those operations.
+  Actual authored time is elsewhere: +1D8 stores the initial duration and +1DC
+  stores remaining frames. Parameters include kBallOpenEffectFrame, kFailureWait,
+  kMoveToGroundFrame, kPokeCaptureFrame, kSuccessWait, kWaitBeforeJudgeFrame, and
+  kSpinFrame. Multiple branches subtract one from +1DC and test expiration.
+  Examples: main+180C954, main+180CB08, main+180CBAC, main+180D05C,
+  main+180D7D4, main+180DB54. Interpolation uses (initial - remaining)/initial.
+  Next: measure the director's update cadence and identify its active stage.
+  Third-pass update: a guarded observation probe is now in the research
+  candidate. No timing correction is enabled. The exact stage/parameter map
+  is in arceus-engine-research-pass3.txt.
+
+Look-at holds, main+19C2F80
+  main+19C3004: decrement +440 while +3D0 is active.
+  main+19C303C: decrement +4C0 while +450 is active.
+  main+19C3074: decrement +540 while +4D0 is active.
+  main+19C30AC: decrement +5C0 while +550 is active.
+  Each expiration calls virtual slot +100 with a distinct slot index and clears
+  the active flag. The function uses look_start_keep_frame elsewhere.
+  These control look-target holding, not eyelid texture/frame selection.
+  Third-pass update: 19C6760 takes a slot index in W1 and duration in W2;
+  each slot has a 0x80 stride. A separate +670 elapsed counter is compared
+  against look_start_keep_frame. It is not the initializer for these slots.
+  Live cadence still needs measurement.
+
+Player facial-expression holds, main+24D17DC
+  Third-pass parameter tracing identifies the player_face group. +280 is an
+  expression-override countdown initialized through helper 24D35B8, either
+  from an explicit duration or face_change_event_default_frame. The vigilance
+  ending and two buddy-interaction keep-frame settings feed this helper.
+  +2A4 is vigilance_end_delay_frame. +298 counts surprise elapsed updates;
+  +29C counts rejoice elapsed updates. The latter two compare against their
+  named keep-frame parameters. These are separate from eyelid blink timing.
+  Exact addresses and initializer paths are in arceus-engine-research-pass3.txt.
+  No facial timer correction or new face probe has been enabled.
+
+Respawn fade hold, main+24EE204
+  Fourth-pass mapping: state +240 == 4 owns counter +2A0. It increments the
+  field but compares its OLD value with respawn_fade_keep_frame_count, waiting
+  while old <= threshold. From zero, threshold N takes N+2 callbacks to the
+  expiry decision. Tests preserve this original behavior; it is not classified
+  as an off-by-one bug. The hold and common fade animation are separate clocks.
+
+Climbing movement stopping blend, main+2549FA0
+  State +D00 == 2 uses +D04 for elapsed progression and eases saved vectors
+  toward zero. Initializer main+254B254 stores 64-bit value 2 at +D00, simultaneously
+  setting state 2 and resetting +D04. Expiration compares the NEW count against
+  climbing_move_stop_frame. This function also invokes the ride blink helper;
+  it cannot safely be throttled wholesale to fix the stopping blend.
+
+Ride search-voice interval and dash-effect ramp, main+2587684
+  Fourth-pass correction: +D08 controls a search-voice interval, potentially
+  issuing PLAY_PV_RD_217_00_SEARCH, then resetting. It is not the dash ramp.
+  The real dash ramp is +D20, aliased through X8 at main+2588038. It increments and
+  clamps, then divides by the configured duration into float +D00. Both named
+  dash-effect easing paths consume that normalized value. Live rates pending.
+
+Wormhole delayed effect cleanup, main+1B5BBB8
+  Entries in the queue at owner+440/+448 have 0x18 stride and begin with a
+  signed countdown. Initializer main+1B5E5A0 sets it to 30. Expiration processes
+  retained effects through main+2B90D40 and erases the entry. This does not identify
+  the overall space-time-distortion duration. The nearby wormhole_out_keep_frame
+  parameter instead feeds the player facial-expression helper main+24D35B8.
+
+REJECTED OR DEPRIORITIZED MATCHES
+
+main+1458300 / 145E1C0, field +3BC:
+  Third-pass follow-up confirms this is a substate selector, not elapsed time.
+  The actual skip fade is passed to common fade wrapper C264CC; update C21490
+  uses +538/+53C for elapsed/duration. See the third-pass fade findings.
+
+main+180C7BC / 180DE54 / 180DE6C / 180E240 / 180E26C:
+  Capture sequence stage increments (+F0), not timer increments. See above for
+  the actual duration/remaining fields found while following this false lead.
+
+main+2A94E64 / 2A94EB0:
+  Increment +108 when a reusable-ID stack is empty; otherwise pop an existing
+  ID, then use the result for resource registration and store it in the object.
+  Direct callers mention FeedbackEffect/PostEffects, but this is allocation
+  bookkeeping, not evidence of a frame-based visual timer.
+
+main+4A47C8 / 4A9C04 / 4ABA10:
+  gRPC/HTTP2 transport counters. "Frame" in these source strings refers to
+  protocol frames, not game rendering. Excluded from timing work.
+
+View_Frame-associated main+1232A30 / 1249B74 / 1249DE4:
+  UI name alone is insufficient; matches include stack counters and repeated
+  bookkeeping increments. No timing change proposed.
+
+main+2944AA8 in generic helper main+2944274:
+  A broad caller list happens to contain timing strings. This does not identify
+  +8 as a gameplay clock. Requires owner/lifetime analysis; no patch proposed.
+
+SCAN LIMITATIONS
+
+The strict scan found 5,180 candidates in 2,972 functions; only 34 had selected
+timing words in the same function or direct callers. Neither number is a bug
+count. Most matches are bookkeeping. Conversely, the scan misses timers with
+branches between load/decrement/store, register aliases, vector clocks, fractional
+steps, coroutine delays, or parameters with no nearby strings. Capture +1DC is a
+concrete example of useful timing logic found by manual follow-up after a false
+positive, rather than by the strict pattern itself.
+
+Related new observation probes cover camera recenter, battle idle, and three
+throwable-progress states. Those findings and executable checks are documented
+in arceus-engine-research-pass2.txt.
+
+Third-pass follow-up: arceus-engine-research-pass3.txt adds common fades,
+UI elapsed-clock analysis, capture-stage mapping, and face/look initializer tracing.
+
+Fourth-pass execution checks and corrected field mappings:
+arceus-engine-research-pass4.txt and its physics/AI/field/attention companion reports.
+
+FIFTH-PASS FOLLOW-UP
+
+arceus-engine-research-pass5.txt adds verified field-message ownership and
+separates embedded BE02 wait+188, reveal delay+9D/+9E, fresh-press advancement
+and menu repeat.2737ABC can deliberately drain text in one outer invocation;
+FBFBD0 also has an inner status-driven repeat bypassing the ordinary quota.
+Do not equate processor calls with rendered frames or throttle it wholesale.
+The InputSkip references in107.../131... are expedition/Pokedex results;
+SingleInputEnableFrame belongs to tips configuration.
+
+The AI callback now has a traced dispatch epoch/clock source and named category
+buckets. Its frame accounting and decision cadence remain distinct. The four
+previously unexplained event1/30scalar increments are catch-up/recovery clocks
+of RealTimeEventManager, not generic dialogue waits. All are offline findings;
+no new timing correction or runtime probe was installed in the fifth pass.
+
+SIXTH-PASS FOLLOW-UP
+
+arceus-engine-research-pass6.txt and companion reports add:
+- A timed message subtype's signed+9C post-completion countdown, distinct from
+  text+114 readiness and optional+A2/+A3 automatic advancement. Mode3 manual
+  input can bypass the automatic threshold; none is a universal debounce.
+- Turn/TurnKey's authored degrees and per-callback quaternion versus accumulated
+  completion mismatch. Fractional rotation must also handle the original yaw
+  setter's small-angle quantization; an isolated residual design was tested,
+  without installing a gameplay correction.
+- Separate elapsed component preparation and variable-dt secondary worlds
+  beside the fixed-step main physics world. A shared postsolve serial+5B8 is
+  now logged by the next staged candidate; the completed user test predates it.
+- Explicit scene-resolution modes and override precedence. These are rendering
+  controls, not30Hz timing constants, and require correlated viewport evidence.
+The controller test completed cleanly; the user accepted camera/menu behavior.
+No new gameplay timing correction was installed in pass6.

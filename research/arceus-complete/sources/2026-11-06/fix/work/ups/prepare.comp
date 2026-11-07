@@ -1,0 +1,26 @@
+#version 450
+// NGX input: current-to-previous motion in render pixels, excluding frame jitter.
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D sceneDepth;
+layout(rg16f,binding=1) uniform writeonly image2D screenMotion;
+layout(binding=2) uniform sampler2D sceneColor;
+layout(rgba16f,binding=3) uniform writeonly image2D lowColor;
+layout(r32f,binding=4) uniform writeonly image2D lowDepth;
+layout(push_constant) uniform Inputs {mat4 clipToPrevious;vec2 geometryOffsetPx;uint valid;} u;
+void main(){
+ ivec2 p=ivec2(gl_GlobalInvocationID.xy),size=imageSize(screenMotion);
+ if(any(greaterThanEqual(p,size)))return;
+ ivec2 full=textureSize(sceneDepth,0); ivec2 src=clamp(ivec2((vec2(p)+.5)*vec2(full)/vec2(size)),ivec2(0),full-1);
+ vec2 uv=(vec2(src)+.5-u.geometryOffsetPx)/vec2(full),v=vec2(0);
+ float z=texelFetch(sceneDepth,src,0).r;
+ imageStore(lowColor,p,texelFetch(sceneColor,src,0));imageStore(lowDepth,p,vec4(z));
+ if(u.valid!=0 && z>0 && z<=1){
+  vec2 clip=vec2(2*uv.x-1,1-2*uv.y);
+  vec4 q=u.clipToPrevious*vec4(clip,z,1);
+  if(q.w>0 && !any(isnan(q)) && !any(isinf(q))){
+   v=clamp((q.xy/q.w-clip)*vec2(.5,-.5)*vec2(size),-vec2(size),vec2(size));
+  }
+ }
+ imageStore(screenMotion,p,vec4(v,0,0));
+}
+

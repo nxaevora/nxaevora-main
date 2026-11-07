@@ -1,0 +1,811 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "world-limits.h"
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_ray_query : require
+layout(local_size_x=8,local_size_y=8) in;
+layout(binding=0) uniform sampler2D depthMap;
+layout(binding=3,rgba16f) uniform writeonly image2D shaded;
+layout(binding=5) uniform sampler2D albedoMap;
+layout(binding=6) uniform samplerCube environmentMap;
+layout(constant_id=0) const uint textureCapacity=WORLD_TEXTURE_SLOTS;
+layout(binding=8) uniform sampler2D drawTextures[textureCapacity];
+layout(binding=7) uniform samplerCube diffuseProbe;
+layout(binding=9) uniform sampler2D emissionMap;
+layout(binding=10) uniform sampler2D packedNormals;
+layout(binding=11) uniform sampler2D packedSurface;
+layout(buffer_reference,std430,buffer_reference_align=16) buffer Vertices {vec4 v[];};
+layout(buffer_reference,std430,buffer_reference_align=4) buffer Counts {uint primary;uint covered;uint matchingDepth;uint bounce;uint textured;uint unresolved;uint drawColor;uint eval;uint grayError;uint rawError;uint fittedError;uint terrainPrimary;uint terrainSecondary;uint terrainShadow;uint glossyPaths;uint glossyHits;uint cutouts;uint rasterGeometry;uint missingPrimary;uint primaryMismatch;uint directVisible;uint directOccluded;uint emitterHits;uint bounceEmitters;uint recovered;uint retainedPrimary;uint retainedBounce;uint retainedShadow;uint deepHits;uint maxBounce;uint retainedPbrHits;uint intervalHits;};
+struct DrawMaterial {uint end;uint slot;uint roughness;uint metallic;vec4 transform;uint emission;float emissionScale;uint base;uint sourceStart;};
+struct Tint {uvec4 target;uvec4 source;uvec4 emission;};
+layout(buffer_reference,std430,buffer_reference_align=4) buffer Words {uint v[];};
+struct Witness {uvec4 key;vec4 position[3];};
+layout(buffer_reference,std430,buffer_reference_align=16) buffer Witnesses {Witness items[];};
+struct PropInfo {Vertices mesh;Words tags;Words atlas;Witnesses checks;Words activeGroups;uint triangles;uint groups;uvec2 properties;uint firstPlaced;uint classCount;};
+#include "grove-structs.glsl"
+struct SplatInfo {Words data;uint side;uint banks;};
+struct LandInfo {uvec2 scene;Vertices vertices;uint side;uint enabled;vec2 jitter;PropInfo props;Words indices;uint triangles;uint pad;uvec2 colors;uint colorSide;uint hasShading;vec4 grid;vec4 viewport;GroveInfo grove;SplatInfo splat;};
+layout(buffer_reference,std430,buffer_reference_align=8) buffer PrimaryLight {uvec2 values[];};
+layout(buffer_reference,std430,buffer_reference_align=16) buffer DrawTable {DrawMaterial draw[2048];Tint tint[2048];LandInfo land;vec4 lightDirection;vec4 lightRadiance;uvec2 primaryLight;uvec2 rrData;float emitterCdf[2048];uint emitterEnd[2048];Words particleGrid;float triangleCdf[];};
+layout(buffer_reference,std430,buffer_reference_align=16) buffer GeometrySamples {uvec4 header[8]; vec4 camera; vec4 points[];};
+layout(push_constant) uniform Inputs {
+    vec4 camera;
+    Vertices vertices;
+    uvec2 scene, stats;
+    uint frame,count;
+    Vertices clip;DrawTable draws;
+    vec4 axisX,axisY,axisZ,origin;
+} u;
+#if defined(GROVE_TRACE_TEST)
+#include "grove-trace-test.glsl"
+#elif defined(VERIFY_TREES)
+#include "grove-witness.glsl"
+#elif defined(FIELD_WITNESS)
+#include "field-witness.glsl"
+#elif defined(EMITTER_TRIANGLES)
+#include "emitter-triangles.glsl"
+#elif defined(EMITTER_DISTRIBUTION)
+#include "emitter-distribution.glsl"
+#elif defined(VERIFY_OBJECTS)
+void main(){
+    uint group=64u*gl_WorkGroupID.x+gl_LocalInvocationIndex;
+    PropInfo props=u.draws.land.props;
+    if(group>=props.groups)return;
+    Witness w=props.checks.items[group];uint first=0;
+    for(uint i=0;i<uint(u.axisX.w);i++){
+        uint end=u.draws.draw[i].end;
+        if(end-first==w.key.x){
+            bool matches=true;
+            for(uint j=0;j<3;j++){
+                vec3 v=u.vertices.v[3u*u.draws.draw[i].base+w.key[j+1]].xyz;
+                vec3 world=u.origin.xyz+u.axisX.xyz*v.x+u.axisY.xyz*v.y+u.axisZ.xyz*v.z;
+                if(!(distance(world,w.position[j].xyz)<.035)){matches=false;break;}
+            }
+            if(matches && w.position[1].w>0.){
+                uint start=uint(w.position[1].w)-1u;
+                for(uint j=0u;j<8u;j++){
+                    uint k=j<3u?w.key[j+1u]:((2u*j-5u)*(3u*w.key.x))/10u;
+                    vec4 stored=props.mesh.v[start+k];
+                    uint src=3u*u.draws.draw[i].base+k;
+                    vec3 v=u.vertices.v[src].xyz;
+                    vec3 point=u.origin.xyz+u.axisX.xyz*v.x+u.axisY.xyz*v.y+u.axisZ.xyz*v.z;
+                    vec2 uv=u.vertices.v[1500000u+src].xy;
+                    if(!(distance(point,stored.xyz)<.035) || !all(lessThan(abs(uv-unpackHalf2x16(floatBitsToUint(stored.w))),vec2(.004)))){matches=false;break;}
+                }
+            }
+            if(matches){
+                props.activeGroups.v[group]=u.frame+1u;
+                if(props.classCount>0u){
+                    uint model=uint(w.position[0].w)-1u;
+                    if(model<props.classCount)atomicOr(props.activeGroups.v[props.groups+model],1u);
+                }
+                return;
+            }
+        }
+        first=end;
+    }
+}
+#elif defined(BUILD_MESH)
+void main(){
+    uint tri=gl_WorkGroupID.x*64u+gl_LocalInvocationIndex;
+    if(tri>=u.count)return;
+    uint lo=0,hi=uint(u.axisX.w);
+    while(lo<hi){uint mid=(lo+hi)/2;if(u.draws.draw[mid].end<=tri)lo=mid+1;else hi=mid;}
+    if(lo>=uint(u.axisX.w))return;
+    DrawMaterial material=u.draws.draw[lo];
+    uint offset=tri-(lo==0u?0u:u.draws.draw[lo-1u].end);
+    uint first=3u*(material.sourceStart+offset);
+    uint dst=3u*(material.base+offset);
+    if(dst/3u>=u.count)return;
+    vec4 a=u.clip.v[2*first],b=u.clip.v[2*(first+1)],c=u.clip.v[2*(first+2)];
+    bool missing=all(equal(a,vec4(0)))&&all(equal(b,vec4(0)))&&all(equal(c,vec4(0)));
+    for(uint i=0;i<3;i++){
+        vec4 p=u.clip.v[2*(first+i)];
+        vec3 point=vec3(p.x*u.camera.x,-p.y*u.camera.y,p.w);
+        if(missing || any(isnan(point)) || any(isinf(point)))point=vec3(uintBitsToFloat(0x7fc00000u),0,0);
+        u.vertices.v[dst+i]=vec4(point,1);
+        vec2 uv=(u.clip.v[2*(first+i)+1].xy-material.transform.zw)*material.transform.xy;
+        u.vertices.v[1500000u+dst+i]=vec4(uv.x,1.-uv.y,float(material.slot&255u),float(lo));
+    }
+}
+#else
+uint hash(uint x){x^=x>>16;x*=0x7feb352du;x^=x>>15;x*=0x846ca68bu;return x^(x>>16);}
+float sample01(uint x){return float(hash(x)>>8)/16777216.;}
+vec3 cosineDirection(vec3 n,vec2 sampleUV){
+    float r=sampleUV.x,a=6.2831853*sampleUV.y;
+    vec3 t=normalize(cross(abs(n.z)<.9?vec3(0,0,1):vec3(0,1,0),n));
+    return sqrt(1.-r)*n+sqrt(r)*(cos(a)*t+sin(a)*cross(n,t));
+}
+vec3 diffuse(vec3 n,uint seed){
+    return cosineDirection(n,vec2(sample01(seed),sample01(seed+1)));
+}
+vec2 primaryEnvironmentSample(uint pixel,uint frame){
+    // Additive two-dimensional R2 sequence, independently rotated at each pixel.
+    // Integer arithmetic preserves the fractional sequence on long sessions.
+    uvec2 shift=uvec2(hash(pixel),hash(pixel^0x9e3779b9u));
+    uvec2 phase=shift+frame*uvec2(3242174889u,2447445414u);
+    return vec2(phase>>8)/16777216.;
+}
+const uint landFlag=0x80000000u;
+const uint propFlag=0x40000000u;
+vec3 toWorldDirection(vec3 v){return u.axisX.xyz*v.x+u.axisY.xyz*v.y+u.axisZ.xyz*v.z;}
+vec3 fromWorldDirection(vec3 v){return vec3(dot(v,u.axisX.xyz),dot(v,u.axisY.xyz),dot(v,u.axisZ.xyz));}
+bool hasInput(uint mask){return (uint(u.origin.w)&mask)==mask;}
+vec3 observedNormal(ivec2 pixel){
+    uvec3 bytes=uvec3(round(texelFetch(packedNormals,pixel,0).rgb*255.));
+    vec2 oct=clamp(vec2(bytes.r*16u+(bytes.g>>4),(bytes.g&15u)*256u+bytes.b)/2047.-1.,-1.,1.);
+    vec3 n=vec3(oct,1.-abs(oct.x)-abs(oct.y));
+    if(n.z<0.)n.xy=(1.-abs(n.yx))*mix(vec2(-1),vec2(1),greaterThanEqual(n.xy,vec2(0)));
+    return normalize(fromWorldDirection(normalize(n)));
+}
+bool validRay(vec3 origin,vec3 direction,float nearT,float farT){
+    float len=dot(direction,direction);
+    return all(lessThan(abs(origin),vec3(1e7))) && len>.9 && len<1.1 && nearT>=0. && farT>nearT;
+}
+uint alphaRejected=0,propShadow=0,placedShadow=0,placedBounce=0;
+bool placedProp(uint id){return (u.draws.land.props.tags.v[id]>>16)>=u.draws.land.props.firstPlaced;}
+vec4 samplePropAtlas(Words atlas,uint material,vec2 uv){
+    vec2 r=fract(uv)*64.-.5;ivec2 xy=ivec2(floor(r));vec2 f=fract(r);
+    uint base=material*4096u;
+    vec4 c=vec4(0);
+    for(int j=0;j<2;j++)for(int i=0;i<2;i++){
+        ivec2 p=(xy+ivec2(i,j))&63;
+        c+=unpackUnorm4x8(atlas.v[base+uint(64*p.y+p.x)])*(i==0?1.-f.x:f.x)*(j==0?1.-f.y:f.y);
+    }
+    return c;
+}
+vec4 propTexel(uint id,vec2 bary,Words atlas){
+    PropInfo props=u.draws.land.props;
+    uint first=3*id;
+    vec2 uv=unpackHalf2x16(floatBitsToUint(props.mesh.v[first].w))*(1.-bary.x-bary.y)
+           +unpackHalf2x16(floatBitsToUint(props.mesh.v[first+1].w))*bary.x
+           +unpackHalf2x16(floatBitsToUint(props.mesh.v[first+2].w))*bary.y;
+    return samplePropAtlas(atlas,props.tags.v[id]&255u,uv);
+}
+vec4 propColor(uint id,vec2 bary){return propTexel(id,bary,u.draws.land.props.atlas);}
+bool acceptsProp(uint id,vec2 bary){
+    PropInfo props=u.draws.land.props;
+    if(id>=props.triangles)return false;
+    uint tag=props.tags.v[id],stamp=props.activeGroups.v[tag>>16];
+    if((stamp==0u && (tag>>16)<props.firstPlaced) || stamp==u.frame+1u)return false;
+    if(props.classCount>0u && props.activeGroups.v[props.groups+(tag&255u)]==0u)return false;
+    uint cutoff=(tag>>8)&255u;
+    return cutoff==0u || propColor(id,bary).a>=float(cutoff)/255.;
+}
+#include "grove-rays.glsl"
+bool acceptsTriangle(uint id,vec2 bary){
+    if(id>=u.count)return false;
+    uint start=1500000u+3u*id;
+    vec4 a=u.vertices.v[start];
+    uint draw=uint(a.w);
+    if(draw>=uint(u.axisX.w))return false;
+    uint material=u.draws.draw[draw].slot;
+    float cutoff=float((material>>8u)&255u)/255.;
+    if(cutoff<=0.)return true;
+    vec2 uv=a.xy*(1.-bary.x-bary.y)+u.vertices.v[start+1].xy*bary.x+u.vertices.v[start+2].xy*bary.y;
+    if(any(isnan(uv)) || any(isinf(uv)))return true;
+    if(textureLod(drawTextures[nonuniformEXT(material&255u)],uv,0.).a>=cutoff)return true;
+    alphaRejected++;return false;
+}
+bool intersection(uvec2 scene,vec3 origin,vec3 direction,float nearT,float farT,out float distanceHit,out uint primitive,out vec2 bary){
+    if(!validRay(origin,direction,nearT,farT))return false;
+    rayQueryEXT ray;
+    bool guest=all(equal(scene,u.scene));
+    uint flags=gl_RayFlagsNoneEXT;
+    rayQueryInitializeEXT(ray,accelerationStructureEXT(scene),flags,255,origin,nearT,direction,farT);
+    while(rayQueryProceedEXT(ray)){
+        uint id=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false);vec2 bc=rayQueryGetIntersectionBarycentricsEXT(ray,false);
+        if(guest?acceptsTriangle(id+uint(u.axisZ.w),bc):acceptsInstance(rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false),id,bc))rayQueryConfirmIntersectionEXT(ray);
+    }
+    if(rayQueryGetIntersectionTypeEXT(ray,true)!=gl_RayQueryCommittedIntersectionTriangleEXT)return false;
+    distanceHit=rayQueryGetIntersectionTEXT(ray,true);
+    bary=rayQueryGetIntersectionBarycentricsEXT(ray,true);
+    primitive=uint(rayQueryGetIntersectionPrimitiveIndexEXT(ray,true));
+    if(guest && rayQueryGetIntersectionGeometryIndexEXT(ray,true)==1)primitive+=uint(u.axisZ.w);
+    uint custom=guest?0u:rayQueryGetIntersectionInstanceCustomIndexEXT(ray,true);
+    if(custom>=2u){
+        uint instance=custom-2u;
+        if(!treeSurface(instance,primitive) || distanceHit<nearT || distanceHit>farT)return false;
+        primitive=propFlag|treeBit|(instance<<14u)|primitive;return true;
+    }
+    bool prop=custom==1u;
+    uint maxCount=guest?u.count:(prop?u.draws.land.props.triangles:u.draws.land.triangles);
+    if(primitive>=maxCount || distanceHit<nearT || distanceHit>farT)return false;
+    if(prop)primitive|=propFlag;
+    return true;
+}
+// Raster depth gives the covered sample's distance even when textured foliage or
+// decimated terrain hides it from the first ray. Search live triangles on both
+// sides of that distance and choose the closest projected depth.
+bool primaryAtDepth(vec3 direction,float expected,float tolerance,out vec3 hit,out uint primitive,out vec2 bary,out bool cutout){
+    float nearT=max(.01,(expected-tolerance)/direction.z);
+    float farT=min(5000.,(expected+tolerance)/direction.z);
+    if(!(farT>nearT))return false;
+    rayQueryEXT ray;
+    rayQueryInitializeEXT(ray,accelerationStructureEXT(u.scene),gl_RayFlagsNoOpaqueEXT,255,vec3(0),nearT,direction,farT);
+    float best=tolerance;
+    bool found=false;
+    while(rayQueryProceedEXT(ray)){
+        if(rayQueryGetIntersectionTypeEXT(ray,false)!=gl_RayQueryCandidateIntersectionTriangleEXT)continue;
+        float t=rayQueryGetIntersectionTEXT(ray,false);
+        float error=abs(direction.z*t-expected);
+        uint geometry=rayQueryGetIntersectionGeometryIndexEXT(ray,false);
+        uint id=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false)+(geometry==1u?uint(u.axisZ.w):0u);
+        if(id>=u.count || !(error<best))continue;
+        best=error;hit=direction*t;primitive=id;bary=rayQueryGetIntersectionBarycentricsEXT(ray,false);
+        cutout=geometry==1u;found=true;
+    }
+    return found;
+}
+bool traceScene(vec3 origin,vec3 direction,float nearT,float farT,out vec3 hit,out uint primitive,out vec2 bary){
+    float distanceHit;
+    bool found=intersection(u.scene,origin,direction,nearT,farT,distanceHit,primitive,bary);
+    // Give the guest's full-detail triangles precedence where the two terrain surfaces coincide.
+    float limit=found?distanceHit-.15:farT;
+    if(u.draws.land.enabled!=0u && limit>nearT){
+        uint landPrim;vec2 landBary;float landDistance;
+        if(intersection(u.draws.land.scene,u.origin.xyz+toWorldDirection(origin),toWorldDirection(direction),
+                        nearT,limit,landDistance,landPrim,landBary)){
+            primitive=(landPrim&propFlag)!=0u?landPrim:landFlag|landPrim;bary=landBary;distanceHit=landDistance;found=true;
+        }
+    }
+    if(found)hit=origin+direction*distanceHit;
+    return found;
+}
+bool anyHit(uvec2 scene,vec3 origin,vec3 direction,float bias){
+    if(!validRay(origin,direction,bias,5000.))return false;
+    rayQueryEXT ray;
+    bool guest=all(equal(scene,u.scene));
+    uint flags=gl_RayFlagsNoneEXT;
+    rayQueryInitializeEXT(ray,accelerationStructureEXT(scene),flags|gl_RayFlagsTerminateOnFirstHitEXT,255,
+        origin,bias,direction,5000.);
+    while(rayQueryProceedEXT(ray)){
+        uint id=rayQueryGetIntersectionPrimitiveIndexEXT(ray,false);vec2 bc=rayQueryGetIntersectionBarycentricsEXT(ray,false);
+        if(guest?acceptsTriangle(id+uint(u.axisZ.w),bc):acceptsInstance(rayQueryGetIntersectionInstanceCustomIndexEXT(ray,false),id,bc))rayQueryConfirmIntersectionEXT(ray);
+    }
+    bool found=rayQueryGetIntersectionTypeEXT(ray,true)!=gl_RayQueryCommittedIntersectionNoneEXT;
+    if(found && !guest){
+        uint instance=rayQueryGetIntersectionInstanceCustomIndexEXT(ray,true);
+        if(instance>0u){
+            propShadow++;
+            if(instance>=2u || placedProp(rayQueryGetIntersectionPrimitiveIndexEXT(ray,true)))placedShadow++;
+        }
+    }
+    return found;
+}
+bool shadowed(vec3 origin,vec3 direction,float bias,inout uint landShadows){
+    if(anyHit(u.scene,origin,direction,bias))return true;
+    if(u.draws.land.enabled==0u)return false;
+    // Offset the test above the reduced terrain to avoid self-occlusion at grazing angles.
+    if(anyHit(u.draws.land.scene,u.origin.xyz+toWorldDirection(origin)+vec3(0,.07,0),toWorldDirection(direction),max(.07,bias))){
+        landShadows++;return true;
+    }
+    return false;
+}
+uvec3 landTriangle(uint primitive){
+    uint first=3u*(primitive&~landFlag);
+    Words idx=u.draws.land.indices;
+    return uvec3(idx.v[first],idx.v[first+1u],idx.v[first+2u]);
+}
+vec3 faceNormal(uint primitive){
+    if((primitive&propFlag)!=0u){
+        if((primitive&treeBit)!=0u)return treeFace(primitive&~propFlag);
+        uint j=3u*(primitive&~propFlag);
+        Vertices mesh=u.draws.land.props.mesh;vec3 a=mesh.v[j].xyz;
+        return normalize(fromWorldDirection(cross(mesh.v[j+1].xyz-a,mesh.v[j+2].xyz-a)));
+    }
+    if((primitive&landFlag)==0u){
+        uint j=3u*primitive;vec3 a=u.vertices.v[j].xyz;
+        return normalize(cross(u.vertices.v[j+1].xyz-a,u.vertices.v[j+2].xyz-a));
+    }
+    uvec3 ids=landTriangle(primitive);
+    Vertices v=u.draws.land.vertices;
+    vec3 a=v.v[ids.x].xyz;
+    vec3 n=cross(v.v[ids.y].xyz-a,v.v[ids.z].xyz-a);
+    return normalize(fromWorldDirection(n));
+}
+bool observedMaterial(vec3 hit,ivec2 size,out vec3 color,out vec3 glow){
+    glow=vec3(0);
+    if(hit.z<=0.)return false;
+    vec2 uv=.5+.5*hit.xy/(u.camera.xy*hit.z)+u.draws.land.jitter/u.draws.land.viewport.zw;
+    if(any(lessThan(uv,vec2(0))) || any(greaterThanEqual(uv,vec2(1))))return false;
+    ivec2 p=ivec2(u.draws.land.viewport.xy+uv*u.draws.land.viewport.zw);
+    float depth=texelFetch(depthMap,p,0).r;
+    float expected=1./max(1e-7,depth*u.camera.z+u.camera.w);
+    if(depth<=0. || abs(expected-hit.z)>=max(.01,.025*hit.z))return false;
+    color=clamp(texelFetch(albedoMap,p,0).rgb,vec3(0),vec3(.95));
+    if(hasInput(1u))glow=clamp(texelFetch(emissionMap,p,0).rgb,vec3(0),vec3(64.));
+    return true;
+}
+vec4 terrainTexel(uvec3 ids,vec3 weight,uint offset){
+    Vertices mesh=u.draws.land.vertices;
+    vec2 world=mesh.v[ids.x].xz*weight.x+mesh.v[ids.y].xz*weight.y+mesh.v[ids.z].xz*weight.z;
+    uint side=u.draws.land.colorSide;
+    vec2 uv=clamp((world-u.draws.land.grid.xy)*u.draws.land.grid.zw,vec2(0),vec2(side-1u));
+    uvec2 cell=min(uvec2(uv),uvec2(side-2u));
+    vec2 f=uv-vec2(cell);
+    uint a=cell.y*side+cell.x;
+    uvec3 texel;
+    if(f.x+f.y<=1.){
+        texel=uvec3(a,a+1u,a+side);
+        weight=vec3(1.-f.x-f.y,f.x,f.y);
+    }else{
+        texel=uvec3(a+side+1u,a+side,a+1u);
+        weight=vec3(f.x+f.y-1.,1.-f.x,1.-f.y);
+    }
+    Words colors=Words(u.draws.land.colors);
+    texel+=offset;
+    return unpackUnorm4x8(colors.v[texel.x])*weight.x+unpackUnorm4x8(colors.v[texel.y])*weight.y+
+         unpackUnorm4x8(colors.v[texel.z])*weight.z;
+}
+#include "terrain-splat.glsl"
+bool sourceMaterial(uint primitive,vec2 bary,out uint draw,out vec3 value){
+    if((primitive&propFlag)!=0u){
+        draw=2048u;uint id=primitive&~propFlag;
+        vec3 c=(id&treeBit)!=0u?treeTexel(treeInstance(id),treePrimitive(id),bary).rgb:propColor(id,bary).rgb;
+        value=mix(c/12.92,pow((c+.055)/1.055,vec3(2.4)),greaterThan(c,vec3(.04045)));
+        return true;
+    }
+    if((primitive&landFlag)!=0u){
+        draw=2047u;
+        uvec3 ids=landTriangle(primitive);
+        Vertices mesh=u.draws.land.vertices;
+        vec3 weight=vec3(1.-bary.x-bary.y,bary);
+        vec4 tint;
+        if(any(notEqual(u.draws.land.colors,uvec2(0)))){
+            tint=terrainTexel(ids,weight,0u);
+        }else{
+            tint=unpackUnorm4x8(floatBitsToUint(mesh.v[ids.x].w))*weight.x+
+                 unpackUnorm4x8(floatBitsToUint(mesh.v[ids.y].w))*weight.y+
+                 unpackUnorm4x8(floatBitsToUint(mesh.v[ids.z].w))*weight.z;
+        }
+        if(tint.a<.65){value=vec3(.36);return false;}
+        value=mix(tint.rgb/12.92,pow((tint.rgb+.055)/1.055,vec3(2.4)),greaterThan(tint.rgb,vec3(.04045)));
+        return true;
+    }
+    uint first=1500000u+3u*primitive;
+    vec4 a=u.vertices.v[first];uint slot=uint(a.z);draw=uint(a.w);
+    if(slot==0u || slot>=textureCapacity)return false;
+    vec2 uv=a.xy*(1.-bary.x-bary.y)+u.vertices.v[first+1].xy*bary.x+u.vertices.v[first+2].xy*bary.y;
+    if(any(isnan(uv)) || any(isinf(uv)))return false;
+    value=clamp(textureLod(drawTextures[nonuniformEXT(slot)],uv,1.).rgb,vec3(0),vec3(.95));
+    return true;
+}
+vec3 predictedMaterial(uint draw,bool textured,vec3 raw,out bool measured){
+    if(draw>=2048u){measured=false;return raw;}
+    Tint t=u.draws.tint[draw];
+    measured=t.target.w>=3u;
+    if(!measured)return raw;
+    vec3 mean=vec3(t.target.rgb)/(255.*float(t.target.w));
+    if(!textured)return mean;
+    vec3 sourceMean=vec3(t.source.rgb)/(255.*float(t.target.w));
+    return clamp(mean+(raw-sourceMean)*clamp((mean+.02)/(sourceMean+.02),vec3(.2),vec3(3.)),vec3(0),vec3(.95));
+}
+bool surfaceProperties(uint primitive,vec2 bary,out float rough,out float metal){
+    rough=1.;metal=0.;
+    if((primitive&(treeBit|propFlag))==(treeBit|propFlag)){
+        GroveInfo g=u.draws.land.grove;
+        uint model=g.placements.items[treeInstance(primitive&~propFlag)].key.x;
+        uint pbr=g.shapes.items[model].pbr;
+        rough=max(.04,float(pbr&255u)/255.);metal=float((pbr>>8u)&255u)/255.;
+        return true;
+    }
+    if((primitive&propFlag)!=0u && any(notEqual(u.draws.land.props.properties,uvec2(0)))){
+        vec4 properties=propTexel(primitive&~propFlag,bary,Words(u.draws.land.props.properties));
+        if(properties.a>.5){
+            rough=max(.04,properties.r);metal=properties.g;return true;
+        }
+    }
+    if((primitive&(landFlag|propFlag))!=0u)return false;
+    uint start=1500000u+3u*primitive;
+    vec4 a=u.vertices.v[start];
+    uint draw=uint(a.w);
+    if(draw>=uint(u.axisX.w))return false;
+    DrawMaterial m=u.draws.draw[draw];
+    if(m.roughness==0u || m.roughness>=textureCapacity || m.metallic>=textureCapacity)return false;
+    vec2 uv=a.xy*(1.-bary.x-bary.y)+u.vertices.v[start+1].xy*bary.x+u.vertices.v[start+2].xy*bary.y;
+    if(any(isnan(uv)) || any(isinf(uv)))return false;
+    vec3 r=textureLod(drawTextures[nonuniformEXT(m.roughness)],uv,1.).rgb;
+    if(m.metallic==m.roughness){rough=r.g;metal=r.b;}
+    else{
+        rough=r.r;
+        if(m.metallic!=0u)metal=textureLod(drawTextures[nonuniformEXT(m.metallic)],uv,1.).r;
+    }
+    rough=clamp(rough,.04,1.);metal=clamp(metal,0.,1.);
+    return true;
+}
+// Sample the GGX distribution of normals visible from the incident direction.
+// GGX visible-normal reflection density in solid angle and Smith G1 for the outgoing ray.
+float smithG1(float cosine,float a2){
+    return 2.*cosine/max(1e-8,cosine+sqrt(a2+(1.-a2)*cosine*cosine));
+}
+float glossyPdf(vec3 n,vec3 v,vec3 l,float rough){
+    float nv=dot(n,v),nl=dot(n,l);
+    if(nv<=0. || nl<=0.)return 0.;
+    vec3 h=normalize(v+l);
+    float nh=clamp(dot(n,h),0.,1.),a2=rough*rough*rough*rough;
+    float d=(1.-nh*nh)+nh*nh*a2;
+    return a2/(3.14159265*d*d)*smithG1(nv,a2)/(4.*nv);
+}
+vec3 glossy(vec3 n,vec3 v,float rough,vec3 f0,uint seed,out vec3 weight){
+    vec3 t=normalize(cross(abs(n.z)<.9?vec3(0,0,1):vec3(0,1,0),n));
+    mat3 basis=mat3(t,cross(n,t),n);
+    vec3 local=transpose(basis)*v;
+    float alpha=rough*rough;
+    vec3 vh=normalize(vec3(alpha*local.xy,max(.00001,local.z)));
+    float lensq=dot(vh.xy,vh.xy);
+    vec3 t1=lensq>0.?vec3(-vh.y,vh.x,0)/sqrt(lensq):vec3(1,0,0);
+    float radius=sqrt(sample01(seed)),azimuth=6.2831853*sample01(seed+1);
+    float x=radius*cos(azimuth),y=radius*sin(azimuth);
+    y=mix(sqrt(max(0.,1.-x*x)),y,.5*(1.+vh.z));
+    vec3 nh=x*t1+y*cross(vh,t1)+sqrt(max(0.,1.-x*x-y*y))*vh;
+    vec3 h=basis*normalize(vec3(alpha*nh.xy,max(0.,nh.z)));
+    vec3 l=reflect(-v,h);
+    float nl=max(0.,dot(n,l));
+    vec3 fresnel=f0+(1.-f0)*pow(1.-clamp(dot(v,h),0.,1.),5.);
+    weight=fresnel*smithG1(nl,alpha*alpha);
+    return l;
+}
+vec3 materialAt(vec3 hit,ivec2 size,uint primitive,vec2 bary,inout uint textured,inout uint unresolved,inout uint drawColor,out vec3 glow,out bool observed){
+    vec3 color;
+    observed=observedMaterial(hit,size,color,glow);
+    if(observed)return color;
+    vec3 raw=vec3(.36);uint draw;
+    bool hasTexture=sourceMaterial(primitive,bary,draw,raw);
+    if(!hasTexture)raw=vec3(.36);
+    bool measured;
+    vec3 fitted=predictedMaterial(draw,hasTexture,raw,measured);
+    if(draw<2048u){
+        Tint tint=u.draws.tint[draw];
+        if(tint.emission.a>=3u && tint.source.a*5u>=tint.emission.a*4u)glow=vec3(tint.emission.rgb)/(1024.*float(tint.emission.a));
+        if((primitive&landFlag)==0u){
+            DrawMaterial m=u.draws.draw[draw];
+            if(m.emission!=0u && m.emission<textureCapacity){
+                uint start=1500000u+3u*primitive;
+                vec2 uv=u.vertices.v[start].xy*(1.-bary.x-bary.y)+u.vertices.v[start+1].xy*bary.x+u.vertices.v[start+2].xy*bary.y;
+                if(!any(isnan(uv)) && !any(isinf(uv)))glow=m.emissionScale*textureLod(drawTextures[nonuniformEXT(m.emission)],uv,1.).rgb;
+            }
+        }
+    }
+    if(hasTexture)textured++;
+    else if(measured)drawColor++;
+    else unresolved++;
+    return fitted;
+}
+#include "emitter-sampling.glsl"
+#if defined(PARTICLE_GRID)
+#include "particle-grid.glsl"
+#elif defined(CALIBRATE)
+void main(){
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy)*8+ivec2(2,3),size=textureSize(albedoMap,0);
+    if(any(greaterThanEqual(pixel,size)))return;
+    vec3 direction=normalize(vec3(((vec2(pixel)+.5-u.draws.land.jitter-u.draws.land.viewport.xy)/u.draws.land.viewport.zw*2.-1.)*u.camera.xy,1));
+    vec3 hit,observed,glow;uint primitive;vec2 bary;
+    if(!traceScene(vec3(0),direction,.01,5000.,hit,primitive,bary) || !observedMaterial(hit,size,observed,glow))return;
+    vec3 raw=vec3(0);uint draw;
+    if(!sourceMaterial(primitive,bary,draw,raw))raw=vec3(0);
+    if(draw>=2048u)return;
+    uvec3 a=uvec3(round(255.*observed)),b=uvec3(round(255.*raw));
+    atomicAdd(u.draws.tint[draw].target.x,a.x);atomicAdd(u.draws.tint[draw].target.y,a.y);atomicAdd(u.draws.tint[draw].target.z,a.z);
+    atomicAdd(u.draws.tint[draw].source.x,b.x);atomicAdd(u.draws.tint[draw].source.y,b.y);atomicAdd(u.draws.tint[draw].source.z,b.z);
+    atomicAdd(u.draws.tint[draw].target.w,1);
+    if(hasInput(1u)){
+        uvec3 light=uvec3(round(1024.*glow));
+        if(any(greaterThan(light,uvec3(4))))atomicAdd(u.draws.tint[draw].source.w,1);
+        atomicAdd(u.draws.tint[draw].emission.x,light.x);atomicAdd(u.draws.tint[draw].emission.y,light.y);
+        atomicAdd(u.draws.tint[draw].emission.z,light.z);atomicAdd(u.draws.tint[draw].emission.w,1);
+    }
+}
+#else
+void main(){
+    ivec2 pixel=ivec2(gl_GlobalInvocationID.xy),size=imageSize(shaded);
+    if(any(greaterThanEqual(pixel,size)))return;
+    vec3 direction=normalize(vec3(((vec2(pixel)+.5-u.draws.land.jitter-u.draws.land.viewport.xy)/u.draws.land.viewport.zw*2.-1.)*u.camera.xy,1));
+    vec3 origin=vec3(0),throughput=vec3(1),radiance=vec3(0);
+    vec3 deterministic=vec3(0);
+    uint surfaceGuide=0u;
+#ifdef RR_GUIDES
+    vec3 rrDiffuse=vec3(0),rrSpecular=vec3(0);
+    vec4 rrNormal=vec4(0,0,0,1);
+    float rrDistance=0.;
+    uvec4 primaryAudit=uvec4(0xffffffffu,0,0,0);
+#endif
+    float nearT=.01;
+    if(u.axisY.w>0. && any(notEqual(u.stats,uvec2(0))) && all(equal(pixel%32,ivec2(0)))){
+        GeometrySamples samples=GeometrySamples(u.stats);
+        if(all(equal(pixel,ivec2(0))))samples.camera=vec4(u.origin.xyz,float(u.frame));
+        float depth=texelFetch(depthMap,pixel,0).r;
+        float viewZ=1./max(1e-7,depth*u.camera.z+u.camera.w);
+        vec3 v=direction*(viewZ/direction.z);
+        uint idx=uint(pixel.x/32+60*(pixel.y/32));
+        samples.points[idx]=vec4(u.origin.xyz+u.axisX.xyz*v.x+u.axisY.xyz*v.y+u.axisZ.xyz*v.z,depth);
+    }
+    uint groundPrimary=0,groundSecondary=0,groundShadows=0,retainedPrimary=0,retainedBounce=0,sunVisible=0,sunOccluded=0,emitterHits=0,bounceEmitters=0;
+    bool depthMatch=false,matchedInterval=false,matchedCutout=false,matchedPrecise=false;bool primaryHit=false;uint secondary=0,textured=0,unresolved=0,drawColor=0;
+    uint terrainPbr=0u;
+    uint retainedPbr=0;bool previousGloss=false,recovered=false;uint glossPaths=0,glossHits=0;
+    uint seed=hash(uint(pixel.x+pixel.y*size.x))+hash(u.frame%64u);
+    const uint maxSurfaces=6u;
+    uint emitterCount=u.draws.emitterEnd[uint(u.axisX.w)-1u];
+    uint lightSamples=0u,visibleSamples=0u;
+    float previousLobePdf=0.;
+    uint deepHits=0,lastBounce=0;
+    for(uint depth=0;depth<maxSurfaces;depth++){
+        vec3 hit;uint primitive;vec2 bary;
+        bool found=traceScene(origin,direction,nearT,5000.,hit,primitive,bary);
+        if(depth==0u){
+            primaryHit=found;
+            float z=texelFetch(depthMap,pixel,0).r;
+            float expected=1./max(1e-7,z*u.camera.z+u.camera.w);
+#ifdef RR_GUIDES
+            if(hasInput(8u)){
+                primaryAudit.x=found?primitive:0xffffffffu;
+                primaryAudit.y=floatBitsToUint(found?hit.z:0.);
+                primaryAudit.z=floatBitsToUint(z>0.?expected:0.);
+            }
+#endif
+            depthMatch=found && z>0. && abs(hit.z-expected)<max(.02,expected*.025);
+            // Account for D24 quantization in reversed-Z and view-space float precision.
+            float fineTolerance=.0005+expected*.00012+expected*expected*abs(u.camera.z)/16777215.;
+            if(z>0. && expected>.001 && expected<5000. && (!found || abs(hit.z-expected)>fineTolerance)){
+                vec3 candidate;uint id;vec2 bc;bool cut;
+                if(primaryAtDepth(direction,expected,fineTolerance,candidate,id,bc,cut)){
+                    hit=candidate;primitive=id;bary=bc;found=true;primaryHit=true;depthMatch=true;
+                    matchedCutout=cut;matchedPrecise=!cut;
+                }
+            }
+            // A coarse retained mesh or coplanar draw can hide the guest-visible
+            // surface in the acceleration structure. Look for its triangle before
+            // reconstructing a position from raster depth.
+            float tolerance=max(.02,expected*.025);
+            if(found && z>0. && !depthMatch && hit.z<=expected-tolerance){
+                float t0=max(nearT,(expected-tolerance)/direction.z);
+                float t1=min(5000.,(expected+tolerance)/direction.z);
+                vec3 candidate;uint candidateId;vec2 candidateBary;
+                if(t1>t0 && traceScene(origin,direction,t0,t1,candidate,candidateId,candidateBary) &&
+                   abs(candidate.z-expected)<tolerance){
+                    hit=candidate;primitive=candidateId;bary=candidateBary;
+                    depthMatch=true;matchedInterval=true;
+                }
+            }
+            if(!depthMatch && hasInput(6u) && z>0. && expected>.001 && expected<5000.){
+                hit=direction*(expected/direction.z);
+                recovered=true;
+            }else if(!depthMatch)break;
+#ifdef RR_GUIDES
+            if(hasInput(8u)){
+                primaryAudit.w=recovered?3u:matchedCutout?4u:matchedPrecise?5u:matchedInterval?2u:1u;
+                if(!recovered){primaryAudit.x=primitive;primaryAudit.y=floatBitsToUint(hit.z);}
+            }
+#endif
+        }
+        bool fromBuffers=depth==0u && recovered;
+        if(!found && !fromBuffers){
+            vec3 worldDir=direction.x*u.axisX.xyz+direction.y*u.axisY.xyz+direction.z*u.axisZ.xyz;
+            if(depth==0u || previousGloss)radiance+=throughput*max(textureLod(environmentMap,worldDir,0.).rgb,vec3(0));break;
+        }
+        if(depth==0u && depthMatch && any(notEqual(u.stats,uvec2(0))) && all(equal(pixel%32,ivec2(11,13)))){
+            vec3 raw,observed,glow;uint draw;
+            bool hasTexture=sourceMaterial(primitive,bary,draw,raw);
+            if(!hasTexture)raw=vec3(.36);
+            bool measured;vec3 predicted=predictedMaterial(draw,hasTexture,raw,measured);
+            if(measured && observedMaterial(hit,size,observed,glow)){
+                Counts c=Counts(u.stats);
+                atomicAdd(c.eval,1);
+                atomicAdd(c.grayError,uint(round(dot(abs(observed-.36),vec3(85.)))));
+                atomicAdd(c.rawError,uint(round(dot(abs(observed-raw),vec3(85.)))));
+                atomicAdd(c.fittedError,uint(round(dot(abs(observed-predicted),vec3(85.)))));
+            }
+        }
+        if(previousGloss)glossHits++;
+        if(depth>0)secondary++;
+        if(depth>=3u)deepHits++;
+        lastBounce=depth;
+        if(!fromBuffers && (primitive&propFlag)!=0u){if(depth==0u)retainedPrimary++;else {retainedBounce++;if((primitive&treeBit)!=0u || placedProp(primitive&~propFlag))placedBounce++;}}
+        if(!fromBuffers && (primitive&landFlag)!=0u){if(depth==0u)groundPrimary++;else groundSecondary++;}
+        vec3 normal,glow,base,triangleNormal=vec3(0);float rough,metal;bool pbr,observed=false;
+        if(depth==0u && hasInput(6u)){
+            normal=observedNormal(pixel);
+            base=clamp(texelFetch(albedoMap,pixel,0).rgb,vec3(0),vec3(.95));
+            glow=hasInput(1u)?max(texelFetch(emissionMap,pixel,0).rgb,vec3(0)):vec3(0);
+            rough=clamp(texelFetch(packedNormals,pixel,0).a,.04,1.);
+            metal=clamp(texelFetch(packedSurface,pixel,0).g,0.,1.);pbr=true;
+        }else{
+            triangleNormal=faceNormal(primitive);normal=triangleNormal;
+            base=materialAt(hit,size,primitive,bary,textured,unresolved,drawColor,glow,observed);
+            pbr=surfaceProperties(primitive,bary,rough,metal);
+            if(pbr && (primitive&propFlag)!=0u)retainedPbr++;
+            if((primitive&landFlag)!=0u && u.draws.land.hasShading!=0u){
+                uint side=u.draws.land.colorSide;
+                vec4 map=terrainTexel(landTriangle(primitive),vec3(1.-bary.x-bary.y,bary),side*side);
+                vec2 xz=map.xy*2.-1.;
+                vec3 smoothNormal=normalize(fromWorldDirection(vec3(xz.x,max(0.,1.-abs(xz.x)-abs(xz.y)),xz.y)));
+                if(dot(smoothNormal,triangleNormal)>.25)normal=smoothNormal;
+                if(map.a>=.65){rough=clamp(map.z,.04,1.);metal=0.;pbr=true;terrainPbr++;}
+            }
+        }
+        if(!fromBuffers && isTerrainMaterial(primitive) && u.draws.land.splat.side!=0u &&
+           (depth!=0u || (any(notEqual(u.stats,uvec2(0))) && all(equal(pixel%32,ivec2(9,11)))))){
+            vec3 detail,mappedNormal;float nativeRough;
+            vec3 position=u.origin.xyz+toWorldDirection(hit);
+            vec3 slope=normalize(toWorldDirection(depth==0u?faceNormal(primitive):normal));
+            if(slope.y<0.)slope=-slope;
+            float footprint=max(.0001,2.*u.camera.y*abs(hit.z)/u.draws.land.viewport.w);
+            if(nativeTerrainMaterial(position,slope,footprint,detail,nativeRough,mappedNormal)){
+                if(depth!=0u){
+                    if(!observed)base=detail;
+                    if(dot(mappedNormal,mappedNormal)>.5)normal=fromWorldDirection(mappedNormal);
+                    rough=nativeRough;metal=0.;pbr=true;
+                    if(any(notEqual(u.stats,uvec2(0))) && all(equal(pixel%8,ivec2(0))))atomicAdd(Words(u.stats).v[11905],1u);
+                }else if(hasInput(6u) && abs(texelFetch(albedoMap,pixel,0).a-66./255.)<.001){
+                    vec3 actual=texelFetch(albedoMap,pixel,0).rgb;
+                    Words stats=Words(u.stats);
+                    if(dot(mappedNormal,mappedNormal)>.5){
+                        vec3 nativeNormal=normalize(toWorldDirection(normal));
+                        atomicAdd(stats.v[11906],1u);
+                        atomicAdd(stats.v[11907],uint(round(100.*degrees(acos(clamp(dot(nativeNormal,mappedNormal),-1.,1.))))));
+                        atomicAdd(stats.v[11908],uint(round(100.*degrees(acos(clamp(dot(nativeNormal,slope),-1.,1.))))));
+                    }
+                    atomicAdd(stats.v[11903],1u);atomicAdd(stats.v[11904],uint(round(255.*dot(abs(actual-detail),vec3(1./3.)))));
+                }
+            }
+        }
+        if(dot(normal,direction)>0.)normal=-normal;
+        float emissionWeight=1.;
+        if(previousLobePdf>0. && emitterCount!=0u && primitive<u.count && depth>0u){
+            uint draw=uint(u.vertices.v[1500000u+3u*primitive].w);
+            if(draw<uint(u.axisX.w) && u.draws.emitterEnd[draw]>(draw==0u?0u:u.draws.emitterEnd[draw-1u])){
+                uint first=draw==0u?0u:u.draws.draw[draw-1u].end;
+                uint count=u.draws.draw[draw].end-first;
+                float density=emitterPdf(primitive,direction,dot(hit-origin,hit-origin),emitterProbability(draw,primitive,count,emitterCount));
+                emissionWeight=previousLobePdf/(previousLobePdf+density);
+            }
+        }
+        radiance+=throughput*glow*emissionWeight;
+        if(any(greaterThan(glow,vec3(.004)))){emitterHits++;if(depth>0u)bounceEmitters++;}
+        vec3 f0=mix(vec3(.04),base,metal);
+        vec3 diffuseWeight=pbr?base*(1.-metal)*(1.-f0):base;
+        vec3 incoming=throughput;
+        throughput*=diffuseWeight;
+        vec3 geometric=fromBuffers?normal:(depth==0u && depthMatch?faceNormal(primitive):triangleNormal);
+        if(dot(geometric,direction)>0.)geometric=-geometric;
+        if(dot(geometric,normal)<=0.)normal=geometric;
+        nearT=max(.0005,.00008*length(hit));origin=hit+geometric*nearT;
+        if(u.draws.lightDirection.w>0.){
+            vec3 toLight=fromWorldDirection(u.draws.lightDirection.xyz);
+            float nl=max(0.,dot(normal,toLight));
+            if(nl>0.){
+                if(shadowed(origin,toLight,nearT,groundShadows))sunOccluded++;
+                else{
+                    vec3 direct=throughput*(nl/3.14159265);
+                    if(pbr){
+                        vec3 v=-direction,h=normalize(v+toLight);
+                        float nv=max(dot(normal,v),.0001),nh=max(dot(normal,h),0.);
+                        float a2=rough*rough*rough*rough;
+                        float d=(1.-nh*nh)+nh*nh*a2;
+                        float visibility=.5/max(.00001,nl*sqrt(nv*nv*(1.-a2)+a2)+nv*sqrt(nl*nl*(1.-a2)+a2));
+                        vec3 fresnel=f0+(1.-f0)*pow(1.-clamp(dot(v,h),0.,1.),5.);
+                        direct+=incoming*fresnel*(nl*a2*visibility/(3.14159265*d*d));
+                    }
+                    radiance+=direct*u.draws.lightRadiance.rgb;
+                    sunVisible++;
+                }
+            }
+        }
+        vec3 worldNormal=normal.x*u.axisX.xyz+normal.y*u.axisY.xyz+normal.z*u.axisZ.xyz;
+        // The guest diffuse probe contains local irradiance, including light in enclosed rooms.
+        // Use it as a finite-length termination estimate at surfaces, weighted across path depths.
+        if(depth<3u){
+            vec3 localLight=max(textureLod(diffuseProbe,normalize(worldNormal),0.).rgb,vec3(0));
+            radiance+=throughput*localLight*(depth==0u?.72:depth==1u?.20:.08);
+        }
+#ifdef RR_GUIDES
+        if(depth==0u){
+            rrNormal=vec4(normalize(worldNormal),clamp(rough,0.,1.));
+            rrDiffuse=diffuseWeight;
+            float grazing=pow(1.-clamp(dot(normal,-direction),0.,1.),5.);
+            rrSpecular=f0+(max(vec3(1.-rough),f0)-f0)*grazing;
+            vec3 reflectedHit;
+            uint reflectedPrimitive;
+            vec2 reflectedBary;
+            if(traceScene(origin,reflect(direction,normal),nearT,5000.,reflectedHit,reflectedPrimitive,reflectedBary))
+                rrDistance=length(reflectedHit-hit);
+        }
+#endif
+        // Sample the environment directly. A second cosine-weighted sample continues to other surfaces.
+        if(depth==0u){
+            deterministic=radiance;
+            vec2 oct=worldNormal.xy/max(dot(abs(worldNormal),vec3(1)),1e-8);
+            if(worldNormal.z<0.)oct=(1.-abs(oct.yx))*mix(vec2(-1),vec2(1),greaterThanEqual(oct,vec2(0)));
+            uvec2 xy=uvec2(round(clamp(oct*.5+.5,0.,1.)*127.));
+            surfaceGuide=0x8000u|(pbr && (metal>.5 || rough<.20)?0x4000u:0u)|xy.x|(xy.y<<7u);
+        }
+        float diffuseProbability=pbr?1.-mix(.25,1.,metal):1.;
+        if(emitterCount!=0u){
+            bool lit;
+            bool continues=depth+1u<maxSurfaces;
+            vec3 specularThroughput=pbr?incoming:vec3(0);
+            radiance+=sampleEmitter(origin,normal,-direction,nearT,throughput,specularThroughput,f0,rough,diffuseProbability,continues,seed+depth*111u+101u,size,emitterCount,lit);
+            lightSamples++;
+            if(lit)visibleSamples++;
+        }
+        vec3 lightDir=depth==0u?
+            cosineDirection(normal,primaryEnvironmentSample(uint(pixel.x+size.x*pixel.y),u.frame)):
+            diffuse(normal,seed+depth*111u+53u);
+        if(!shadowed(origin,lightDir,nearT,groundShadows)){
+            vec3 worldDir=lightDir.x*u.axisX.xyz+lightDir.y*u.axisY.xyz+lightDir.z*u.axisZ.xyz;
+            radiance+=throughput*max(textureLod(environmentMap,worldDir,0.).rgb,vec3(0));
+        }
+        if(depth+1u==maxSurfaces)break;
+        vec3 outgoing=-direction;
+        previousGloss=false;
+        if(pbr){
+            float probability=mix(.25,1.,metal);
+            if(sample01(seed+depth*111u+72u)<probability){
+                vec3 weight;
+                direction=glossy(normal,-direction,rough,f0,seed+depth*111u+77u,weight);
+                if(dot(normal,direction)<=0.)break;
+                throughput=incoming*weight/probability;previousGloss=true;glossPaths++;
+            }else throughput/=1.-probability;
+        }
+        if(!previousGloss)direction=diffuse(normal,seed+depth*111u);
+        previousLobePdf=previousGloss?(1.-diffuseProbability)*glossyPdf(normal,outgoing,direction,rough):
+            diffuseProbability*max(0.,dot(normal,direction))/3.14159265;
+        if(depth>=2u){
+            float energy=max(throughput.r,max(throughput.g,throughput.b));
+            float survival=clamp(energy,.1,.9);
+            if(energy<1.e-6 || sample01(seed+depth*111u+96u)>=survival)break;
+            throughput/=survival;
+        }
+    }
+    if(any(notEqual(u.stats,uvec2(0))) && all(equal(pixel%8,ivec2(0)))){
+        Words diagnostics=Words(u.stats);
+        if(recovered && u.frame<2209u)atomicAdd(diagnostics.v[8500u+u.frame],1u);
+        if(placedShadow!=0u)atomicAdd(diagnostics.v[16376],placedShadow);
+        if(placedBounce!=0u)atomicAdd(diagnostics.v[16377],placedBounce);
+        if(terrainPbr!=0u)atomicAdd(diagnostics.v[16378],terrainPbr);
+        if(matchedPrecise)atomicAdd(diagnostics.v[16375],1u);
+        if(matchedCutout)atomicAdd(diagnostics.v[16380],1u);
+        if(lightSamples!=0u)atomicAdd(diagnostics.v[16382],lightSamples);
+        if(visibleSamples!=0u)atomicAdd(diagnostics.v[16383],visibleSamples);
+        Counts c=Counts(u.stats);atomicAdd(c.primary,1);
+        if(primaryHit)atomicAdd(c.covered,1);if(depthMatch)atomicAdd(c.matchingDepth,1);
+        atomicAdd(c.bounce,secondary);atomicAdd(c.textured,textured);atomicAdd(c.unresolved,unresolved);atomicAdd(c.drawColor,drawColor);atomicAdd(c.terrainPrimary,groundPrimary);atomicAdd(c.terrainSecondary,groundSecondary);atomicAdd(c.terrainShadow,groundShadows);atomicAdd(c.glossyPaths,glossPaths);atomicAdd(c.glossyHits,glossHits);atomicAdd(c.cutouts,alphaRejected);atomicAdd(c.directVisible,sunVisible);atomicAdd(c.directOccluded,sunOccluded);atomicAdd(c.emitterHits,emitterHits);atomicAdd(c.bounceEmitters,bounceEmitters);if(recovered)atomicAdd(c.recovered,1);atomicAdd(c.retainedPrimary,retainedPrimary);atomicAdd(c.retainedBounce,retainedBounce);atomicAdd(c.retainedShadow,propShadow);atomicAdd(c.deepHits,deepHits);atomicMax(c.maxBounce,lastBounce);atomicAdd(c.retainedPbrHits,retainedPbr);if(matchedInterval)atomicAdd(c.intervalHits,1);
+        if(texelFetch(depthMap,pixel,0).r>0.){
+            atomicAdd(c.rasterGeometry,1);
+            if(!primaryHit)atomicAdd(c.missingPrimary,1);
+            else if(!depthMatch)atomicAdd(c.primaryMismatch,1);
+        }
+    }
+    // Preserve the game's sky and effects in pixels without a captured primary surface.
+    bool written=(depthMatch || recovered) && !any(isnan(radiance));
+#ifdef RR_GUIDES
+    Words guides=Words(u.draws.rrData);
+    uint count=uint(size.x*size.y),index=uint(pixel.y*size.x+pixel.x);
+    guides.v[2u*index]=packHalf2x16(rrDiffuse.rg);
+    guides.v[2u*index+1u]=packHalf2x16(vec2(rrDiffuse.b,1));
+    guides.v[2u*(count+index)]=packHalf2x16(rrSpecular.rg);
+    guides.v[2u*(count+index)+1u]=packHalf2x16(vec2(rrSpecular.b,1));
+    guides.v[2u*(2u*count+index)]=packHalf2x16(rrNormal.xy);
+    guides.v[2u*(2u*count+index)+1u]=packHalf2x16(rrNormal.zw);
+    guides.v[6u*count+index]=floatBitsToUint(rrDistance);
+    if(hasInput(8u)){
+        uint base=7u*count+index*4u;
+        for(uint k=0u;k<4u;k++)guides.v[base+k]=primaryAudit[k];
+    }
+#endif
+    if(written)imageStore(shaded,pixel,vec4(clamp(radiance,0.,65504.),1));
+    if(any(notEqual(u.draws.primaryLight,uvec2(0)))){
+        vec3 base=written?clamp(deterministic,0.,65504.):vec3(0);
+        uint index=(u.frame&1u)*uint(size.x*size.y)+uint(pixel.y*size.x+pixel.x);
+        PrimaryLight(u.draws.primaryLight).values[index]=uvec2(packHalf2x16(base.rg),
+            packHalf2x16(vec2(base.b,0))|((written?surfaceGuide:0u)<<16u));
+    }
+}
+#endif
+
+
+#endif
+

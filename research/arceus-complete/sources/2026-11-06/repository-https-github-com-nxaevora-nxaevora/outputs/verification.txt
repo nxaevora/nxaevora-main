@@ -1,0 +1,28 @@
+Checkout: C:\Users\brett\Documents\Codex\2026-11-06\repository-https-github-com-nxaevora-nxaevora\work\repo
+Branch: fix/nvn-compute-qmd-size-limits
+Base: 59c7e1780e50c74a8f92a53dcd77d017fd00cbf6
+Changes remain uncommitted. Nothing was pushed and no PR was created.
+
+Fix: validate native compute constant-buffer sizes before packing into the 17-bit QMD field. Uniform slots 0 to 4 must fit after 256-byte rounding. Program constant buffer 1 must fit after its existing padding. Refusals leave output unchanged. Driver-only descriptors keep their 32-bit sizes.
+
+Targeted tests: regression cases fail with the original implementation. Full nvn_params passes with AddressSanitizer and UndefinedBehaviorSanitizer under Clang 23.1.5. nvn_replay and nvn_rt pass. Whitespace checks pass.
+
+Game verification, November 6, 2026:
+- Source NSPs and keys were read from the supplied D: folder and remain unchanged.
+- Merged extraction identifies update 1.1.1. Generated 45,728 jump-table hints.
+- Built the modified runtime and successfully recompiled all 191 game blocks. Output code module: 564.3 MB.
+- Machine: Windows 11, Ryzen 7 9800X3D, RTX 5090, Vulkan 1.4.357, Clang/LLVM 23.1.5.
+- Patched nvn_native=0, 60 seconds: exit 0, 1,674 frames, 0 JIT misses. Captured opening dialogue renders.
+- Patched nvn_native=1, 60 seconds: 1,706 frames, normal timed termination, no crash report. Original runner did not retain the process exit code. Capture is entirely black. Initial cold run records 15 JIT misses.
+- Original QMD implementation, same nvn_native=1 test, 60 seconds: exit 0, 1,720 frames, 0 warm-cache JIT misses. Its black capture is byte-for-byte identical to the patched capture.
+- Patched nvn_native=1, 120 seconds with continued dialogue input: exit 0, 3,516 frames, black capture, 3 JIT misses, no compute dispatch or QMD size refusal logged.
+
+Conclusion: game recompilation and bounded startup tests succeeded. The native rendering defect predates this change. The size guard is verified by targeted tests, but no in-game compute dispatch exercised it. These are introductory smoke tests, not a full gameplay or 60 FPS result. Frame counts include startup/loading and are not a steady-state performance benchmark.
+
+Compiled game: C:\Users\brett\Documents\Codex\work\arceus-games\ArceusTest\ArceusTest.exe
+Double-click Play-Arceus-Test.cmd to run the patched executable with nvn_native=0 and a visible window. It uses isolated test settings/saves. The experimental nvn_native=1 path currently gives black output.
+Private extraction, generated code, captures and logs remain under C:\Users\brett\Documents\Codex\work. Run logs: arceus-runs. No game files are in the repository or these deliverables.
+
+Build-only adjustments were confined to the separate source copy at C:\Users\brett\Documents\Codex\work\nvn-src: native Windows tools, an OpenSSL Perl path shim and generated Makefile path correction, an FFmpeg temporary prefix, and ordinary executable copies instead of hard links. MSYS shells are denied by this session's sandbox. The intended MSYS LLVM DLL is pinned beside the driver and deployed game to avoid the compiler bundle's same-named DLL producing ELF objects. These adjustments are not in the contribution patch.
+
+Further verification: once the native rendering path supports the needed scenes, compare baseline and patched runs through actual compute work, including the opening sea scene and Fieldlands. Check QMD refusal reason/slot/size, rendering, dispatch counts and frame times. The zero-JIT-miss baseline was not established in the longer scripted scene. Keep game-derived logs and captures local.

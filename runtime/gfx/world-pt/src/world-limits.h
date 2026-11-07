@@ -1,0 +1,1 @@
+#define WORLD_TEXTURE_SLOTS 192

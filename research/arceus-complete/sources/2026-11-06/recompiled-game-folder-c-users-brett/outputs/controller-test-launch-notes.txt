@@ -1,0 +1,46 @@
+ARCEUS CONTROLLER TEST LAUNCH POLICY
+2026-11-06, user preference: every launch must support the controller.
+
+Agent launches: use the desktop computer-use launch_app API with the native
+Arceus-Controller-Test.exe in this outputs folder. It starts the game directly
+in the interactive desktop session, sets the prepared120FPS environment and
+uses the current local ArceusEngineCandidate-runtime.exe. It does not invoke
+PowerShell or Command Prompt. Launch through the restricted shell previously
+failed to enumerate the user's controller; do not repeat that path.
+
+The helper itself has no window. The desktop API may report that the helper
+exposed no targetable window even though the game started. Always inspect the
+returned desktop window inventory and the new local game-err.txt before retrying.
+Do not launch twice merely because the helper has no window.
+
+Confirmed on timing-20261106-163108-125: DualSense Edge Wireless Controller,
+6 axes,17buttons; accelerometer and gyroscope enabled. Startup logs confirmed
+all timing,water,effect,event-camera,blink,camera2.2 and menu-repeat hooks active.
+The renderer stays --nvn_native=0. Background controller input is explicitly
+on so focus changes do not disable the gamepad. Existing mappings are retained.
+
+Manual testing: no timeout; save and close the game window yourself. Escape
+remains non-exiting in the existing runtime. The helper never kills a game and
+refuses to start when ArceusTest or another controller-test helper is active.
+It writes the local capture directory to current-controller-test.txt. Source
+is in work/pass6-launch/controller-launcher.c. Existing CMD test launchers also
+now pass gamepad_background=1 through Capture-Arceus-Timing.ps1; start them from
+the desktop when using a controller.
+
+This120FPS test uses saved resolution, no screen-fetch/fixed-resolution
+experiment. The completed163108 test used the pass4 candidate. Pass5/pass6 research added
+no gameplay corrections. The candidate staged AFTER that test now includes
+one sampled read-only physics postsolve serial; it built successfully but has
+not been tested in gameplay. Its camera/menu/timing/rendering behavior is unchanged. New observations or fixes
+must be prepared separately while the user tests, never hot-patched into the
+running game or used to close/restart it without the user's instruction.
+
+The native helper captures submissions and runtime logs; it does not start
+PresentMon. Submission intervals are not proof of displayed FPS. Existing
+PowerShell capture launchers retain their optional PresentMon mode.
+
+Completed test feedback: camera and menu felt good/better; visuals were good,
+below1440p, without the earlier distortion. Manual close confirmed exit0.
+Keep camera speed2.2 and menu-repeat fix enabled. The preserved tested runtime
+is work/ArceusEngineCandidate-before-pass6-runtime.exe. The regular package and
+installed game runtime were not replaced when staging the new diagnostic build.

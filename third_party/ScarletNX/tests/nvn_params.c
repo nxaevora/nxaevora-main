@@ -1132,6 +1132,50 @@ static void test_vertex_attrib_state(void) {
     CHECK(nvn_vertex_attrib_state_set_stream_index(0xFFFFFFFFu, 0) == 0xFFFFFFE0u);
     CHECK(nvn_vertex_attrib_state_set_stream_index(0, 0x100) == 0x100u);          /* not masked: spills into stride */
     CHECK(nvn_vertex_attrib_state_set_stream_index(0x20u, 0) == 0x20u);           /* bit 5 kept */
+
+    uint32_t format = 0;
+    uint64_t offset = 0;
+    uint32_t word = nvn_vertex_attrib_state_set_stream_index(nvn_vertex_attrib_state_set_format(0, 0x22, 0xC), 7);
+    nvn_vertex_attrib_state_get_format(word, &format, &offset);
+    CHECK(format == 0x22u && offset == 0xCu && nvn_vertex_attrib_state_get_stream_index(word) == 7u);
+    nvn_vertex_attrib_state_get_format(0xFFFFFFFFu, &format, &offset);
+    CHECK(format == 0x3FFu && offset == 0x3FFFu);                                /* bit 31 and bits 0-6 not read */
+    CHECK(nvn_vertex_attrib_state_get_stream_index(0xFFFFFFFFu) == 0x1Fu);         /* bit 5 not read */
+}
+
+static void test_xfb_words(void) {
+    uint32_t out[NVN_XFB_WORDS_MAX];
+    CHECK(nvn_bind_xfb_words(2, 0x123456780ull, 0x100u, out) == 5u);
+    CHECK(out[0] == 0x200400F0u && out[1] == 1u && out[2] == 1u && out[3] == 0x23456780u && out[4] == 0x100u);
+    CHECK(nvn_bind_xfb_words(3, 0, 0x100u, out) == 1u && out[0] == 0x800000F8u); /* a null buffer: inline 0 */
+    CHECK(nvn_bind_xfb_words(0, 0x10ull, 0, out) == 5u && out[0] == 0x200400E0u);
+    CHECK(nvn_bind_xfb_words(NVN_XFB_BUFFER_COUNT, 0x10ull, 4u, out) == 0u);
+
+    CHECK(nvn_xfb_words(NVN_XFB_BEGIN, 0x1234567800ull, out) == 3u);
+    CHECK(out[0] == 0xA0020E00u && out[1] == 0x12u && out[2] == 0x34567800u);
+
+    static const uint32_t query[4] = {0x1D005002u, 0x1D005022u, 0x1D005042u, 0x1D005062u};
+    CHECK(nvn_xfb_words(NVN_XFB_END, 0x1FFFFFFF8ull, out) == 21u);
+    CHECK(out[0] == 0x800001D1u);
+    for (uint32_t i = 0; i < 4; i++) {
+        const uint32_t* r = out + 1 + 5 * i;
+        uint64_t at = 0x1FFFFFFF8ull + 4u * (i + 1u);
+        CHECK(r[0] == 0x200406C0u && r[1] == (uint32_t)(at >> 32) && r[2] == (uint32_t)at);
+        CHECK(r[3] == 0u && r[4] == query[i]);
+    }
+    CHECK(out[7] == 2u && out[8] == 0u); /* buffer 1 at 0x200000000: the high word carries */
+    CHECK(nvn_xfb_words(NVN_XFB_KIND_COUNT, 0, out) == 0u);
+}
+
+static void test_reset_counter_word(void) {
+    uint32_t word = 0;
+    CHECK(nvn_reset_counter_word(0, &word) && word == 0x01u);
+    CHECK(nvn_reset_counter_word(2, &word) && word == 0x12u);
+    CHECK(nvn_reset_counter_word(13, &word) && word == 0x1Fu);
+    CHECK(nvn_reset_counter_word(16, &word) && word == 0x01u); /* the timestamp type */
+    word = 77;
+    CHECK(!nvn_reset_counter_word(17, &word) && word == 77u);
+    CHECK(!nvn_reset_counter_word(0xFFFFFFFFu, &word) && word == 77u);
 }
 
 static void test_depth_range_methods(void) {
@@ -1219,6 +1263,11 @@ static void test_raster_methods(void) {
     CHECK(count == 2u);
     CHECK(out[0].method == 0x4ECu && out[0].value == 0x40000000u);
     CHECK(out[1].method == 0x4EDu && out[1].value == 0x40000000u);
+
+    CHECK(nvn_raster_methods(NVN_RASTER_POINT_SIZE, (const uint32_t[3]){0x40800000u, 0u, 0u}, out, &count));
+    CHECK(count == 2u);
+    CHECK(out[0].method == 0x546u && out[0].value == 0x40800000u); /* the float as given */
+    CHECK(out[1].method == 0x68Bu && out[1].value == 0u);
 
     count = 77;
     CHECK(!nvn_raster_methods(NVN_RASTER_KIND_COUNT, (const uint32_t[3]){0u, 0u, 0u}, out, &count));
@@ -2281,6 +2330,51 @@ static void test_compute_qmd_build(void) {
     CHECK(qmd[0x14] == 0x3u);
 }
 
+static void test_compute_qmd_size_limits(void) {
+    NvnProgramComputeIn prog = {0};
+    NvnComputeBinds binds = {0};
+    uint32_t qmd[NVN_COMPUTE_QMD_WORDS], detail;
+    const uint64_t refused[] = {0x1FF01u, 0x20000u, 0xFFFFFF01u, UINT32_MAX};
+    CHECK(strcmp(nvn_compute_qmd_reason_name(NVN_QMD_UNIFORM_QBUF_SIZE),
+                 "rounded uniform size above its QMD field") == 0);
+    /* QMD sizes occupy bits 31:15. Uniform sizes round up to 256 bytes before packing. */
+    for (uint32_t slot = 0; slot < NVN_COMPUTE_UNIFORM_QBUF_SLOTS; slot++) {
+        binds.uniform[slot] = (NvnComputeBindEntry){0x400003000ull, 0x1FE01u, 1};
+        CHECK(nvn_compute_qmd_build(&prog, 1, 1, 1, &binds, qmd));
+        CHECK((qmd[0x1E + 2u * (slot + 3u)] >> 15) == 0x1FF00u);
+        CHECK(qmd[0x14] == (1u | (1u << (slot + 3u))));
+        binds.uniform[slot].size = 0x1FF00u;
+        CHECK(nvn_compute_qmd_build(&prog, 1, 1, 1, &binds, qmd));
+        CHECK((qmd[0x1E + 2u * (slot + 3u)] >> 15) == 0x1FF00u);
+        for (uint32_t i = 0; i < sizeof refused / sizeof refused[0]; i++) {
+            binds.uniform[slot].size = refused[i];
+            CHECK(nvn_compute_qmd_check(&prog, 1, 1, 1, &binds, &detail) == NVN_QMD_UNIFORM_QBUF_SIZE);
+            CHECK(detail == slot);
+            bind_sentinel(qmd, NVN_COMPUTE_QMD_WORDS);
+            CHECK(!nvn_compute_qmd_build(&prog, 1, 1, 1, &binds, qmd));
+            check_bind_sentinel(qmd, NVN_COMPUTE_QMD_WORDS);
+        }
+        binds.uniform[slot].bound = 0;
+        CHECK(nvn_compute_qmd_build(&prog, 1, 1, 1, &binds, qmd) && qmd[0x14] == 1u);
+    }
+    /* Driver-only slots keep the full 32-bit size, without a QMD enable bit. */
+    uint32_t words[NVN_COMPUTE_CBUF0_WORDS];
+    for (uint32_t slot = NVN_COMPUTE_UNIFORM_QBUF_SLOTS; slot < NVN_COMPUTE_DESCRIPTOR_SLOTS; slot++) {
+        binds.uniform[slot] = (NvnComputeBindEntry){0x400003000ull, UINT32_MAX, 1};
+        CHECK(nvn_compute_qmd_build(&prog, 1, 1, 1, &binds, qmd) && qmd[0x14] == 1u);
+        CHECK(nvn_compute_cbuf0_build(binds.uniform, binds.storage, words));
+        CHECK(words[NVN_COMPUTE_CBUF0_UNIFORM_OFFSET / 4u + slot * 4u + 2u] == UINT32_MAX);
+    }
+    prog.h6fc = 0x1FF00u;
+    CHECK(nvn_compute_qmd_build(&prog, 1, 1, 1, &binds, qmd));
+    CHECK((qmd[0x20] >> 15) == 0x1FFFFu);
+    prog.h6fc++;
+    CHECK(nvn_compute_qmd_check(&prog, 1, 1, 1, &binds, &detail) == NVN_QMD_CBUF1_SIZE && detail == 0);
+    bind_sentinel(qmd, NVN_COMPUTE_QMD_WORDS);
+    CHECK(!nvn_compute_qmd_build(&prog, 1, 1, 1, &binds, qmd));
+    check_bind_sentinel(qmd, NVN_COMPUTE_QMD_WORDS);
+}
+
 static void test_compute_cbuf0_build(void) {
     NvnComputeBindEntry uniform[NVN_COMPUTE_UNIFORM_SLOTS] = {0};
     NvnComputeBindEntry storage[NVN_COMPUTE_STORAGE_SLOTS] = {0};
@@ -2327,6 +2421,7 @@ static void test_program_compute_round_trip(void) {
 }
 
 int main(int argc, char** argv) {
+    test_compute_qmd_size_limits();
     test_window_params();
     test_window_sync_cycle_params();
     test_sync_wait_limit();
@@ -2378,6 +2473,8 @@ int main(int argc, char** argv) {
     test_state_getters();
     test_state_getters_extra();
     test_vertex_attrib_state();
+    test_reset_counter_word();
+    test_xfb_words();
     test_depth_range_methods();
     test_stencil_op_and_polygon_offset();
     test_raster_methods();

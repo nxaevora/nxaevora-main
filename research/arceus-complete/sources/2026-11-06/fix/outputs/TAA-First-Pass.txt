@@ -1,0 +1,7 @@
+Historical prototype record. The current playable builds and GPU results are described in Temporal-Test-Results.txt.
+
+Native-resolution TAA: first pass
+Status: ongoing. Prototype only; no change to the playable runtime.
+Two real 2560x1440 captures validated camera reprojection using the captured inverse view-projection and reverse depth. On depth-matched samples mean RGB disagreement fell from 26.9 to 0.95 levels in one direction, and 36.0 to 0.78 in reverse. This validates static geometry, not animated motion or consecutive-frame quality.
+The native Vulkan resolve in fix/work/taa/resolve.comp was compiled and exercised on an RTX 5090. Fixture passed history accumulation, depth and reactive rejection, object velocity, out-of-view and invalid-motion handling, clamping, and reset.
+Next: capture consecutive pre-HUD scene frames, bind depth and motion or rejection for dynamic content, wire projection jitter and ping-pong history, clear on cuts/resizes, compare motion sequences with TAA off/on and check UI and frame time. The final guest color already includes HUD and is not a suitable input.

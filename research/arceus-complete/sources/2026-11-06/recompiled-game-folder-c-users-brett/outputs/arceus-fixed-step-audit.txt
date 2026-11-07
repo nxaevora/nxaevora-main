@@ -1,0 +1,339 @@
+Arceus 1.1.1 timing investigation - 2026-11-06
+
+All addresses are offsets relative to main, not absolute process addresses.
+Local static investigation plus review of the existing test log. No runtime
+source, executable, game content, or save was changed during this pass.
+
+RESULT
+
+The original 40 sites are not 40 independent animation clocks. They include
+live timers, movement calculations, unit conversions, and initialization defaults.
+The expanded scan found 47 positive and 11 negative float 1/30 constructions:
+58 sites altogether. It also found nine +/-1/60 or +1/120 constructions and
+the existing 33,333,334-nanosecond clock default.
+
+Most actionable new finding: an unpatched copy of the blink countdown inside
+main+1AAF0B4. It directly decrements the same +68C counter as the two previously
+patched base functions. NPC/common character animation tables contain this
+function. It bypasses the patched base functions. This is a strong explanation
+for the failed blink test, pending a live callback measurement.
+
+Controller camera acceleration and angular integration are separate. The last
+candidate changes the response ramp at 193C04C. Sustained rotation is calculated
+elsewhere, including 193D16C, where configuration/input values are multiplied
+and added to the angle on each update. Changing only acceleration cannot correct
+per-update turning distance.
+
+AI navigation and rigid-body physics each have a conditional override that
+replaces supplied elapsed time with 1/30. Their constructors initialize the
+examined mode flags to the fixed-step setting. Live mode and call cadence remain
+to be measured; neither is yet proven to be causing the thrown-ball problem.
+
+Dialogue skipping remains unresolved. The latest field-message probe logged its
+installation but no callbacks. It has not established the active conversation
+path. Correct text appearance and correct minimum advance delay are separate.
+
+EVIDENCE LABELS
+
+Confirmed operation/subsystem does not mean confirmed once-per-render cadence.
+A static fixed constant is not by itself proof of a high-FPS bug.
+Likely feature interpretations and unresolved details are explicitly marked.
+Several nominal frame/second conversions should retain their original units.
+
+ORIGINAL 40 POSITIVE 1/30 SITES
+
+01. main+8EEDB4 | owner 8EED5C
+    Camera-related transition command: integer duration at +94 converted to
+    seconds, passed to 191CDEC to initialize interpolation state. Likely FOV
+    easing; precise feature label provisional. Confirmed conversion, not tick.
+
+02. main+13B339C | owner 13B32FC
+    Credits/staff-roll timer: +48C += 1/30 while not paused.
+    Local names: appli_staffroll, pause, skip. Owner and operation confirmed.
+
+03. main+167FF0C | owner 167F988
+    Event-script-related object/character coordination: capped timer +190.
+    Compares positions of two objects and a distance threshold. Caller C92C50
+    is in the event update chain. Exact user-visible behavior unresolved.
+
+04. main+16832C0 | owner 168300C
+    Same coordination chain: timer +1A0 += 1/30, with a two-second check.
+
+05. main+16832E4 | owner 168300C
+    Same chain: timer +198 += 1/30, toward a six-second threshold.
+
+06. main+16836D0 | owner 1683528
+    Same chain: timer +19C += 1/30 during state progression. Called from
+    168300C, reached via 168790C from 167F988. These four sites are related
+    state logic. Exact interaction still needs tracing.
+
+07. main+17177B4 | owner 1717594
+    Shared character orientation helper. Normalizes quaternion/vector data;
+    computes object+270 * (1/30) / incoming S0. Confirmed nominal-step ratio,
+    not a plain elapsed timer. Inspect denominator and caller before editing.
+
+08. main+1728054 | owner 1727DF4
+    Companion orientation helper used by player/Pokemon controllers.
+    Computes object+268 * (1/30) / incoming timestep; another branch calls
+    1717594. Treat these conversions as a coordinated system.
+
+09. main+191D2B8 | owner 191CE24
+    Camera-related transition setup: seconds divided by 1/30, then converted
+    to integer frames (FDIV, FCVTZS). Changing just this constant changes
+    the requested duration. Exact camera effect remains provisional.
+
+10. main+1982930 | owner 1982408
+    Shared character movement/collision path reused by player, NPC, Pokemon.
+    Velocity -> displacement using 1/30; nearby inverse conversion uses
+    approximately 30. Review the pair together.
+
+11. main+1983760 | owner 1983760
+    Four-instruction nominal timestep getter returning 1/30. Consumers include
+    Pokemon/ride functions 2527E8C, 252B124, 252D448, 25A8A84. Cadence unresolved.
+
+12. main+198E020 | owner 198D7E4
+    Shared character acceleration/velocity update: vector * 1/30 added to
+    velocity, with speed clamping and associated-object rate handling.
+    Companion negative-step branch appears in the expanded list.
+
+13. main+198EC6C | owner 198EB04
+    Character collision prediction: another object's motion vector * 1/30 *
+    object rate * 1.5 added to position, then collision queried.
+    This is a prediction horizon, not a plain animation timer.
+
+14. main+1A0BAF0 | owner 1A08560
+    PlayerControllerComponent scalar acceleration/rate update, limited by
+    configured maximum. Part of player movement/turning logic.
+
+15. main+1A0BEE4 | owner 1A08560
+    Same player update: acceleration vector * 1/30 added to velocity,
+    followed by maximum-speed clamping.
+
+16. main+1A0DA20 | owner 1A0D9DC
+    Player movement helper: clamps a supplied vector, scales by 1/30, then
+    submits a collision-aware move. Exact action name unresolved.
+
+17. main+1A0EEA0 | owner 1A0E0EC
+    Player movement: vector * 1/30 and associated-object rate from 198E188.
+    Confirmed motion integration; precise action/state unresolved.
+
+18. main+1A0F304 | owner 1A0F278
+19. main+1A0F498 | owner 1A0F278
+20. main+1A0F55C | owner 1A0F278
+    Three branches of one player method, passing nominal or object-scaled
+    1/30 to shared motion helper 1713904. Not three separate features.
+
+21. main+1A17B10 | owner 1A173B0
+    Player motion: velocity * 1/30 added to a position/vector accumulator.
+
+22. main+1A17F3C | owner 1A173B0
+    Player physics branch: acceleration/gravity and displacement integration,
+    with slope/normal handling. Constant participates in both stages.
+
+23. main+1A19104 | owner 1A173B0
+    Player orientation/motion: passes 1/30 to 1727DF4, applies result through
+    1983770. Related to item 08.
+
+24. main+1A196C4 | owner 1A19654
+    Alternate helper called by the preceding player update. Also passes
+    1/30 to 1727DF4 and applies the result. Review with items 08 and 23.
+
+25. main+1B48A48 | owner 1B47D10 | accumulation +254
+26. main+1B48A94 | owner 1B47D10 | accumulation +24C
+27. main+1B49004 | owner 1B47D10 | another branch for +24C
+28. main+1B493F4 | owner 1B47D10 | accumulation +250
+    Weather-dependent character/material blending. Uses kWeatherScale,
+    configured rate * 1/30, 0..1 clamping, and related visual-component update.
+    Likely wet/snow/other weather appearance, but exact channel names unproven.
+    Three matching fade-out constants were absent from the original list.
+
+29. main+1D1B7CC | owner 1D1B454
+    Player-state movement/collision prediction: position + vector * 1/30.
+    Constructor 1D1AE28 belongs to the player-state family and is created
+    by 1D22400. Exact state unresolved. NOT established as thrown-ball code.
+
+30. main+1D5D684 | owner 1D5D59C
+    Supplies 1/30 to world-time update 24AC8C4 when a pause/gating pointer is
+    absent. Callee advances a double clock through 24 segments of 60 units,
+    wraps at 1440, and updates time-dependent state. Strong evidence for
+    day/night time. Actual speed against wall time remains unmeasured.
+
+31. main+257AC30 | owner 257ABB4
+    Pokemon/ride motion: 1/30 * controller/object rates, then helper 1713904.
+    Related to player items 18-20.
+
+32. main+257C9F4 | owner 257AF70
+    Pokemon/ride scalar acceleration, limited by configured speed.
+
+33. main+257CE38 | owner 257AF70
+    Pokemon/ride vector acceleration, followed by speed clamping.
+    Multiple controller vtables reuse items 31-33, including ride variants.
+
+34. main+2795230 | owner 2795204
+    AI navigation timestep: uses 1/30 if object+150 is zero, incoming seconds
+    otherwise. Caller 279A6D0 already reads clock channel 1 and converts
+    nanoseconds to seconds. Selected dt reaches 3119908, identified by
+    hkaiWorld::stepWorld and navigator task names. Constructor 2799368
+    initializes +150 to zero. Live mode/cadence measurement is high priority.
+
+35. main+29FAF8C | owner 29FA554
+    WaterCurrentTime shader clock. Original adds 1/30 each update.
+    Already corrected to elapsed time; user confirmed water speed is right.
+
+36. main+2AF25F4 | owner 2AF25B4
+    Rigid-body physics timestep: 1/30 if object+121 is zero, incoming elapsed
+    time otherwise. Multiplies by rate +124 and feeds Havok collision/solve
+    at 2F39630/2F3B120. Constructor clears +120/+121. Separate from item 34.
+    Could affect ball physics, but that causal connection is not yet measured.
+
+37. main+2F3E8C4 | owner 2F3E870
+    Havok settings initialization during hknpWorld construction. Stores
+    defaults including 1/30 and 1/120. Not a per-render timer increment.
+
+38. main+3002A04 | owner 30026F4
+    Havok particle/collider initialization during world construction.
+    Stores default step in a new object. Local names include
+    hkParticleMeshClosest/hknpParticleHeightFieldClosest. Not itself a live tick.
+
+39. main+301439C | owner 301437C
+    Default construction of hknpStepCollideTrace records. Exact name from
+    reflection metadata. Writes 1/30 into new records, not physics execution.
+
+40. main+3014D24 | owner 3014D04
+    Default construction of hknpStepAllParticlesCollidersTrace records.
+    Same distinction as item 39.
+
+SEVEN MORE POSITIVE 1/30 CONSTRUCTIONS
+
+Original search matched W-register MOV/MOVK. These use X-register builds,
+often packing the float and a neighboring setting into the same store.
+
+main+1C5D388: Player setup; component+B4 default 1/30 next to 40.0.
+             Exact component purpose unresolved; initialization confirmed.
+main+2AEFB24: Havok world configuration initialization; packed step/flag.
+main+2F3EC14: Havok settings construction; timestep +18, solver settings derived.
+main+2FE965C: Havok world configuration defaults; timestep +11C.
+main+3015268: hknpWorldCinfo reflection/default array construction.
+main+3018B90: hknpRefWorldCinfo reflection/default array construction.
+main+301E51C: Havok world configuration construction, timestep +13C.
+             Related WorldCinfo layout; exact class label unresolved.
+
+ELEVEN NEGATIVE 1/30 CONSTRUCTIONS
+
+main+AFBBC4: Script-driven character motion; downward acceleration term
+            added to movement vector before controller submission.
+main+1984A70: Shared character motion; vertical acceleration term modifies +6B0.
+main+198DA8C: Shared acceleration/gravity function 198D7E4; companion to 198E020.
+main+1A0B3AC: Negative-step branch in player update 1A08560.
+main+1A158C8: Player vertical acceleration before movement submission.
+main+1AAB5A4: Countdown at +50 decreases by 1/30 until expiration.
+main+1AAB5D4: Companion countdown at +54 in 1AAB534. Exact behavior unresolved;
+             caller 1A586C8. These are genuine decrementing timers.
+main+1B47F5C: Weather/material +24C fades down by configured rate * 1/30.
+main+1B47F94: Matching fade-down at +250.
+main+1B47FCC: Matching fade-down at +254.
+main+25AC3D8: Pokemon/ride vertical acceleration/gravity, then damping/limiting.
+
+OTHER FIXED RATES
+
+main+1AAF478 (+1/60): Character animation transition duration. Interpolates
+  integer parameters using an angle, then converts nominal 60-Hz frame units
+  to seconds. Unit conversion, not elapsed advance.
+main+1B0385C (+1/60): Pokemon animation parameter frames-to-seconds conversion.
+main+1D4892C (+1/120): Object transform/motion timer +328 increment.
+main+1D49838 (+1/60): Companion transform/motion timer +328 increment.
+  Both reached from 1D48268; precise gameplay use remains unresolved.
+main+1E1B278 (+1/120): Environment/cave-light transition initializes normalized
+  blend increment, then adds it on subsequent updates. Named setting:
+  cave_light_change_easing. Candidate for an intended 120-update transition
+  becoming shorter when called more frequently.
+main+2F3E928 (+1/120): Havok initialization default, alongside original item 37.
+main+2FECDC8 (+1/60): Havok character support query, named checkSupport.
+  Requires physics-context review; not established as an animation clock.
+main+31909EC (+1/60) and main+3190A04 (-1/60): Two signs in helper 3190788.
+  Exact role unresolved; do not infer elapsed timer merely from these values.
+main+277BDDC: 33,333,334-nanosecond default in clock initialization 277BD74.
+  The runtime already changes verified main-loop duration submissions.
+  Defaults and downstream consumers are separate issues.
+
+FRAME COUNTERS / PER-UPDATE LOGIC
+
+Blink:
+  Existing hooks: 194F110 and 194F20C.
+  Newly found copy: 1AAF0B4. Load at 1AAF120, subtract one at 1AAF12C, store at
+  1AAF130. Same +688/+689/+690 flags and +68C countdown. Same virtual
+  state/start/reset/interval methods at +358/+360/+368/+370.
+  NPC table 4146210/common animation table 4143700 reference this copy at +90.
+  It does not call the patched base countdown. Next correction must cover
+  this copy while preserving the rest of the face/animation update.
+
+Controller camera:
+  193C04C handles acceleration/deceleration and is experimentally scaled.
+  193D16C separately integrates angular changes; arithmetic includes
+  193D28C through 193D314. 193C2C4 supplies configuration, not elapsed time.
+  1934ACC has additional input/turn/blend paths.
+  193633C increments +414 during reset/turn handling and consults
+  reset_turn_keep_update_target. Sensitivity, response ramp, turn distance,
+  and reset interpolation need consistent time units.
+
+Capture/ball sequence:
+  180C338 uses kBallOpenEffectFrame, kFailureWait, kMoveToGroundFrame,
+  kPokeCaptureFrame, and kSuccessWait. +1DC counts down by one in several
+  phases, including 180C954 and 180D05C. Remaining count also drives movement
+  interpolation. Concrete frame-counted capture/effect sequence to measure.
+  +F0 increments in the same function are state transitions, NOT timers.
+
+Script waits / dialogue:
+  WaitFrame node B35AE0 subtracts 1059A78's returned integer from +13C.
+  That getter reads object+88. Its producer/cadence still needs tracing.
+  AfterWaitFrame, OverrideAfterWaitFrame and EndWaitFrame exist, but are not
+  established as the NPC A/B advance guard.
+  InputSkip handlers include 1078BC4/107962C and 131C1B4/131C600/131E494.
+  These include UI event dispatch/button handling, not a proven delay fix.
+  The active field conversation path remains unresolved.
+
+Other candidates:
+  1458300: demo/movie skip transition, counter +3BC, skip_fade_frame setting.
+  Separate from the already corrected realtime event camera.
+  9BB904: battle idle-animation wait setup reads Trainer_IdleAnimationMin/
+  MaxWaitFrames and IdleAnimationMinWaitFrames, chooses a wait stored at +238.
+  Consumption/cadence not yet verified.
+
+LATEST TEST EVIDENCE / NEXT WORK
+
+Reviewed timing-20261106-050229-404/game-err.txt; it ends with Exit.
+Camera-input hook executed thousands of times. Blink logging shows its first
+four base-hook calls, but is sparse, so this does not imply exactly four calls.
+The field-message probe has installation output and no callback output.
+The new static findings have not yet been gameplay-tested.
+
+Retain user-confirmed corrections: water, realtime cutscene camera, Pokemon
+release-effect playback. Dialogue typing was reported correct at both 30/60.
+Still reported: rapid dialogue advance, blinking frequency, controller turning.
+Earlier fast thrown-ball flight still requires a targeted retest.
+
+Recommended order:
+1. Cover the inlined blink copy; separately correct camera angular integration.
+2. Trace active dialogue advance guard and the integer script-frame producer.
+3. Measure selected dt, mode flag, and calls/second for AI and rigid-body physics;
+   then test thrown-ball flight and the capture sequence countdown.
+4. Compare world time, weather fades, cave lighting, scripted object motion,
+   credits, idle waits and skip fades at 30/60/120 using the same saved scene.
+
+Compare elapsed wall time and state progression, not only target FPS.
+A 120 FPS target does not prove 120 presented frames per second.
+Future runs should preserve working Vulkan, controller, save and manual closing.
+
+SCOPE / LIMITS
+
+Indexed 161,057 main-text function ranges using local recompiler metadata.
+Inspected ARM64 instructions, direct callers, vtables, names, reflection metadata
+and the local test log. Expanded searches include W/X constant construction,
+short nonadjacent builds, literal/ADRP-load candidates, signed rates and simple
+object counters. Generic counter patterns are candidates, not thousands of bugs:
+many represent reference counts, collection lengths or state transitions.
+
+This is not proof every frame-dependent path has been found. Asset-authored
+durations, arbitrary smoothing coefficients, inlining, indirect calls, scripts,
+optimized integer division and scheduling can hide more dependencies.
+Unresolved labels above are intentional. No new run or blanket replacement.

@@ -1,0 +1,96 @@
+Menu/camera/1440p candidate — 2026-11-06
+
+Camera preset increased from 2.0 to 2.2 (+10%). In-game sensitivity remains active.
+Confirmed three-entry blink implementation unchanged.
+
+Menu repeat: main+C9A9B4 decrements +18 each update; +10/+14 supply initial wait
+and repeat interval. The wrapper collects fresh input every rendered frame but
+paces the countdown at 30 Hz. Fresh presses (+A8), releases and analog sticks
+remain untouched; repeat bits (+B8) are cleared on intervening frames. No burst
+of catch-up repeats after a stall. Live observed initial=10, interval=3, meaning
+nominal 333ms initial wait and 100ms repeat intervals. Hook installed and executed.
+Controller scrolling behavior is still awaiting user confirmation.
+
+1440p image quality NOT verified. The user reports that the test looks lower
+resolution than before. Run timing-20261106-125049-644 established only that
+1920x1080 guest targets became 2560x1440 Vulkan images at 4/3 scale, and that the
+output swapchain was 2560x1440. Allocation dimensions and a non-black screenshot
+were insufficient evidence of actual scene detail. The earlier success claim is
+withdrawn. Saved resolution has been restored to 1 in ArceusTest.ini. Previous
+settings backed up locally in work/ArceusTest-before-1440p.ini. No game assets or
+saves edited.
+
+Test-Arceus-1440p-120FPS.cmd and its 60FPS alternative remain experimental. They
+start fullscreen with a one-run 4/3 override and resolution tracing. Responsive
+launchers inherit the restored saved resolution=1 and start windowed; F11 toggles
+fullscreen. Test-Arceus-Resolution-Baseline-120FPS.cmd uses fullscreen, scale 1,
+and the same timing/controller settings for comparison after manual closure.
+Close manually after saving; Escape does not quit.
+
+Runtime SHA256 (with opt-in resolution diagnostics and fixed scene candidate):
+69B7C027FAFC35C2AF8270CDCBF01B666E8931CF0C81E39F170193A19F64DDAF
+Previous executable: work/Arceus-before-menu-1440-v4.exe.
+Build passed, binary/function guards passed, countdown model matched 30/60/120
+with short taps preserved, and float scale dimensions verified. A launcher switch
+conversion error caught during initial launch was corrected. Subsequent live
+launch succeeded. The agent did not close the game or send gameplay input.
+
+Resolution investigation, timing-20261106-125820-850:
+- SNX_RESOLUTION_TRACE logs distinct viewport/scissor/target configurations and
+  sampled texture dimensions (up to 512 configurations), plus presentation size
+  changes. It does not change the rendering or shaders. Disabled by default.
+- Early presentation: guest 1920x1080, image and crop 2560x1440, cpu_fallback=0.
+- Some passes use 2304x1224 viewports within those full-size images. Half-size
+  passes use 1152x612. These early/title observations do not establish gameplay
+  resolution or identify which pass caused the user's complaint.
+- Final presentation crop and standard viewport/scissor scaling appear correct
+  in the code and early logs. This does not prove all intermediate passes work.
+- Local cached shader inspection confirms integer texture fetches in several
+  lighting/postprocess shaders. The translator maps integer guest coordinates
+  to scaled texels after quantization. This may discard subpixel detail; it is
+  a hypothesis requiring pass-specific analysis, not a confirmed cause.
+- The trace run was opened for the user to load their save and inspect the same
+  area. No automated game input, closure, or save modification was performed.
+- Next comparison: inspect gameplay trace at 4/3, then a matching scale-1 run.
+  Keep the saved default at 1 until improved detail is actually demonstrated.
+
+Follow-up after user clarified that only the 3D world was blurry:
+- The completed diagnostic run includes actual geometry at 1280x720, 2176x1152,
+  2304x1224 and 2560x1440, all inside 2560x1440 allocated targets. For example,
+  draw id=97, present=168853, count=262653, colors=5, depth=1 is 1280x720.
+  This establishes a real resolution reduction, but not its duration or whether
+  that particular frame was the user's blurry gameplay view.
+- Local disassembly identified the automatic resolution governor at main+CC35A4,
+  size 2C8, and its separate mode setter at main+CC3888. The governor averages two
+  GPU-duration samples, divides by a 33.333ms budget, and uses 0.80/0.95 thresholds.
+  Authored automatic scales: (0.90,0.85), (0.85,0.80), (0.80,0.70).
+- The mode setter begins normal mode at (1,1); it also has explicit fixed, custom,
+  tiny and half-size modes. Thus the 720p frame could be the explicit half-size
+  mode rather than an automatic drop. Do not claim that the governor explains
+  every lower-resolution frame.
+- New SNX_ARCEUS_FIXED_RESOLUTION=1 candidate patches only main+CC35C4:
+  51000509 (SUB W9,W8,#1) -> 52800069 (MOV W9,#3). The existing CMP #2 / B.HI
+  goes to the ordinary epilogue before governor state writes. Full function,
+  build-ID, head, comparison, branch and RET guards precede invalidation/JIT.
+  The mode setter and shader translation are unchanged. Explicit game modes
+  can still lower resolution when requested by the game.
+- Test-Arceus-Fixed-Resolution-1440p-120FPS.cmd and the 60FPS alternative enable
+  this candidate. The old 1440p launchers keep the governor for comparison.
+- Build and branch/epilogue checks passed. New run timing-20261106-132828-807
+  reports successful installation. Early title-screen full-size passes stay
+  at 2560x1440 (the prior run dropped them to 2304x1224 by present 3).
+  Gameplay image quality and performance are still awaiting confirmation.
+- The prior run ended with exit 0 and one partial final CSV row. The summarizer
+  now reports/skips an incomplete final row while rejecting incomplete interior
+  rows or backwards timing. Regression checks passed and its summary regenerated.
+- Cached SPIR-V inspection confirmed that the lighting shaders' central G-buffer
+  fetch coordinates come from truncated FragCoord / scale, then get rescaled.
+  This loses subpixel sampling detail at scales above 1. Shader changes remain
+  a separate investigation so this test isolates the resolution governor.
+
+Offline follow-up:
+- A separate, disabled-by-default shader candidate and 60/120 FPS comparison
+  launchers are now prepared. The regular package is preserved.
+- See arceus-engine-offline-research.txt for the coordinate defect, shader checks,
+  new observation probes, exact build hashes, and the next comparison steps.
+- No visual confirmation or sustained-1440p performance claim has been added.

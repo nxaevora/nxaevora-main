@@ -1,0 +1,10 @@
+Blink/camera candidate v2
+
+Added main+1aaf0b4: inlined blink countdown previously outside the two base wrappers. All three small blink state machines now use shared elapsed-time 30 Hz ticks.
+Added main+193c2c4: scale the manual-camera settings rate returned in S0 by elapsed time / authored 30 Hz interval. Its two manual rotation callers previously integrated at render frequency despite the acceleration correction.
+Existing fractional acceleration/deceleration correction retained.
+
+Build passed. Function metadata, original instruction guards, replacement branch destinations, blink tick conservation, camera response and constant angular travel checks passed. These are static/model checks; live installation and visual behavior require the next game test.
+
+Double-click Test-Arceus-Blink-Camera-120FPS.cmd (or the 60FPS version). Test idle blinking, small and full right-stick turns, and releasing the stick. Save in-game and close the window yourself. Vulkan, existing save/controller setup, unlimited duration and Escape-does-not-quit remain enabled.
+Previous executable backed up locally as work/Arceus-before-blink-camera-v2.exe.

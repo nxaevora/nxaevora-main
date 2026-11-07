@@ -1,0 +1,269 @@
+Arceus 1.1.1 pass 6: narrow Turn/TurnKey elapsed-time design
+2026-11-06. Offline research only. Main-relative hexadecimal addresses unless
+explicitly prefixed sdk+. Add 0x8005000 for original main virtual addresses.
+No game process, package, runtime, save, asset, or Vulkan setting was changed.
+
+Outcome
+The two actions require one consistent progress value for angular motion and
+completion. Their authored angle is retained in degrees, so a local correction
+can derive fractional angular advances without guessing a quaternion logarithm.
+However, the existing orientation helper has a concrete small-angle precision
+limit: a simple fractional step from the stored current orientation can stall.
+Retaining a local angular quantization residual resolves that controlled example
+while preserving an injected external orientation change. This is a design and
+isolated guest arithmetic result, not a tested live-game patch.
+
+Action identity, configuration, and units
+TurnKey name function B331E8 is bound at vtable40DFD58. Its configuration reader
+B32728 uses TurnFramesKey and TurnAngleKey. The key handles are stored at action
++130 (B3279C) and +138 (B32800). Entry B32814 resolves the frame key via A89B7C
+at B32A60, stores signed integer frames N at +140 (B32A68), resolves angle via
+A872B0 at B32A74, and stores float angle A at +148 (B32B0C).
+
+Turn name function B33E88 is bound at vtable40DFE18. Configuration reader B33220
+uses TurnFrames and TurnAngle, loading integer via A6909C at B33290 and storing
++130 at B33294, then float via A6911C at B332F4 and storing +138 at B332F8.
+Entry B3330C reads those already stored fields when constructing its step.
+
+Original step generation:
+  TurnKey duration+140, elapsed+144, angle+148, step quaternion+150.
+  Turn    duration+130, elapsed+134, angle+138, step quaternion+140.
+  theta_per_authored_frame = -(A * FloatPi / FloatDegree180) / signed(N).
+  q_step = [0, sin(theta/2), 0, cos(theta/2)], within original polynomial error.
+The minus sign is FNMUL at B32AC4 / B33638. Signed integer-to-float conversion
+is SCVTF B32AB4 / B3362C. Duration division is B32ACC / B33640. Half-angle is
+B32AF8 / B3364C. Both normalize the literal Y axis [0,1,0,0]. Initialization
+clears elapsed at B32C64 / B33740 and commits quaternion B32C80 / B3375C.
+
+The degree conversion is established beyond inference from familiar constants:
+main's dynamic relocations name imported nn::util::detail::FloatDegree180 at
+GOT4272CE0 and FloatPi at4272CF0. Local sdk definitions are sdk+AB3AA0=180.0
+and sdk+AB3A8C=3.1415927410125732. Related symbols identify the sine/cosine
+polynomials, half/two pi, reciprocal2pi, and quaternion epsilon. The import at
+4270F20 is acosf, supplied by local sdk+5295F0 (640 bytes). No network lookup
+or assumed replacement math library was used for these guest checks.
+
+Original per-update ordering and exact completion boundaries
+TurnKey update B32CD4 first loads duration+140 at B32CF8; CBZ B32CFC branches
+to immediate success B32D50. Turn update B338DC does the same for +130 at
+B33900/04, reaching B339B4. Thus N=0 is a special immediate-completion path
+before target/context acquisition or motion; it must survive any correction.
+
+For a nonzero duration and a resolved actor:
+  TurnKey B32DFC reads context+88 through getter1059A78; B32E00..08 adds that
+  u32 word to elapsed+144 using 32-bit ADD/store. The math B32E34..FB8 applies
+  ONE stored q_step to the current orientation regardless of the frame delta,
+  then calls direction setter19853A8 at B32FBC. B32FC0..CC loads elapsed/duration
+  and uses signed B.GE; success BD4380 is chosen at B32FD8, otherwise running
+  BD43A4 at B32FD0. Status is copied at B32FDC/E0.
+  Turn B33A9C, B33AA0..A8, B33AD4..C58, B33C5C, B33C60..6C follows the same
+  order. Success path B33CA4 rejoins status copy B33C74/78.
+
+Consequences verified by original count and completion slices:
+- Completion happens in the SAME callback whose new progress reaches N, after
+  that callback's angular update. There is no WaitFrame-style extra callback.
+- A zero frame delta still performs one angular step on the original path.
+- A multi-frame delta still performs one angular step, then may complete.
+- Negative N is not filtered by the zero guard. Signed comparison can complete
+  on the first motion callback, and 32-bit counter overflow can change the result.
+  Those are characterized invalid/unusual domains, not recommended semantics.
+- Missing actor/resource paths have existing failure outcomes; bypassing those
+  acquisition paths just because a sidecar progress value exists is incorrect.
+
+Motion composition and current-pose source
+Both math blocks pre-multiply q_step*q_current and transform +Z. Pass4 guest
+noncommuting tests established this ordering. Each update rereads current pose,
+not an initialization-time pose. In the normal resolved path the actor is X21;
+actor+1A8 is a weak reference, payload+18 points to component+50, and the update
+loads q_current at payload+70 (B3315C / corresponding Turn branch), equivalent
+to component+C0. It places this quaternion at [SP] before the math block.
+Do not replace this with interpolation between two fixed initialization poses:
+another system may change the actor orientation between action updates.
+
+New downstream evidence: the direction setter is a yaw projection
+19853A8 receives actor X0 and forward-vector pointer X1. It selects input X/Z
+components at19853C0..D4; ignores input Y; computes horizontal length; rejects
+length < float0x34000000 (~1.1920929e-7) or zero squared length at19853F4..5400.
+It normalizes the horizontal direction at1985404..5440, dots it with +Z, clamps
+to [-1,+1] at198545C..5468, and calls the actual imported acosf at198546C.
+The sign is positive for normalized x>0, negative otherwise (1985474..5490).
+It constructs a pure-Y quaternion, normalizes it, acquires actor component via
+8C69BC at198561C, sets component+E0=1 at198562C and writes quaternion+C0 at
+1985630. The reference release afterwards is executed in the guest test.
+
+Therefore a direct write of q_step*q_current would bypass the original yaw
+projection and dirty marking. Even a correct fractional pre-multiplication must
+respect that integration boundary. A vertical-only forward vector is rejected.
+
+Small-angle loss is real in the original helper, independently of call cadence
+The original helper plus real local SDK acosf maps a supplied0.001deg and0.01deg
+heading to zero because normalization/cosine rounding yields acosf(1)=0. This
+is angular precision loss, not the horizontal-length guard rejecting a vector.
+Controlled output:0.1deg ->0.100870558deg;1deg ->0.999950798deg;
+179.99deg ->180.000013660deg. Signed wrapping at180deg is equivalent orientation.
+
+A synthetic1deg turn over30 authored frames, with original initialization and
+motion math plus full setter at each callback, produces:
+  assumed rate   naive fractional-from-current    retained command/residual
+  30 callbacks/s         -1.008912428deg             -1.000146518deg
+  60 callbacks/s         -1.024693057deg             -1.000146518deg
+ 120 callbacks/s         -0.000000000deg             -1.000146518deg
+At120, the intended per-callback step is about-0.0083333deg; each request begins
+again from the stored zero heading, so rounding repeatedly erases it. A retained
+unquantized commanded heading eventually crosses the representable threshold.
+The final setter still quantizes the endpoint; residual does not make its output
+infinitely precise. This synthetic case is not evidence that a live Turn action
+with these authored parameters is currently active or visibly broken.
+
+Why not take a fractional power of the stored quaternion alone?
+The authored angle carries winding information that a quaternion does not.
+The original entry for A=720deg,N=1 produces nearly identity q_step, while an
+elapsed quarter of that authored frame must traverse-180deg if preserving the
+authored angular path. Both variants' guest initializers confirm this example.
+Using shortest-path slerp(identity,q_step,fraction) would lose that turn. Retain
+A and N or a signed unwrapped angular rate; do not infer rate solely from q_step.
+
+Proposed narrow positive-duration design, not implemented
+Use the same elapsed clock as this AI context, rather than host wall time or a
+global render rate. Let dt be this action's eligible channel-1 elapsed seconds;
+let P be per-action progress measured in authored30Hz frame units:
+  d = 30 * dt
+  P_next = min(N, P + d)
+  a = P_next - P
+  own_yaw = -(A * pi / 180) * (a / N)
+Apply that yaw by LEFT multiplication to the observed current orientation, feed
+the resulting forward vector through the original yaw setter, then complete in
+the same callback iff P_next>=N. Otherwise return running. Keep N=0's immediate
+success path. For N>0, a zero dt should produce no additional rotation; a hitch
+should consume its elapsed amount and clamp final angular amount to remaining
+progress. Do not let the completion counter and angular amount use different d.
+
+This preserves the positive-N, delta=1, ordinary30Hz progression and its
+post-motion boundary, subject to normal float math differences. It intentionally
+changes existing multi-frame behavior: original advances the deadline by e.g.4
+but rotates one step; proposed advances both by4. Existing scheduler groups may
+already accumulate multiple frames even at30FPS. Thus this is NOT proven to
+preserve every30FPS trajectory. Live group/action cadence is needed before
+enabling it, especially for low-frequency groups and forced scheduling.
+
+The current context+84 accumulates seconds across scheduler group intervals.
+It is not a per-render-frame sample. Consume its applicable value once per
+qualified action update, not on every field read, and do not integrate the same
+accumulated window twice. Decide entry/resume treatment from observed scheduling:
+a new action could inherit a context window that began before action entry.
+Repeated invocation in one epoch and several actions sharing a context are not
+equivalent cases. Parent scheduler/clock identity and lifetime still matter.
+
+Track fractional progress outside existing reset-cleared context fields. A
+candidate action sidecar must reset on successful action-entry commit, distinguish
+object address reuse, reentry and variant, and leave duration/angle config intact.
+Do not reinterpret the integer elapsed field as float. Its existing 32-bit signed
+completion comparison must be replaced locally or supplied from a coherent
+separate progress representation; floor(P) plus an unrelated angle can recreate
+the mismatch. No object-layout padding or safe free slot has been established.
+
+Quantization residual design (tested host model around original guest math):
+  observe current heading h from the current orientation;
+  requested_heading = h + residual + own_yaw;
+  rotate current by residual+own_yaw, left-multiplied;
+  call original direction setter;
+  read actual written heading h_written;
+  residual = wrap(requested_heading - h_written).
+On the next update, external orientation changes remain in observed h, while the
+small error discarded by the last setter remains in residual. This preserves an
+injected+0.4rad external yaw at the midpoint of the1deg/120-callback test: output
+21.918315149deg, with residual about-0.000003880deg. Without external injection
+the output is-1.000146518deg, residual+0.000146518deg. This is more appropriate
+than always rotating from an initialization pose. Reset residual on reentry.
+Completion still occurs after the final clamped request. Do not add callbacks
+solely to drain the final residual: that would change the established boundary.
+For a=0 before completion, skip angular application rather than repeatedly trying
+to repay a rounding residual during a paused/zero-time interval.
+
+Scope limits for that model: it uses well-defined horizontal orientations and
+does not establish safe behavior when a direction is vertical/invalid, actor
+component resolution fails, or another thread mutates pose during the setter.
+The observed current-to-last-written relationship and actual writer order need
+instrumentation. A residual should not accumulate a large angle to compensate
+for another system deliberately cancelling rotation; distinguish numerical
+quantization from target rejection/ownership using the actual write outcome.
+Do not globally replace19853A8: it has many unrelated callers.
+
+Keep pause/time scale semantics of channel1. Do not silently turn negative,
+nonfinite or discontinuous dt into ordinary positive elapsed. Narrow rollout
+would reject unsupported data and retain original behavior while reporting it.
+Clock rounding also matters at exact deadlines: e.g.120 samples of integer
+8,333,333ns total999,999,960ns, not1second. A tolerance or rational frame phase
+must be an explicit clock policy, not an accidental extra callback from per-step
+truncation. This pass establishes same-callback ordering, not a universal epsilon.
+
+Controlled comparisons and boundary checks
+For A=90deg,N=30 and synthetic uniform callback spacing:
+  Original one step/count:30callbacks at30/60/120Hz, endpoint-90deg, durations
+  1.0/0.5/0.25 nominal seconds.
+  Elapsed counter only:30/60/120callbacks,1nominal second, endpoints about
+  -90deg /180deg /0deg (the latter is accumulated full rotation, wrapped).
+  Elapsed counter AND angle:30/60/120callbacks,1nominal second, all about-90deg.
+For N=7 with elapsed advances4 then4, proposed clamp applies4 then3, completing
+on callback2 at approximately-89.999995deg for a90deg turn. This is a proposed
+clamped-angle model, not a claim about original hitch behavior.
+
+Exact potential observation fields, without gameplay automation
+1. Successful entry commit:
+   PCs B32C80 / B3375C; X19=action; N,A,old/new elapsed and q_step fields above;
+   class/variant, action-entry generation, host observation sequence, thread ID.
+   Also record update N=0 short-circuit at B32CFC/B33904 without fabricating a
+   successful initialized quaternion for that path.
+2. Context read and update qualification:
+   At B32DFC / B33A9C, X0=context; capture context+80 eligibility,+81/+82 force,
+   +84 float seconds,+88 u32 ticks; at next instruction W0 is returned ticks.
+   Link scheduler1050E00 instance, task clock pointer, channel1 integer ns,
+   dispatcher epoch and worker ID. Capture context generation/reset boundaries.
+3. Counter/motion preparation:
+   At B32E00 / B33AA0: X20=action, old elapsed field, W0 delta; after store new
+   elapsed. At B32E34 / B33AD4: X20=action, X21=actor, current quaternion[SP],
+   stored q_step; record observed callback count per action/epoch and elapsed
+   since last eligible action evaluation. These stack snapshots avoid guessing
+   weak-pointer lifetimes for orientation reads.
+4. Direction/result:
+   At B32FBC / B33C5C: X0=actor,X1=forward pointer, vector4floats, current angle
+   projection, authored N/A, action progress, expected clamped fraction.
+   Within19853A8 log horizontal length, normalized x/z, acos input/output and
+   rejected-path flag. At1985630, X0=component,Q0=new quaternion; component+E0
+   dirty flag; compare last observed/write quaternions up to q versus-q symmetry.
+   A raw quaternion dot near1 is insufficient to identify a writer at tiny angles;
+   retain raw component bits alongside robust heading differences.
+5. Completion:
+   Compare PCs B32FC8/B33C68, elapsed/duration and signed comparison outcome;
+   status stores B32FE0/B33C78, actual result1success/4running from source globals.
+   Record action reentry/destruction/target-change so address reuse is detectable.
+
+A compact observational record should include raw dt/count, source epoch, and
+action-entry identity, not only aggregate FPS. Required scenarios when user-driven
+testing reaches them: ordinary turn, slow small-angle turn, low-frequency group,
+hitch, pause/resume, externally changed facing, and fresh/reentered action. None
+of these live observations was collected here, and no user game was controlled.
+
+Guest test provenance and limits
+Result: Turn guest checks=9843 failures=0 compiled_functions=13.
+turn-jit.c invokes original init arithmetic, count slices, motion slices and
+post-motion comparison/status slices separately. The full19853A8 function,
+original acos PLT and local SDK acosf execute. Actor-component acquisition alone
+is a controlled stub; original component release is allowed to decrement2to1.
+Original SDK constants are installed through synthetic GOT addresses, preserving
+their actual values. All extraction ranges and RET/BR stop substitutions are in
+fixture-provenance.json. Address0 is only the completion-slice stop sentinel.
+13images compile; original real helper statuses1/4 are verified from main data.
+
+SIM/SMALL/HITCH/RESIDUAL loops use host-controlled fractional progress schedules;
+they are proposed arithmetic experiments, not execution of a patched scheduler
+or full original action. The entry's resource/config resolution, live outer
+action manager, rendering, game lifetime and real callback cadence are not tested.
+No hidden fallback sqrt path in SDK acos was exercised; any missing guest target
+other than declared actor-acquire/stop stubs fails the harness.
+
+Private reproduction files: make-fixtures.py, turn-jit.c, run-checks.ps1,
+resolve-globals.py, sdk-symbols.py, disasm.py, original relevant disassembly.
+Safe review artifacts: this findings.txt, turn-checks.txt, fixture-provenance.json.
+Extracted instructions/constants (.h/.bin/.elf and sdk-symbols raw data) remain
+local and need not be distributed with the report.

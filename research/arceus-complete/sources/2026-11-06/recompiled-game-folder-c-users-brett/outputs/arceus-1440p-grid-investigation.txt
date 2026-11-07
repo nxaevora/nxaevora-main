@@ -1,0 +1,71 @@
+1440p screen-door investigation — 2026-11-06
+
+The completed run timing-20261106-164839-938 exited normally (game_exit=0).
+Its logs confirm actual 2560x1440 depth-tested scene viewports. The user
+confirmed proper1440p sharpness, but reported a grid on environment textures.
+The screenshot has a strong repeating four-pixel pattern on the stone.
+
+Most likely cause, reproduced offline
+Shadow-receiver shader e9e7255e7594a006 reads normal/material data at correct
+physical pixels, but its third screen-pixel read (depth, guest word61/0x1E8)
+missed the correction. Reaching-definition analysis treated predicated KIL
+at word24 as terminating every path. Surviving fragments still had valid
+screen coordinates, but the recognizer lost them across the later SSY/SYNC.
+
+At4/3 scale, emitted depth coordinates repeated:
+  before: 0,2,2,3,4,6,6,7,8,10,10,11,12,14,14,15
+  fixed:  0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+The depth/normal disagreement fits the screenshot's four-pixel pattern.
+An in-game comparison must still confirm that the visible artifact is gone.
+
+Prepared changes
+- Preserve reachability through conditional KIL for surviving fragments,
+  using the same predicate/condition-code rule as conditional EXIT.
+- Reject unsupported MOV masks when proving screen coordinates. Separate
+  tests exposed this bug; it was absent from the affected real shaders.
+- Add direct_flow=2 to translated-shader cache keys in both flag modes,
+  preventing old translated shaders from being reused without deleting caches.
+- Add seven synthetic control-flow and two MOV-mask regression cases.
+No shader hash is hardcoded into the correction.
+
+Validation of the exact production shader object
+- Runtime rebuild succeeded;38 shader regression cases passed.
+- 27,216 emitted-coordinate cases passed across seven scales, nine synthetic
+  shaders and all nine relevant reads in two real shaders. Includes the
+  previously missed depth read, unscaled masks and native-scale coordinates.
+- All931 shipped fragment shaders translated in both flag modes.
+- All334 cached shaders translated in both modes when their captured
+  constant-buffer reads were replayed. The plain standalone tool lacks that
+  context for five vertex entries; both prior and final builds show those
+  same five rejections without the replay adapter.
+- Under identical tool settings, only e9e7255e7594a006 changes with the flag
+  enabled. Disabled-mode output is byte-identical across both corpora.
+- Source mirror matches; accepted gameplay timing source is unchanged.
+
+Limits
+These checks cover compilation, recognition and coordinate expressions,
+not complete GPU rendering. No standalone SPIR-V validator was available.
+A separate shadow-map scaling/downsampling concern remains for later research
+and was not changed in this candidate.
+
+Next test
+The existing Arceus-1440p-Controller-Test.exe launcher uses the staged candidate
+with Vulkan, docked4/3 scaling, fullscreen, target120FPS, camera2.2 and accepted
+timing fixes. Controller support and manual closure remain enabled; no timeout
+or Escape-to-quit is added. No game was launched during this investigation.
+The installed game executable remains the last tested build until the launcher
+installs the prepared candidate. Inspect the same stairs/paving, then other
+environment surfaces, shadows and water while moving the camera normally.
+
+Candidate SHA256
+fbe5a06b4b800143ae1cdf943975ea23b2279a2da23639239381b4719066da61
+Previous candidate preserved in work/ArceusEngineCandidate-before-pass8-runtime.exe
+SHA256 c88b5a620f1f627a2a07bc695eca49dc05dfddebecddc708d020a2c7d610a5df
+All game assets, captures, shader fixtures and saves remain local.
+Detailed provenance: arceus-1440p-grid-fix-provenance.json
+
+Later feedback, pass9
+The user tested the prepared build and confirmed the bump/grid appearance
+persists on graystone and wood. Actual runtime caches confirm the pass8 fix
+was active. It therefore did not resolve the reported visual problem. See
+arceus-material-investigation.txt for subsequent evidence and comparison.

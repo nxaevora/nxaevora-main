@@ -1,0 +1,551 @@
+--- a/world-pt/contact.comp
++++ b/world-pt/contact.comp
+@@ -19,7 +19,7 @@
+ layout(binding=12) uniform sampler2D localDiffuseProbe;
+ layout(buffer_reference,std430,buffer_reference_align=16) buffer Vertices {vec4 v[];};
+ layout(buffer_reference,std430,buffer_reference_align=4) buffer Counts {uint primary;uint covered;uint matchingDepth;uint bounce;uint textured;uint unresolved;uint drawColor;uint eval;uint grayError;uint rawError;uint fittedError;uint terrainPrimary;uint terrainSecondary;uint terrainShadow;uint glossyPaths;uint glossyHits;uint cutouts;uint rasterGeometry;uint missingPrimary;uint primaryMismatch;uint directVisible;uint directOccluded;uint emitterHits;uint bounceEmitters;uint recovered;uint retainedPrimary;uint retainedBounce;uint retainedShadow;uint deepHits;uint maxBounce;uint retainedPbrHits;uint intervalHits;};
+-struct DrawMaterial {uint end;uint slot;uint roughness;uint metallic;vec4 transform;uint emission;float emissionScale;uint base;uint sourceStart;uvec2 fallbackColor;uint wrap;uint pad;};
++struct DrawMaterial {uint end;uint slot;uint roughness;uint metallic;vec4 transform;uint emission;float emissionScale;uint base;uint sourceStart;uvec2 fallbackColor;uint wrap;uint instanceLink;uvec2 roughTile;uvec2 metalTile;uint roughWrap;uint metalWrap;uint packedProperties;uint surfaceKey;};
+ struct Tint {uvec4 target;uvec4 source;uvec4 emission;uvec4 surface;};
+ layout(buffer_reference,std430,buffer_reference_align=4) buffer Words {uint v[];};
+ struct Witness {uvec4 key;vec4 position[3];};
+@@ -114,11 +114,26 @@
+     if(dst/3u>=u.count)return;
+     vec4 a=u.clip.v[2*first],b=u.clip.v[2*(first+1)],c=u.clip.v[2*(first+2)];
+     bool missing=all(equal(a,vec4(0)))&&all(equal(b,vec4(0)))&&all(equal(c,vec4(0)));
++#ifdef GEOMETRY_HISTORY
++    uint key=2166136261u^material.surfaceKey;
++    bool usable=!missing;
++#endif
+     for(uint i=0;i<3;i++){
+         vec4 p=u.clip.v[2*(first+i)];
+         vec3 point=vec3(p.x*u.camera.x,-p.y*u.camera.y,p.w);
+         if(missing || any(isnan(point)) || any(isinf(point)))point=vec3(uintBitsToFloat(0x7fc00000u),0,0);
+         u.vertices.v[dst+i]=vec4(point,1);
++#ifdef GEOMETRY_HISTORY
++        vec3 world=u.origin.xyz+u.axisX.xyz*point.x+u.axisY.xyz*point.y+u.axisZ.xyz*point.z;
++        if(any(isnan(world)) || any(isinf(world)) || any(greaterThan(abs(world),vec3(1000000.))))usable=false;
++        else{
++            uvec3 quantized=uvec3(ivec3(round(world*32.)));
++            key=(key^quantized.x)*16777619u;
++            key=(key^quantized.y)*16777619u;
++            key=(key^quantized.z)*16777619u;
++        }
++        if(i==2u && usable)u.vertices.v[dst].w=uintBitsToFloat(0x3f800000u|(1u+key%0x7fffffu));
++#endif
+         vec2 uv=(u.clip.v[2*(first+i)+1].xy-material.transform.zw)*material.transform.xy;
+         u.vertices.v[1500000u+dst+i]=vec4(uv.x,1.-uv.y,float(material.slot&255u),float(lo));
+     }
+@@ -477,20 +492,43 @@
+     uint draw=uint(a.w);
+     if(draw>=uint(u.axisX.w))return false;
+     DrawMaterial m=u.draws.draw[draw];
+-    if(m.roughness==0u || m.roughness>=textureCapacity || m.metallic>=textureCapacity){
++    bool roughBound=m.roughness!=0u && m.roughness<textureCapacity;
++    bool metalBound=m.metallic!=0u && m.metallic<textureCapacity;
++    if(!roughBound){
+         uint id;
+-        if(!matchingProp(primitive,draw,id))return false;
+-        vec4 native=propTexel(id,bary,Words(u.draws.land.props.properties));
+-        if(native.a<=.5)return false;
+-        rough=max(.04,native.r);metal=native.g;return true;
++        if(matchingProp(primitive,draw,id)){
++            vec4 native=propTexel(id,bary,Words(u.draws.land.props.properties));
++            if(native.a>.5){rough=max(.04,native.r);metal=native.g;return true;}
++        }
++        if(all(equal(m.roughTile,uvec2(0))))return false;
+     }
+     vec2 uv=a.xy*(1.-bary.x-bary.y)+u.vertices.v[start+1].xy*bary.x+u.vertices.v[start+2].xy*bary.y;
+-    if(any(isnan(uv)) || any(isinf(uv)))return false;
+-    vec3 r=textureLod(drawTextures[nonuniformEXT(m.roughness)],uv,1.).rgb;
+-    if(m.metallic==m.roughness){rough=r.g;metal=r.b;}
+-    else{
+-        rough=r.r;
+-        if(m.metallic!=0u)metal=textureLod(drawTextures[nonuniformEXT(m.metallic)],uv,1.).r;
++    if(any(isnan(uv)) || any(isinf(uv)) || any(greaterThan(abs(uv),vec2(1000000.))))return false;
++    vec3 r=roughBound?textureLod(drawTextures[nonuniformEXT(m.roughness)],uv,1.).rgb:materialTile(m.roughTile,m.roughWrap,uv);
++    bool packedMap=m.packedProperties!=0u;
++    rough=packedMap?r.g:r.r;
++    bool metalTiled=!packedMap && !metalBound && any(notEqual(m.metalTile,uvec2(0)));
++    if(packedMap)metal=r.b;
++    else if(metalBound)metal=textureLod(drawTextures[nonuniformEXT(m.metallic)],uv,1.).r;
++    else if(metalTiled)metal=materialTile(m.metalTile,m.metalWrap,uv).r;
++    if(any(notEqual(u.stats,uvec2(0))) && all(equal(gl_GlobalInvocationID.xy%8u,uvec2(3,6)))){
++        Words q=Words(u.stats);
++        if(!roughBound)atomicAdd(q.v[11960],1u);
++        if(metalTiled || (packedMap && !roughBound))atomicAdd(q.v[11961],1u);
++        if(u.frame==600u || u.frame==1960u){
++            uint k=u.frame==600u?11962u:11968u;
++            if(roughBound && any(notEqual(m.roughTile,uvec2(0)))){
++                vec3 sampleValue=materialTile(m.roughTile,m.roughWrap,uv);
++                atomicAdd(q.v[k],1u);atomicAdd(q.v[k+1u],uint(round(4096.*abs(rough-(packedMap?sampleValue.g:sampleValue.r)))));
++                atomicAdd(q.v[k+2u],uint(round(4096.*abs(1.-rough))));
++            }
++            if((packedMap && roughBound && any(notEqual(m.roughTile,uvec2(0)))) ||
++               (!packedMap && metalBound && any(notEqual(m.metalTile,uvec2(0))))){
++                float val=packedMap?materialTile(m.roughTile,m.roughWrap,uv).b:materialTile(m.metalTile,m.metalWrap,uv).r;
++                atomicAdd(q.v[k+3u],1u);atomicAdd(q.v[k+4u],uint(round(4096.*abs(metal-val))));
++                atomicAdd(q.v[k+5u],uint(round(4096.*abs(metal))));
++            }
++        }
+     }
+     rough=clamp(rough,.04,1.);metal=clamp(metal,0.,1.);
+     return true;
+@@ -603,7 +641,7 @@
+     vec3 direction=normalize(vec3(((vec2(pixel)+.5-u.draws.land.jitter-u.draws.land.viewport.xy)/u.draws.land.viewport.zw*2.-1.)*u.camera.xy,1));
+     vec3 origin=vec3(0),throughput=vec3(1),radiance=vec3(0);
+     vec3 deterministic=vec3(0);
+-    uint surfaceGuide=0u;
++    uint surfaceGuide=0u,geometryKey=0u;
+ #ifdef RR_GUIDES
+     vec3 rrDiffuse=vec3(0),rrSpecular=vec3(0);
+     vec4 rrNormal=vec4(0,0,0,1);
+@@ -680,6 +718,10 @@
+             }
+ #endif
+         }
++#ifdef GEOMETRY_HISTORY
++        if(depth==0u && depthMatch && !recovered && primitive<u.count)
++            geometryKey=floatBitsToUint(u.vertices.v[3u*primitive].w)&0x7fffffu;
++#endif
+         bool fromBuffers=depth==0u && recovered;
+         if(!found && !fromBuffers){
+             vec3 worldDir=direction.x*u.axisX.xyz+direction.y*u.axisY.xyz+direction.z*u.axisZ.xyz;
+@@ -1010,6 +1052,9 @@
+     if(any(notEqual(u.draws.primaryLight,uvec2(0)))){
+         vec3 base=written?clamp(deterministic,0.,65504.):vec3(0);
+         uint index=(u.frame&1u)*uint(size.x*size.y)+uint(pixel.y*size.x+pixel.x);
++#ifdef GEOMETRY_HISTORY
++        Words(u.draws.primaryLight).v[4u*uint(size.x*size.y)+index]=written?geometryKey:0u;
++#endif
+         PrimaryLight(u.draws.primaryLight).values[index]=uvec2(packHalf2x16(base.rg),
+             packHalf2x16(vec2(base.b,0))|((written?surfaceGuide:0u)<<16u));
+     }
+--- a/world-pt/contact.h
++++ b/world-pt/contact.h
+@@ -135,7 +135,13 @@
+     contact.scene=contact_address(&contact.top);
+     const char *filter=getenv("ARCEUS_PT_FILTER");
+     if(!filter || strcmp(filter,"0"))
+-        contact_buffer(&contact.primaryLight,2ull*1920*1080*8,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,false);
++        contact_buffer(&contact.primaryLight,2ull*1920*1080*
++#ifdef GEOMETRY_HISTORY
++            12
++#else
++            8
++#endif
++            ,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,false);
+     if(getenv("ARCEUS_RT_VERIFY")){
+         if(!contact_buffer(&contact.counters,65536,VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,true) ||
+            vkMapMemory(g_vk.dev,contact.counters.memory,0,65536,0,(void**)&contact.mappedCounters))return false;
+@@ -252,6 +258,7 @@
+             emittingTriangles,contact.mappedCounters[16379],contact.mappedCounters[16382],contact.mappedCounters[16383],contact.mappedCounters[16380],contact.mappedCounters[16378],contact.mappedCounters[16376],contact.mappedCounters[16377],contact.mappedCounters[16375],contact.mappedCounters[11905],contact.mappedCounters[11903],contact.mappedCounters[11904],contact.mappedCounters[11906],contact.mappedCounters[11907],contact.mappedCounters[11908]);
+ #ifdef EMISSION_WITNESS
+         u32 *q=contact.mappedCounters+11940;float maxError;memcpy(&maxError,q+4,4);
++        LOG("world-pt: archive emitter coarse error=%u\n",contact.mappedCounters[11974]);
+         LOG("world-pt: archive emitter groups=%u active=%u linked=%u triangles=%u maxPositionError=%g nonblack=%u textureError=%u nativePower=%u shadowTests=%u shadowAgreement=%u unblocked=%u\n",
+             q[0],q[1],q[2],q[3],maxError,q[5],q[6],q[7],q[8],q[9],q[10]);
+ #endif
+@@ -261,6 +268,11 @@
+         LOG("world-pt: persistent direct proposals=%u visible=%u\n",contact.mappedCounters[11936],contact.mappedCounters[11937]);
+         LOG("world-pt: persistent emission hits=%u paired=%u error=%u original=%u\n",contact.mappedCounters[11932],
+             contact.mappedCounters[11933],contact.mappedCounters[11934],contact.mappedCounters[11935]);
++        LOG("world-pt: overflow property samples rough=%u metal=%u\n",contact.mappedCounters[11960],contact.mappedCounters[11961]);
++        for(u32 k=11962;k<=11968;k+=6)
++            LOG("world-pt: property tile reference present=%u rough=%u error=%u default=%u metal=%u error=%u default=%u\n",
++                k==11962?600:1960,contact.mappedCounters[k],contact.mappedCounters[k+1],contact.mappedCounters[k+2],
++                contact.mappedCounters[k+3],contact.mappedCounters[k+4],contact.mappedCounters[k+5]);
+         LOG("world-pt: sampled overflow albedo=%u indoor reference=%u tileError=%u grayError=%u outliers=%u village reference=%u tileError=%u grayError=%u outliers=%u\n",
+             contact.mappedCounters[11923],contact.mappedCounters[11924],contact.mappedCounters[11925],
+             contact.mappedCounters[11926],contact.mappedCounters[11927],contact.mappedCounters[11928],
+--- a/world-pt/denoise.comp
++++ b/world-pt/denoise.comp
+@@ -29,6 +29,13 @@
+     uvec2 v=PrimaryLight(frame.primaryLight).values[index];
+     return vec4(unpackHalf2x16(v.x),unpackHalf2x16(v.y).x,float(v.y>>16u));
+ }
++#ifdef GEOMETRY_HISTORY
++layout(buffer_reference,std430,buffer_reference_align=4) readonly buffer Keys {uint v[];};
++uint triangleKey(ivec2 p,ivec2 size,uint layer){
++    if(all(equal(frame.primaryLight,uvec2(0))))return 0u;
++    return Keys(frame.primaryLight).v[(4u+layer)*uint(size.x*size.y)+uint(p.y*size.x+p.x)];
++}
++#endif
+ vec3 guideNormal(uint tag){
+     vec2 xy=vec2(tag&127u,(tag>>7u)&127u)*(2./127.)-1.;
+     vec3 n=vec3(xy,1.-abs(xy.x)-abs(xy.y));
+@@ -74,12 +81,27 @@
+     }
+ 
+     result=spatial/spatialWeight;
++
++#ifdef HISTORY_WITNESS
++    uint passes=uint(age>0.)+2u*uint(frame.historyValid!=0u);
++    vec4 distances=vec4(-1);
++    vec3 projection=vec3(0);
++#endif
+     if(age>0. && frame.historyValid!=0){
+         vec2 uv=(vec2(p)+.5-frame.jitter)/vec2(size);
+         vec4 clip=frame.previousClip*vec4(uv*vec2(2,-2)+vec2(-1,1),z,1);
+         vec2 delta=texelFetch(motion,p,0).xy+frame.previousJitter-frame.jitter;
+         vec2 projected=vec2(p)+delta;
++
++#ifdef HISTORY_WITNESS
++        projection=vec3(length(delta),clip.z/clip.w,z);
++        passes|=4u*uint(clip.w>0.);
++#endif
+         if(clip.w>0. && all(greaterThanEqual(projected,vec2(0))) && all(lessThan(projected,vec2(size-1)))){
++
++#ifdef HISTORY_WITNESS
++            passes|=8u;
++#endif
+             ivec2 origin=ivec2(floor(projected));
+             vec2 fraction=fract(projected);
+             // Narrow the reconstruction footprint without negative weights at silhouettes.
+@@ -92,17 +114,56 @@
+                 ivec2 q=origin+ivec2(x,y);
+                 uvec4 data=texelFetch(metadata,q,0);
+                 vec4 material=unpackUnorm4x8(data.y);
+-                if((data.x&4095u)!=materialID)continue;
++
++#ifdef HISTORY_WITNESS
++                if((data.x&4095u)==materialID)passes|=16u;
++                if(x==0 && y==0){
++                    distances.x=abs(clip.z/clip.w-uintBitsToFloat(data.x&0xfffff000u))/max(.000001,z);
++                    distances.y=distance(material.rgb,surface);
++                    distances.z=dot(guideNormal(uint(baseAt(q,size,frame.layer^1u).a)),guideNormal(uint(base.a)));
++                    distances.w=float((materialID<<12u)|(data.x&4095u));
++                }
++#endif
++                bool sameMaterial=(data.x&4095u)==materialID;
++#ifdef GEOMETRY_HISTORY
++                uint key=triangleKey(p,size,frame.layer);
++                bool sameTriangle=key!=0u && key==triangleKey(q,size,frame.layer^1u);
++                if(!sameMaterial && !sameTriangle)continue;
++#else
++                if(!sameMaterial)continue;
++#endif
+                 float previousZ=uintBitsToFloat(data.x&0xfffff000u);
+                 float expected=clip.z/clip.w;
++
++#ifdef HISTORY_WITNESS
++                if(material.a>0.)passes|=32u;
++                if(material.a>0. && abs(expected-previousZ)<=max(2e-6,.015*expected))passes|=64u;
++#endif
+                 if(material.a==0. || abs(expected-previousZ)>max(2e-6,.015*expected) ||
+                    distance(material.rgb,surface)>.09)continue;
++
++#ifdef HISTORY_WITNESS
++                passes|=128u;
++#endif
+                 float weight=(x==1?fraction.x:1.-fraction.x)*(y==1?fraction.y:1.-fraction.y);
+                 // Reproject incident light while preserving the current texture detail.
+                 // The floor bounds amplification in dark paint and at metallic edges.
+                 vec3 correction=clamp((surface+.08)/(material.rgb+.08),vec3(.75),vec3(1.33));
+                 vec4 oldBase=baseAt(q,size,frame.layer^1u);
++
++#ifdef HISTORY_WITNESS
++                if(((uint(oldBase.a)^uint(base.a))&0x4000u)==0u)passes|=256u;
++#endif
+                 if(((uint(oldBase.a)^uint(base.a))&0x4000u)!=0u || dot(guideNormal(uint(oldBase.a)),guideNormal(uint(base.a)))<(glossy?.985:.88))continue;
++
++#ifdef HISTORY_WITNESS
++                passes|=512u;
++#endif
++#ifdef GEOMETRY_HISTORY
++                if(!sameMaterial && (distance(material.rgb,surface)>.035 ||
++                   abs(expected-previousZ)>max(.000002,.005*expected) ||
++                   dot(guideNormal(uint(oldBase.a)),guideNormal(uint(base.a)))<.96))continue;
++#endif
+                 previous+=weight*max(vec3(0),texelFetch(history,q,0).rgb-oldBase.rgb)*correction;
+                 vec2 oldMoments=uintBitsToFloat(data.zw);
+                 float scale=dot(correction,luminance);
+@@ -111,6 +172,10 @@
+                 sum+=weight;
+             }
+             if(sum>.5){
++
++#ifdef HISTORY_WITNESS
++                passes|=1024u;
++#endif
+                 vec2 historyMoments=previousMoments/sum;
+                 float sigma=sqrt(max(0.,historyMoments.y-historyMoments.x*historyMoments.x));
+                 // Use validated reprojections to distinguish stochastic spread from a lighting change.
+@@ -128,6 +193,11 @@
+     }
+     if(any(notEqual(frame.reference,uvec2(0))) && all(equal(p%4,ivec2(2)))){
+         uint i=uint(p.y/4*480+p.x/4);ReferencePixels ref=ReferencePixels(frame.reference);
++
++#ifdef HISTORY_WITNESS
++        ref.v[4u*480u*270u+i]=vec4(float(passes),projection);
++        ref.v[5u*480u*270u+i]=distances;
++#endif
+         ref.v[480u*270u+i]=vec4(raw.rgb,base.a);
+         ref.v[2u*480u*270u+i]=vec4(base.rgb+result,age);
+     }
+--- a/world-pt/emission-witness.glsl
++++ b/world-pt/emission-witness.glsl
+@@ -35,7 +35,9 @@
+         bool enabled;vec3 archived=retainedEmission(tri,w.yz,enabled);
+         vec3 ground=m.emissionScale*textureLod(drawTextures[nonuniformEXT(m.emission)],uv,1.).rgb;
+         if(!enabled)continue;
+-        if(any(greaterThan(max(archived,ground),vec3(.004)))){
++        bool hasCoarse;vec3 coarse=retainedEmissionMip(tri,w.yz,true,hasCoarse);
++        if(any(greaterThan(max(max(archived,coarse),ground),vec3(.004)))){
++            atomicAdd(stats.v[11974],uint(round(4096.*dot(abs(ground-coarse),vec3(1./3.)))));
+             atomicAdd(stats.v[11945],1u);
+             atomicAdd(stats.v[11946],uint(round(4096.*dot(abs(ground-archived),vec3(1./3.)))));
+             atomicAdd(stats.v[11947],uint(round(4096.*dot(ground,vec3(1./3.)))));
+--- a/world-pt/grove-witness.glsl
++++ b/world-pt/grove-witness.glsl
+@@ -20,7 +20,7 @@
+         }
+         if(matches){
+             atomicExchange(grove.activeGroups.v[i],u.frame+1u);
+-            atomicMax(u.draws.draw[draw].pad,i+1u);
++            atomicMax(u.draws.draw[draw].instanceLink,i+1u);
+             atomicOr(grove.activeGroups.v[grove.instanceCount+p.key.x],1u);
+         }
+     }
+--- a/world-pt/instance-shading.glsl
++++ b/world-pt/instance-shading.glsl
+@@ -4,8 +4,8 @@
+         inst=treeInstance(primitive&~propFlag);tri=treePrimitive(primitive);
+     }else if(primitive<u.count){
+         uint draw=uint(u.vertices.v[1500000u+3u*primitive].w);
+-        if(draw>=uint(u.axisX.w) || u.draws.draw[draw].pad==0u)return false;
+-        inst=u.draws.draw[draw].pad-1u;tri=primitive-u.draws.draw[draw].base;
++        if(draw>=uint(u.axisX.w) || u.draws.draw[draw].instanceLink==0u)return false;
++        inst=u.draws.draw[draw].instanceLink-1u;tri=primitive-u.draws.draw[draw].base;
+     }else return false;
+     if(inst>=g.instanceCount)return false;
+     TreePlacement placement=g.placements.items[inst];uint model=placement.key.x;
+--- a/world-pt/material-tile.glsl
++++ b/world-pt/material-tile.glsl
+@@ -3,13 +3,17 @@
+     if(mode==1u){int k=i&127;return k<64?k:127-k;}
+     return clamp(i,0,63);
+ }
+-vec3 fallbackAlbedo(DrawMaterial m,vec2 uv){
++vec3 materialTile(uvec2 address,uint wrap,vec2 uv){
+     vec2 p=uv*64.-.5,f=fract(p);ivec2 base=ivec2(floor(p));
+-    Words tile=Words(m.fallbackColor);vec3 c=vec3(0);
++    Words tile=Words(address);vec3 c=vec3(0);
+     for(int y=0;y<2;y++)for(int x=0;x<2;x++){
+-        uint k=uint(tileCoordinate(base.y+y,(m.wrap>>3u)&7u)*64+tileCoordinate(base.x+x,m.wrap&7u));
++        uint k=uint(tileCoordinate(base.y+y,(wrap>>3u)&7u)*64+tileCoordinate(base.x+x,wrap&7u));
+         vec3 sampleColor=vec3(unpackHalf2x16(tile.v[2u*k]),unpackHalf2x16(tile.v[2u*k+1u]).x);
+         c+=sampleColor*((x==0?1.-f.x:f.x)*(y==0?1.-f.y:f.y));
+     }
+-    return clamp(c,vec3(0),vec3(.95));
++    return c;
+ }
++
++vec3 fallbackAlbedo(DrawMaterial m,vec2 uv){
++    return clamp(materialTile(m.fallbackColor,m.wrap,uv),vec3(0),vec3(.95));
++}
+--- a/world-pt/material.inc
++++ b/world-pt/material.inc
+@@ -6,9 +6,10 @@
+     u32 emission;
+     float emissionScale;
+     u32 base,sourceStart;
+-    u64 fallbackColor;u32 wrap,pad;
++    u64 fallbackColor;u32 wrap,instanceLink;
++    u64 roughTile,metalTile;u32 roughWrap,metalWrap,packedProperties,surfaceKey;
+ } WorldDrawMaterial;
+-_Static_assert(sizeof(WorldDrawMaterial)==64,"draw material GPU layout");
++_Static_assert(sizeof(WorldDrawMaterial)==96 && offsetof(WorldDrawMaterial,roughTile)==64 && offsetof(WorldDrawMaterial,packedProperties)==88,"draw material GPU layout");
+ enum {worldTintBytes=64};
+ typedef struct {
+     u64 address;
+@@ -64,6 +65,12 @@
+     }
+     WorldDrawMaterial *draw=&capturedDraws[captureDrawCount++];
+     *draw=(WorldDrawMaterial){.end=end,.slot=world_texture(shader,bound,8,true)<<16,.uv={1,1,0,0}};
++#ifdef GEOMETRY_HISTORY
++    if(shader){
++        u64 image=capturedTextures[draw->slot>>16].address;
++        draw->surfaceKey=(u32)(shader->hash^(shader->hash>>32)^image^(image>>32));
++    }
++#endif
+     if(shader && shader->hash==0xea4d86b0272a581full)draw->slot|=0x80000000u;
+     if(shader)switch(shader->hash){
+         case 0xa336734bf0d4c9c0ull: case 0x66ef61705e89a2e7ull: case 0xe1a792dc6d8fac9eull:
+@@ -75,7 +82,7 @@
+             draw->roughness=world_texture(shader,bound,0x10,false);break;
+         case 0xb353d4fdae52bb03ull:
+             draw->roughness=world_texture(shader,bound,0x24,false);
+-            draw->metallic=draw->roughness;break;
++            draw->metallic=draw->roughness;draw->packedProperties=1;break;
+     }
+     unsigned layout=shader?world_material_layout(shader->hash):0;
+     if(shader && shader->hash==0xa336734bf0d4c9c0ull && ch->cbind[4][7] && cb_range(ch,4,shader,7)>=0x7c){
+@@ -121,7 +128,7 @@
+     return x->id<y->id?-1:x->id>y->id;
+ }
+ #include "material-tile.inc"
+-static u16 baseTextureId[worldDrawLimit];
++static u16 baseTextureId[worldDrawLimit],roughTextureId[worldDrawLimit],metalTextureId[worldDrawLimit];
+ static void select_world_textures(void){
+     static TextureChoice choices[maxCapturedTextures];
+     static u16 physical[maxCapturedTextures];
+@@ -148,6 +155,7 @@
+     for(u32 i=0;i<drawCount;i++){
+         WorldDrawMaterial *d=draws+i;
+         baseTextureId[i]=(d->slot>>16)&0x7fff;
++        roughTextureId[i]=d->roughness;metalTextureId[i]=d->metallic;
+         d->slot=(d->slot&0x8000ff00u)|physical[baseTextureId[i]];
+         d->roughness=physical[d->roughness];d->metallic=physical[d->metallic];d->emission=physical[d->emission];
+     }
+@@ -176,6 +184,10 @@
+             draws[j].fallbackColor=material_color_tile(cb,&capturedTextures[baseTextureId[j]],ro,&draws[j].wrap);
+         if(draws[j].roughness && infos[draws[j].roughness].imageView==dummy)draws[j].roughness=0;
+         if(draws[j].metallic && infos[draws[j].metallic].imageView==dummy)draws[j].metallic=0;
++        if(roughTextureId[j] && (!draws[j].roughness || tileWitness))
++            draws[j].roughTile=material_color_tile(cb,&capturedTextures[roughTextureId[j]],ro,&draws[j].roughWrap);
++        if(!draws[j].packedProperties && metalTextureId[j] && (!draws[j].metallic || tileWitness))
++            draws[j].metalTile=material_color_tile(cb,&capturedTextures[metalTextureId[j]],ro,&draws[j].metalWrap);
+         if(draws[j].emission && infos[draws[j].emission].imageView==dummy)draws[j].emission=0;
+     }
+     if(tileCache.filled)contact_barrier(cb,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_ACCESS_SHADER_WRITE_BIT,
+--- a/world-pt/props.inc
++++ b/world-pt/props.inc
+@@ -14,7 +14,7 @@
+     FILE *f=fopen(path,"rb");
+     if(!f)return false;
+     struct {char magic[4];u32 version,triangles,materials,groups,archive;} h;
+-    bool ok=fread(&h,sizeof h,1,f)==1 && !memcmp(h.magic,"PROP",4) && (h.version>=1 && h.version<=7) &&
++    bool ok=fread(&h,sizeof h,1,f)==1 && !memcmp(h.magic,"PROP",4) && (h.version>=1 && h.version<=8) &&
+         h.archive==archiveSize && h.triangles>0 && h.triangles<=1000000 &&
+         h.materials>0 && h.materials<=255 && h.groups>0 && h.groups<=1024;
+     u32 firstPlaced=h.groups;
+@@ -24,7 +24,10 @@
+     u32 emitCount=0;
+     if(ok && h.version>=6)ok=fread(&emitCount,sizeof emitCount,1,f)==1 && emitCount>0 && emitCount<=255;
+     u32 lightCount=0;
+-    if(ok && h.version==7)ok=fread(&lightCount,sizeof lightCount,1,f)==1 && lightCount>0 && lightCount<=h.triangles;
++    if(ok && h.version>=7)ok=fread(&lightCount,sizeof lightCount,1,f)==1 && lightCount>0 && lightCount<=h.triangles;
++    u32 detailWords=0;
++    if(ok && h.version==8)ok=fread(&detailWords,sizeof detailWords,1,f)==1 &&
++        detailWords>=4u*emitCount && detailWords<=16u*1024u*1024u;
+     if(!ok){fclose(f);return false;}
+     u32 classes=h.version==4?h.materials:0;
+     u64 tags=48ull*h.triangles,atlas=tags+4ull*h.triangles;
+@@ -35,7 +38,7 @@
+     u64 maps=frames+(h.version>=5?24ull*h.triangles:0);
+     u64 emit=maps+mapCount*(4ull+128*128*2);
+     u64 cdf=emit+(emitCount?16ull*h.groups+emitCount*128ull*128*8:0);
+-    u64 total=cdf+(lightCount?8ull*lightCount+4:0);
++    u64 detail=cdf+(lightCount?8ull*lightCount+4:0),total=detail+4ull*detailWords;
+     VkBufferUsageFlags usage=VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR|
+         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+     void *mapped=NULL;
+@@ -80,6 +83,22 @@
+             }
+             for(u32 j=0;ok && j<h.groups;j++)if(records[4*j])covered+=*(const u32*)(data+check+64*j);
+             if(last!=1.f || covered!=lightCount || pairs[2*lightCount]!=0)ok=false;
++        }
++        if(ok && detailWords){
++            const u32 *table=(const u32*)(data+detail);
++            u64 cursor=4ull*emitCount;
++            for(u32 i=0;ok && i<emitCount;i++){
++                const u32 *entry=table+4*i;u32 width=entry[1],height=entry[2];
++                ok=entry[0]==cursor && width>0 && width<=4096 && height>0 && height<=4096 && entry[3]==0;
++                cursor+=2ull*width*height;
++            }
++            ok=ok && cursor==detailWords;
++            const u16 *pixels=(const u16*)(table+4u*emitCount);
++            for(u64 i=0;ok && i<2ull*(detailWords-4u*emitCount);i++)if(pixels[i]>0x3c00u)ok=false;
++            if(ok){
++                u32 *groups=(u32*)(data+emit);
++                for(u32 i=0;i<h.groups;i++)if(groups[4*i])groups[4*i]|=0x80000000u;
++            }
+         }
+         if(ok)ok=fgetc(f)==EOF;
+         for(u32 i=0;ok && i<h.triangles;i++){
+--- a/world-pt/reference.inc
++++ b/world-pt/reference.inc
+@@ -8,6 +8,9 @@
+     size_t bytes=3ull*referenceWidth*referenceHeight*16;
+ #ifdef COMPARE_FILTER
+     bytes+=referenceWidth*referenceHeight*16;
++#endif
++#ifdef HISTORY_WITNESS
++    bytes=6ull*referenceWidth*referenceHeight*16;
+ #endif
+     if(reference.frame && g_vk_present>reference.frame+2){
+         contact_wait_readback();
+--- a/world-pt/retained-emission.glsl
++++ b/world-pt/retained-emission.glsl
+@@ -1,22 +1,30 @@
+-vec3 retainedEmission(uint id,vec2 bary,out bool available){
++vec3 retainedEmissionMip(uint id,vec2 bary,bool coarse,out bool available){
+     available=false;
+     PropInfo p=u.draws.land.props;
+     if(p.emissionBanks==0u || id>=p.triangles)return vec3(0);
+     Words data=Words(p.emissionData);
+     uint group=p.tags.v[id]>>16u,entry=4u*group,bank=data.v[entry],stamp=p.activeGroups.v[group];
++    bool detailed=(bank&0x80000000u)!=0u && !coarse;bank&=0x7fffffffu;
+     if(bank==0u || bank>p.emissionBanks || stamp==0u || u.frame+1u-stamp>240u)return vec3(0);
+     float strength=uintBitsToFloat(data.v[entry+2u]);
+     if(!(strength>0. && strength<=64.))return vec3(0);
+     vec2 uv=vec2(0);vec3 w=vec3(1.-bary.x-bary.y,bary);
+     for(uint i=0u;i<3u;i++)uv+=w[i]*unpackHalf2x16(floatBitsToUint(p.mesh.v[3u*id+i].w));
+-    vec2 pos=fract(uv)*128.-.5,f=fract(pos);vec3 rgb=vec3(0);
++    uvec2 extent=uvec2(128u);
+     uint start=p.groups*4u+(bank-1u)*32768u;
++    if(detailed){
++        uint table=retainedDistributionOffset(p)+2u*p.lightTriangles+1u,entry=table+4u*(bank-1u);
++        start=table+data.v[entry];extent=uvec2(data.v[entry+1u],data.v[entry+2u]);
++    }
++    vec2 pos=fract(uv)*vec2(extent)-.5,f=fract(pos);vec3 rgb=vec3(0);
+     for(int y=0;y<2;y++)for(int x=0;x<2;x++){
+-        ivec2 xy=(ivec2(floor(pos))+ivec2(x,y))&127;
+-        uint k=start+2u*uint(xy.y*128+xy.x);
++        ivec2 xy=(ivec2(floor(pos))+ivec2(x,y)+ivec2(extent))%ivec2(extent);
++        uint k=start+2u*(uint(xy.y)*extent.x+uint(xy.x));
+         rgb+=vec3(unpackHalf2x16(data.v[k]),unpackHalf2x16(data.v[k+1u]).x)*
+              ((x==0?1.-f.x:f.x)*(y==0?1.-f.y:f.y));
+     }
+     available=true;
+     return strength*rgb;
+ }
++
++vec3 retainedEmission(uint id,vec2 bary,out bool available){return retainedEmissionMip(id,bary,false,available);}
+--- a/src/nx/gpu/vk/pipeline.c
++++ b/src/nx/gpu/vk/pipeline.c
+@@ -435,6 +435,7 @@
+ #include "smoke-program.h"
+ #include "dual-source.inc"
+ #include "reflection-program.h"
++#include "capture-forward.inc"
+ #include "reflect-module.inc"
+ static u32* sh_spirv(VkSh* s, const u8* code, u64 h, int stage, const u32 mask[20], u32 len, u64 qh, u32 len_a,
+                      u64 qh_a, const ShXfb* xfb, VkCbReader read, int shipped, size_t* nw) {
+@@ -459,6 +460,7 @@
+         const char *dump=getenv(h==0x202b8339af5ac97cull?"ARCEUS_QA_VILLAGE_SMOKE_SPV":"ARCEUS_QA_PARTICLE_SPV");
+         if(dump){FILE *file=fopen(dump,"wb");if(file){fwrite(spv,4,*nw,file);fclose(file);}}
+     }
++    if (spv && stage == ST_FS && capture_forward_hash(h)) capture_forward_module(h, spv, *nw);
+     SNX_ZONE_VALUE(z_translate, *nw);
+     SNX_ZONE_END(z_translate);
+     for (int i = 0; i < s->si.ntex; i++) s->indexed |= (s->si.tex[i].flags & SNX_TEX_INDEXED) != 0;
+@@ -600,7 +602,7 @@
+             q->qh == qh && q->clen_a == len_a && q->qh_a == qh_a && vk_cb_reads_hold(&q->cbr, sh_cb_read))
+             s = q;
+     if (s && s->shipped == 1) pf_ship_found(s);
+-    if (!s && !(world_smoke_program(h) && stage==ST_FS) && (s = pf_ship_take(h, stage, mask, len, qh, len_a, qh_a)) != NULL) {
++    if (!s && !((world_smoke_program(h) || capture_forward_hash(h)) && stage==ST_FS) && (s = pf_ship_take(h, stage, mask, len, qh, len_a, qh_a)) != NULL) {
+         s->next = g_shh[h & 1023];
+         g_shh[h & 1023] = s;
+     }
+@@ -1322,7 +1324,7 @@
+    NULL when it can't be */
+ static VkSh* sh_from_record(const PfShader* r, const u32* cbr, const u32* spv) {
+     VkSh* s;
+-    if(world_smoke_program(r->hash) && r->stage==ST_FS)return NULL;
++    if((world_smoke_program(r->hash) || capture_forward_hash(r->hash)) && r->stage==ST_FS)return NULL;
+     if (r->si.ntex < 0 || r->si.ntex > SH_MAXTEX || vk_spirv_unavailable(spv, r->nspv)) return NULL;
+     s = calloc(1, sizeof *s);
+     if (!s) return NULL;

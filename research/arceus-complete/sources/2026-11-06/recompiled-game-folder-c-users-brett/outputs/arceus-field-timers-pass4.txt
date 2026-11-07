@@ -1,0 +1,240 @@
+ARCEUS 1.1.1 — FIELD TIMER FOLLOW-UP
+Offline analysis, 2026-11-06. Addresses are main-relative, hexadecimal.
+
+RESULT
+
+Three formerly broad candidates can now be separated into specific clocks:
+  1. Climbing stop decays motion vectors using a resettable elapsed-update count.
+  2. The presumed dash +D08 counter is a search-voice interval. The real dash
+     effect ramp uses another counter, +D20, normalized into float +D00.
+  3. The wormhole loop countdown is a 30-update delayed effect cleanup queue.
+     wormhole_out_keep_frame instead feeds the player facial-expression helper.
+The respawn fade hold is now mapped to state 4 with exact old-counter semantics.
+
+All are static findings, supplemented by isolated execution of original CPU
+instructions. None establishes a live update rate, displayed FPS, or a current
+gameplay speedup. No runtime source/package, save, game asset or shared report
+was edited. No game was launched, closed, driven or hot-patched.
+
+CLIMBING STOP: INITIALIZATION AND VECTOR EFFECT
+
+Updater 2549FA0 belongs to the climbing component using the nyuura configuration
+group. It first calls the ride blink helper 2518BA8 at 2549FE0. This is an
+additional reason not to throttle the entire function to fix a single timer.
+
+Object fields:
+  +D00 = state (1 active input/target smoothing; 2 stopping interpolation)
+  +D04 = stopping elapsed update count
+  +D10/+D40 = saved vectors at the start of stopping
+  +D20/+D50 = current vectors
+  +D30/+D60 = target vectors in the active-state smoothing path
+
+Setter 254B238 writes a new +D30 vector and sets state +D00 to 1.
+Stop initializer 254B254 checks W1 bit 0 and current state:
+  W1 bit 0 set, state == 1:
+    copy +D20/+D28 to +D10/+D18;
+    copy +D50/+D58 to +D40/+D48;
+    at 254B2A4, STR X8 with value 2 to +D00.
+  This 64-bit store both sets state 2 and zeros neighboring +D04. A scan for
+  only STR WZR at +D04 would miss the initialization.
+  With bit 0 clear it calls 254AF94 and clears state/vectors immediately.
+  With bit 0 set but another state it leaves the stopping clock unchanged.
+
+State 2 in the updater:
+  254A190 increments +D04 by one; 254A194 stores it.
+  254A1A8 references climbing_move_stop_frame.
+  254A2AC compares the NEW count with the configured duration.
+  If count >= duration, 254ABA0 clears state and the vector fields.
+  Otherwise 254A308 divides count by duration, resolves
+  climbing_move_stop_ease_func, and calls the selected easing function.
+  254A350..254A374 performs saved_vector + (0 - saved_vector) * eased_progress;
+  results are stored into +D20 and +D50 (second store at 254A614).
+
+This is a motion stopping blend, not just an arbitrary delay or stage counter.
+Its initializer and expiration are now clear. Actual update cadence and the
+meaning/units of the vector's individual components still need live evidence.
+
+The same updater also contains a separate division by 30 at 254A8F4, then a
+vector-length ratio at 254A8FC. Its parameter lookup and vector use deserve
+follow-up; this pass does NOT classify that whole expression as a timestep bug.
+
+RIDE SEARCH VOICE VS DASH EFFECT RAMP
+
+Updater 2587684 uses the ringuma configuration group. The older broad label
+"dash-effect +D08" is incorrect for that field.
+
++D08: search-voice interval counter
+  Gated by state +CF4 == 2 and the virtual +1B0 check at 25878F8..2587908.
+  2587910 increments +D08; 2587914 stores it.
+  The path resolves voice_seach_voice_ease_func (spelling from local data),
+  obtains two configured integer endpoints, and interpolates them using an
+  easing result evaluated from float +CF8 (2587E70..2587E9C).
+  2587EB4..2587EC0 compares the interpolated interval with integer +D08.
+  On expiration, a subsequent branch checks voice_enable_seach_voice and
+  can submit PLAY_PV_RD_217_00_SEARCH through 280B66C at 2588220.
+  2587F74 then clears +D08, even if no live sound object was available.
+  Reset sites also include 2589944 and state-setting path 258D07C.
+  The two endpoint parameter names were not recovered from their hashes.
+
++D20: the actual dash effect ramp count
+  The initial +CF4 check in 25876C4..25876D4 clears +D20 and float +D00 unless
+  state == 2. In state 2, the code looks up an integer ramp duration.
+  2588038 computes X8 = owner + D20, resolving the previous unidentified +0 store.
+  2588044 loads the counter; 2588048 adds one; 258804C stores it.
+  2588054..2588068 clamps to the configured duration; a signed-overflow branch
+  selects zero. A zero/missing duration clears both counter and normalized value.
+  2588070 divides the updated/clamped count by duration.
+  2588074 stores the normalized FLOAT result at owner+D00.
+
+The normalized ramp participates in the effects:
+  2588D90..2588DA8 feeds +CFC * +D00 through effect_dash_interval_scale_ease_func.
+  258920C..2589220 similarly feeds it through effect_dash_scale_ease_func.
+  The resulting interval-related value is passed to 1667D0 at 2589268; scale
+  components are written to the effect object's vector +130 at 258927C.
+Thus a high-frequency callback can shorten the ramp even if the effect engine's
+own animation clock has already been corrected. Live activation remains pending.
+
+Do not reinterpret all +D00 fields globally: in this ride component +D00 is a
+float ramp value, while the climbing component above uses +D00 as an integer
+state. Object ownership is essential to any correction.
+
+WORMHOLE: TWO DIFFERENT CLOCKS WERE NEAR EACH OTHER
+
+The loop at 1B5BC38 is not initialized by wormhole_out_keep_frame.
+
+Delayed effect queue:
+  owner+440 is the begin pointer; +448 is the end pointer.
+  Entries have 0x18-byte stride: signed countdown at entry+0, held object
+  reference at entry+8 (with the rest of the handle beside it).
+  1B5BC3C subtracts one and 1B5BC40 stores it.
+  The signed <=0 branch at 1B5BC44 selects expiration handling.
+  If the held reference can be resolved, 1B5C3A8 calls 2B90D40.
+  The entry is then erased through 1B5CD84, which shifts later 0x18-byte entries,
+  releases the trailing reference and reduces the end pointer.
+
+Initializer 1B5E5A0 creates an entry with count 30 at 1B5E5C0/C4, copies the
+reference supplied in X1 through 9EB228, and appends through 1B5E684 to owner+440.
+Identified callers are 1B5EA60, 1B60590 and 1B61750. The latter queues several
+held references from owner+3B0/+3C0/+3D0/+3E0/+3F0/+420.
+
+The delayed-cleanup interpretation is supported by 2B90D40: it clears retained
+resource collections, ends the effect handle through 166930, clears that handle,
+sets byte +36A and clears +2F0. This is separate from the earlier per-frame
+particle animation-progress fix. It is not evidence that all space-time
+distortion durations are driven by this 30-count queue.
+
+Facial hold parameter:
+  References to wormhole_out_keep_frame at 1B5C4A8 and 1B5C9DC resolve an integer,
+  store it into a face request's +10, set the explicit-duration byte at +C, and
+  call the shared face helper 24D35B8 at 1B5C5E8 / 1B5CB0C.
+  The latter path selects face_wormhole_out from the player_face group.
+  Consequently this setting belongs with the prior pass's face hold +280,
+  not with the delayed effect queue's countdown.
+
+RESPAWN FADE HOLD: STATE AND OFF-BY-ONE SEMANTICS
+
+Updater 24EE204 dispatches owner+240 through the five-entry table at 397D8F2:
+  state 1 -> 24EE8AC
+  state 2 -> 24EE62C (sets up fade-out through C264CC at 24EE7BC)
+  state 3 -> 24EE5E0 (waits via C26848, calls 24F2D8C, then enters state 4)
+  state 4 -> 24EE2AC (the hold counter)
+  state 5 -> 24EE570 (waits via C26384, then returns to state 0)
+
+In state 4:
+  old = +2A0 at 24EE2AC;
+  +2A0 = old + 1 at 24EE2B4;
+  lookup respawn_fade_keep_frame_count;
+  at 24EE3F4 compare OLD count with threshold; return while old <= threshold.
+  Only once old > threshold, clear +2A0 at 24EE400, start the fade-in via
+  C26204 at 24EE53C and enter state 5 at 24EE568.
+
+From zero with a nonnegative threshold N, the expiry decision is reached on
+callback N+2, not N. E.g. threshold 30 uses 32 callbacks. This is the original
+comparison semantics, not a claim that it should be 'fixed' as an off-by-one.
+It must be preserved when retiming the authored hold.
+
+The hold timer and shared fades are independent; correcting only the common
+fade animation would not correct this state-4 duration.
+
+OFFLINE EXECUTION CHECKS
+
+work/pass4-field/run-checks.ps1 builds an isolated JIT test against existing
+local runtime libraries. field-fixtures.json records all extracted addresses
+and return substitutions. field-checks.txt contains the results.
+
+310 checks, zero failures; four compiled functions:
+  - Full original climbing stop initializer, with the no-external-call branch:
+    four states, two old counter values; verified state/count reset, copied
+    vectors and balanced return stack.
+  - Original dash ramp arithmetic and branches with returns substituted only
+    at continuation boundaries: durations 0/1/2/30/120, values below/at/above
+    duration and signed overflow; checked counter/clamp and normalized float.
+  - Wormhole queue decrement instructions: inputs -1 through 31, including
+    signed expiration flags. The surrounding cleanup operation was not run.
+  - Respawn increment and original-count comparison: thresholds 0/1/30/120;
+    confirmed 2/3/32/122 callbacks respectively from zero.
+
+These tests do not run movement, audio, effects/GPU rendering, respawning, saves,
+or any interactive game process. They validate the isolated instruction paths
+and arithmetic mappings above. No new live observation hooks were added here.
+
+RECOMMENDED NEXT MEASUREMENTS
+
+For the next research candidate, the most targeted field probes would observe:
+  - climbing owner+D00 state and +D04 elapsed count around 2549FA0;
+  - ride owner+CF4 state, +D08 voice interval, +D20 ramp and float +D00 around
+    2587684, keeping these clocks distinct;
+  - respawn owner+240 stage and +2A0 count, without automating a respawn;
+  - the cleanup queue entry timer and handle at 1B5BC38, if distortion testing
+    becomes available, separate from the face hold path.
+
+Prefer clock-specific correction after observing cadence and pauses. Skipping
+these entire updater functions would also skip movement, lifetime, sound,
+effect management and (for climbing) the independent ride blink update.
+CLIMBING DIVIDE-BY-30 ADDENDUM (bounded follow-up)
+
+254A8F4 is a reference-magnitude conversion inside a normalized motion/control
+ratio. It is neither the +D04 elapsed counter nor the preceding vector smoothing
+coefficient. The exact downstream algebra is now resolved; human-readable names
+of two configuration parameters and three output properties remain unproven.
+
+Parameter source:
+  The group is nyuura (hash 6A437D1436C47A27). The float parameter selected by
+  hash 19AD98E871F39F53 is assembled at 254A72C..738 and loaded from the matched
+  parameter node +30 at 254A820. Call it P. The other float parameter, Q, uses
+  hash 9B21BFA507A1CE5D at 254AA00..A0C and is loaded at 254AB24. Both are
+  direct configuration float lookups, not clocks. Missing lookup paths leave
+  their value at zero; this analysis assumes ordinary valid positive P.
+
+Vector and output use:
+  254A838 loads V = owner+D50, the already-smoothed or stopping-decayed vector.
+  254A83C..848 computes dot(V,V). The zero-vector path sends zero, zero, one.
+  For nonzero V, 254A8BC..8EC computes U=V/length(V) and L=length(V).
+  254A8F4 computes P/30; 254A8FC computes r=L/(P/30).
+  If r<=1, 254A908..90C sends r*U.y and r*U.x; its third output remains1.
+  If r>1, 254AB3C..B4C sends U.y and U.x and chooses min(r,Q) for output3.
+  All three are passed through scalar property setter1950188 at254A868,
+  254A87C and254A890. Their identifiers are respectively:
+    main+397DBA8 = 800D3E6EEB34B0F9 (X scalar)
+    main+397DBB0 = 97CFAF1ABB661575 (Y scalar)
+    main+397DBB8 = 9BD8EF84FDF7B8C6 (third scalar, speed-like multiplier)
+  Setter1950188 looks up the identifier in owner+730/+738, resolves its target,
+  and forwards the float through27AAFE0. The inspected block does not add the
+  normalized vector into the actor's world position. Calling the third property
+  an animation speed is a plausible interpretation, not a verified string name.
+
+Independent corroboration within the same climbing flow:
+  Function25540E8 looks up the identical nyuura/P pair at25542D4..2E0 and
+  25543C4. It divides P by30 at25543E0 and multiplies an existing directional
+  vector by the result at25543E8 before the subsequent movement-vector math.
+  This supports interpreting P/30 as the reference movement quantum at the
+  authored30Hz rate, which the updater divides out to obtain a dimensionless
+  control ratio. The name of P and exact physical units are not established.
+
+Consequence for future fixes: do not replace254A8F4 with an arbitrary measured
+  delta by itself. If V stays unchanged and the denominator becomes P/FPS,
+  r grows by FPS/30, changing the control blend/third scalar. Any correction
+  needs the producer and consumer units traced together. No runtime change or
+  new test was made for this addendum. Private disassemblies1950188,254AFE8 and
+  25540E8 accompany the existing2549FA0 evidence.
+

@@ -1,0 +1,232 @@
+ARCEUS 1.1.1 MESSAGE ADVANCE STATES AND POST-COMPLETION DELAYS
+Offline pass 6, 2026-11-06. All addresses are hexadecimal main-relative.
+Local main.bin SHA-256:
+d13df31aef8e3bdf9dce8fcb12518900218091b8f33a6880b36cfaaf2acf44c0.
+
+RESULT
+
+Three different advance controls are now distinguished:
+1. Text+114 is a readiness latch promoted from1 to2 at the end of an ordinary
+   FBFBD0 processing call. It is not a seconds timer or minimum-duration field.
+2. Text+A2/+A3 are an optional byte threshold/counter for automatic advancement
+   in text mode2 or3. Mode1 is manual; mode3 permits manual input to bypass the
+   automatic threshold. These bytes are not a universal input debounce.
+3. The timed active-message wrapper has a signed +9C countdown AFTER its message
+   reaches state6. It requests close when the OLD value is<=0. The base wrapper
+   has no such countdown. Queued2485A40 uses the timed subtype.
+
+An unchanged-instruction fixture also demonstrates a narrow input-reuse edge:
+with message+D9 enabled, the fast-finish call and the following normal call can
+accept the same fresh mask at two successive terminal text boundaries within
+one27379B8 invocation. The consumed one-shot text+17A does not repeat this way.
+This is NOT proof of advancing two queued NPC messages, nor proof that live NPC
+dialogue uses+D9. The field constructor initializes+D9 to zero and the traced
+field wrapper does not enable it.
+
+Final isolated result: 1752 checks, zero failures, 26 compiled entries from
+12 complete functions plus dynamic internal entry points. No runtime/package,
+save, asset or shared output was edited. No game operation was performed.
+
+OBJECT IDENTITY AND VIRTUAL DESCENDANTS
+
+Use distinct names:
+  A = active wrapper at message-manager+58.
+  M = message implementation at A+68.
+  T = text processor at M+A8.
+Do not conflate same-numbered fields of these three objects.
+
+2484ED8 invokes27379B8 once while A+98==1, then tail-calls A virtual+40.
+27379B8 invokes2737ABC first, writes T+178=(M+80!=1 && M+80!=4), invokes T
+virtual+50 (FBFBD0), records its status in M+B8 and tail-calls M virtual+88.
+
+Relocation-confirmed M virtual+88 targets:
+  416F1D8 base,416F378 demo,416F9D8 small system,416FE68 shared regular base,
+  416FFD8 regular,4170148 loud00,41702B8 loud01 ->2737D94.
+  416FB48 system base,416FCD8 system ->2749300.
+The concrete layout associations are verified by +90 loader references to
+msg_demo_00_in/out, msg_sys_00_s_wake/close, msg_00_wake/close,
+msg_loud_00_wake/close, msg_loud_01_wake/close, and msg_sys_00_wake/close.
+Private vtables.txt records the precise slots and local strings. These are layout
+families, not a claim that every family is used by the current NPC conversation.
+
+MESSAGE STATE+80 IS NOT A COOLDOWN
+
+2737D94's table397E42A maps entry states1..5 to handlers; states0/6/7 and higher
+return without a state handler. In states1 or4, table397E42F dispatches M+B8:
+  status0 or4: if status==M+E0, set state6; otherwise retain state.
+  status1: set state4.
+  status2: set state1.
+  status3 or>4: retain state.
+Entry state2 invokes virtual+98, sets state3, THEN checks virtual+B0 in the same
+call; a true result sets state4 immediately. Entry state3 just checks+B0.
+Entry state5 checks virtual+70; true clears M+D8 and sets state7.
+Thus one owner call can cross2->3->4 if the completion predicate is already true.
+No countdown or elapsed-time arithmetic appears in this state dispatcher.
+
+2749300 has the equivalent state/status branch block at2749450..4FC. Its remaining
+work handles system-layout animation/cursor state, not a scalar advance delay.
+For the regular family, +B0=274A4A4 checks animation0 completion, and
++70=274A23C checks animation1 completion. These inspect animation progress at
+animation+20 against127728's16-bit extent and127744's status. The system family
+has corresponding animation predicates2749540 and2749218.
+The instruction fixture executes2737D94;2749300 was statically compared only.
+
+M+E0 is a TERMINAL STATUS SELECTOR, not a timer: constructor2735B8C sets0 at
+2735BB4. C67F30 sets it to4 when its configured text mode is nonzero, otherwise0
+(C67F98..FA4). No increment/decrement of this field occurs in the traced path.
+M state6 can be resumed with another string:27376B0/27378A4, reached through
+regular virtual+58/+60, change6->4 after replacing the text (273788C/27379A0).
+This differs from closing to state7 and allocating the next manager descriptor.
+
+TEXT+114 READINESS LATCH
+
+The ordinary FBFBD0 wrapper loops around2B315E8, then atFBFC4C..5C promotes
+T+114==1 to2. Promotion happens after the inner processing loop ends, so a fresh
+wait state created during that loop is not immediately armed within the same
+loop. The embedded-wait and external-condition early returns bypass promotion.
+
+Base processor2B315E8 requires T+114==2 before calling manual advance predicates:
+  state2, T+BC not1/2:2B31658..74 ->virtual+68 (FC1078).
+  state0, T+BC==0, mode1:2B3182C..48 ->virtual+70 (FC10E4).
+  state0, mode3:2B31D24..40 tries the same predicate before automatic delay.
+The readiness latch is reset/replaced at state transitions; text replacement
+2B311F0 clears it at2B31480, sets text state4 at2B31470 and clears auto counter
++A3 at2B3147C. Examples of state changes setting readiness1 include2B3177C,
+2B3195C,2B31D18,2B31DF4 and2B31FA4.
+
+No wall-clock minimum delay follows from this latch. With one ordinary wrapper
+call per presentation frame, one-call boundaries would shorten at higher FPS;
+that callback-to-presentation relationship remains a live observation question.
+The fixture confirms readiness1 rejects a manual state0/mode1 attempt, promotes
+to2, and the following wrapper accepts the still-present fresh mask. The input
+predicate does not consume/clear that shared mask. This does not simulate a new
+physical press or claim that the input collector repeats a held button.
+
+OPTIONAL AUTOMATIC ADVANCE COUNTER
+
+In text state0 with T+BC==0, table398480A uses T+90 mode:
+  0: return without an advance decision.
+  1: manual predicate gated by readiness2; no+A3 increment.
+  2: automatic byte threshold.
+  3: first try readiness2/manual acceptance, then automatic byte threshold.
+Out-of-range modes take the immediate state1/status4 branch.
+
+Automatic path2B31D44..64:
+  if old(A3)>A2: advance;
+  else A3=(A3+1)&255; advance only if new(A3)>A2.
+Advance sets text state1/readiness1 and returns status4 through2B31774..84;
+wrapper exit promotes readiness to2. Otherwise return0.
+From zero, thresholdN<255 advances on eligible wrapper N+1; tested0/1/2/30/254.
+Threshold255 never exceeds its threshold under byte wrap;257 synthetic calls
+confirmed no advancement. No claim is made that255 is a legitimate live setting.
+Mode3 manual acceptance with threshold30/counter0 advanced immediately and left
+counter0, establishing that this is not a required minimum manual delay.
+
+Concrete configuration source C67F30:
+  caller descriptor+8 ->T+90 mode if signed value<=3 (C67F7C..8C);
+  descriptor+C low byte ->T+A2; T+A3=0 (C67F88..94);
+  nonzero mode ->M+E0=4, zero mode ->M+E0=0.
+Its M is retained at caller+5B0. This configuration route is distinct from the
+field active-wrapper constructor24841E4. The shared text constructor2B30A88
+initializes mode0 and threshold/counter0. Values/meanings of specific live
+descriptors are not established, and no universal30-count delay is inferred.
+
+D9 WRITERS AND TWO ACCEPTANCE BOUNDARIES
+
+M constructor2735B8C clears D8/D9 together with STRH at2735CC8. Verified writers:
+  2738100 stores bool(W1) at+D9; its indexed caller144A158 always supplies1
+  (144A1BC..C4). That callback is bound at1448400..144842C by14482C4; it selects
+  a message from a retained controller's array+300. Its live trigger/name was
+  not established, so this is not labeled ordinary NPC input.
+  C67F30 copies caller descriptor+12 directly to M+D9 atC67F64..6C.
+Other whole-image direct-byte writes at offsetD9 were inventoried privately;
+an equal offset on another class does not establish a message writer. This
+is not an exhaustive alias/memcpy/indirect-write proof.
+
+Field construction24841E4 does explicitly enable D8 and set M state2 at
+2484450..60, but does not set D9. The two flags must not be conflated.
+
+With D9 enabled,2737ABC repeatedly invokes FBFBD0 until its return is not1,
+then27379B8 still invokes FBFBD0 normally. A wait return2 or terminal return0
+ends the drain; the normal call can see readiness2 promoted by that drain.
+Fresh mask bits are not consumed; text+17A is consumed by the predicate.
+
+The new fixture uses complete original functions and a terminal page-wait:
+  M state1, terminal selector E0=4;
+  T state2, mode1, readiness2, total-lines99=1 and current-line9B=1;
+  manual fresh mask2 enabled, no automatic flag, D9 varied.
+The original core takes its end-of-buffer state2 branch, returns0 and changes
+T to state0/readiness1. Wrapper exit promotes readiness2. Results:
+  D9=0: one normal call ->M state1,T state0,status0.
+  D9=1: drain then normal ->M state6,T state1,status4.
+  D9=1 with one-shot17A instead of fresh mask: M state1,T state0,status0.
+Both D8=0 and1 give these results with cursor callbacks stubbed.
+The terminal boundary executes original color-query and post-layout call edges;
+color/layout implementations are explicit harmless stubs, not rendered text.
+
+This establishes two acceptance boundaries under those configured states in
+one parent call. It does not establish two different queued messages, arbitrary
+multi-page skipping, current NPC mode1/E0=4, or live D9 activation. More frequent
+physical button presses are not represented by an event queue in this path:
+FC1078/FC10E4 read the same current fresh bitmask, as established in pass5.
+
+TIMED ACTIVE-WRAPPER SUBTYPE: NEW POST-COMPLETION COUNTDOWN
+
+2485338 constructs the base A via24841E4, then installs vtable415DBE0. It copies
+descriptor+28 to A+9C and A+A0 at2485374..78, and descriptor+2C to A+A4 at
+248537C..80. Its virtual+40 is2485390; base vtable415DB18+40 is RET24851FC.
+
+2485390 after-update operation:
+  if M+80!=6: return unchanged;
+  if signed old(A+9C)<=0:2484ECC(A) ->2737C00(M,1), request animated close;
+  A+9C-=1, including after the close request (24853D8..DC ->24853BC).
+No seconds conversion or clock read appears. From initial positive N, close is
+requested on state6 visit N+1. Counts-1/0 close on the first eligible visit.
+The final value is-1 for nonnegative starting counts, -2 for initial-1.
+A+A0 remains unchanged in this method. Other descriptor fields are not assigned
+unverified semantic names here.
+
+Concrete allocation routes:
+  queued/request2485A40 ->2485E48 ->2487E04 ->2485338 (timed subtype).
+ 2486254 ->2487F14 ->2485338 is another timed construction route.
+ 2485EE4 constructs24841E4 directly at2485FC8 (base/no after-update countdown).
+ 2487CF0 likewise directly constructs the base at2487D70.
+Do not infer timed subtype solely from a message layout or from M state6.
+
+2484ED8 invokes A virtual+40 AFTER the current27379B8 call. Thus the first
+countdown decrement can occur in the same wrapper update that reaches M state6.
+This is a completion-to-close hold, separate from the latch and auto-advance
+counter. It could shorten if this wrapper's calls scale with FPS, but live
+descriptor values, subtype and cadence have not yet been observed.
+
+MANAGER-LEVEL MULTIPLICITY LIMIT
+
+24858F4's active branch calls2484ED8 once and then clears A if M state7. It does
+not loop into the next queued descriptor that same invocation. Its no-active
+branch may create one queued wrapper via2485A40, but does not run its normal
+active update immediately.2485A40 returns the existing active object when one
+exists. This inspected path supplies no evidence of draining several queued
+NPC messages from repeated A/B events in one manager update.
+Other owners/callers, callback side effects and live scheduling could matter;
+this is not a global one-message-per-frame proof.
+
+VERIFICATION AND NEXT OBSERVATION
+
+message-checks.txt:1752 checks,0 failures,26 compiled entries.12 full original
+functions and two original jump-table ranges are copied without alterations,
+at their original main-relative addresses. fixture-provenance.json records
+the hash, exact ranges and stub boundaries. Dynamic block targets account for
+the compiled-entry count being larger than12.
+Coverage: owner states0..8/status0..5/terminal selectors0 and4; completion gates;
+readiness1->2 and embedded-wait early return; automatic threshold boundaries
+and mode3 manual bypass; parent/drain reuse with D8/D9 and one-shot variants;
+timed subtype state gate, signed expiry and old-value boundary.
+The actual2737C00 close implementation, glyph parsing/rendering, resource setup,
+input collector, physical button transitions and live cadence are not simulated.
+
+Most useful future observation should include A vtable/+9C/+A0/+98, M vtable/
++80/+B8/+D8/+D9/+E0, T+90/+A2/+A3/+A8/+114 and fresh mask, while retaining the
+outer-update serial. This distinguishes timed closure, automatic advancement,
+ordinary latch progression and intentional fast-finish reuse. No timing patch
+is justified merely by these synthetic possibilities; retain the original
+Vulkan path and let the user operate/close future game tests.

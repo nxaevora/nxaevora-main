@@ -1,0 +1,25 @@
+ARCEUS PINK-BOX REFLECTION TEST
+
+1. With the game closed, open Arceus-Reflection-Test.exe from this outputs folder in Windows.
+2. Use your controller to return to the crafting box. When the pink scratches/edges are visible, press F3 once. Allow the capture pause to finish.
+3. Move the camera slightly, keeping the pink box visible, and press F3 again. A third view where the highlight changes would also help.
+4. Save and close the game yourself. Tell Codex the test is done.
+
+This is diagnostic capture, not a proposed color correction. It preserves the accepted native-shadow correction, Vulkan, native BC textures, 1440p settings, 120 FPS target, camera 2.2, menu/timing/blink/event-camera fixes, and background controller input. Displayed FPS is not guaranteed.
+
+The launcher verifies the accepted installed B32D40B0 runtime and the diagnostic runtime hashes. It starts outputs/reflection-runtime/ArceusTest.exe with --game pointing at the existing game folder. It never replaces the installed executable. Keep the supporting reflection-runtime folder in place. No game has been launched during preparation.
+
+F3 saves the existing final image and attachment buffers plus:
+  *_reflections.tsv: cube texture metadata, one row per mip level.
+  *_reflection_NN.bin: raw Vulkan texture bytes, every face/layer for that mip.
+  *_lighting.tsv: per-draw shader, output target, texture descriptors and addresses.
+  *_light_N_cbN.bin: CPU-side constant buffer snapshots where valid.
+
+BC6H signed/unsigned images stay compressed in the dump; row/layer byte counts and block dimensions are recorded. Cube capture is bounded to 256 mip entries / 64 MiB, textures used within two presents, up to 16 mip levels. Skipped entries and write failures are reported. Ordinary attachment capture retains its separate existing limits.
+
+Lighting metadata covers the two identified ha_light shader variants, up to eight draws in the latest recorded frame. CPU constant data is explicitly labeled; pending GPU-written or unmapped constants are omitted and flagged rather than reported as valid. Capture metadata must be checked before concluding that any pixel's inputs are fully known.
+
+Files remain local in C:/Users/brett/Documents/Codex/work/arceus-games/ArceusTest/captures.
+The latest run directory will be written to this outputs folder's current-controller-test.txt.
+
+Validation completed: diagnostic compile/link; actual C capture-size tests for six-face BC6H chains including 2x2 and 1x1 mips, uncompressed textures, stale/invalid/oversize rejection; baseline rebuild .text/.rdata/.data identical to accepted binary; launcher --verify-only exit0. One pre-existing renderer initializer warning remains. Live controller, GPU readback and visual validation await this test.

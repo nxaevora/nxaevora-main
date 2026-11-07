@@ -1,0 +1,81 @@
+Arceus elapsed-time experiment, November 6, 2026
+
+Branch: experiment/arceus-clock-hooks in the existing local colardocookie/nxaevora-main checkout.
+Default remains 30 FPS. No push or PR. Experimental environment flag: SNX_ARCEUS_FPS60=1.
+
+Mechanism verified during the read-only run:
+- The main loop calls the four clock-mode updates each frame with mode 1. Their indexed setter receives 33,333,334 ns.
+- Calls return to main+0x278150C, +0x2781540, +0x2781574 and +0x27815A8 for channels 0 through 3.
+- The loop separately resets channel 2 to zero at main+0x2781358. Consumers check for zero before scheduling work.
+- Live consumers read these duration records. This confirms they are used during execution, rather than merely dormant constants.
+
+Implemented experiment:
+- Full 32-byte main build ID and the three hook entry instructions must match before anything is installed.
+- Only the four observed call sites and their expected 33,333,334 ns input are eligible for replacement.
+- Channel 0 samples elapsed host time since the previous batch. Channels 1 through 3 use that same duration.
+- Zero-duration writes and other call sites are unchanged. Long stalls are capped at 100 ms; excess time is intentionally discarded, so this does not claim time conservation through long loads/stalls.
+- Runtime presentation cap becomes 60 for this process only. The INI default and nvn_native=0 remain.
+- No Z-A implementation was copied. This uses Arceus's verified duration setter, not Z-A addresses or its integer tick algorithm.
+
+Validation so far:
+- Targeted build passed.
+- Standalone C99 test passed with -Wall -Wextra -Werror: all channels share a duration, alternating 60/40 FPS intervals conserve elapsed time, object reset and ordering guards work, long stalls are capped.
+- Read-only probe session exited 0 after the user closed it.
+- Experimental run timing-20261106-030912-278 reached 60 FPS in runtime logs. The clock probe records ~16.7 ms values reaching consumers. Channel 2's separate zero write remains zero.
+- Gameplay correctness, display completion, encounters, battle timing and behavior across pauses remain unverified. This is a candidate, not a completed normal-speed 60 FPS implementation.
+
+Testing:
+Close any currently running game, then double-click Test-Arceus-60FPS.cmd from your desktop. This also avoids the agent-launched session's controller detection problem. It uses the existing save, and has no timeout. Close the game yourself.
+Use Capture-Arceus-Timing.cmd for the 30 FPS comparison. Do not adjust the runtime FPS slider during a comparison.
+Compare the same walking route, roll duration/distance, camera rotation, thrown object trajectory, encounter transition, battle animation and menus. Report systems that run fast, slow, or get stuck. Save/load and fluctuation tests are still required.
+
+A local backup of the initial save is at:
+C:\Users\brett\Documents\Codex\work\arceus-runs\save-before-clock-experiment-20261106
+All raw logs, game images and save files remain outside Git.
+User feedback and Escape correction (03:18 local):
+- User reports generally normal-speed 60 FPS, but dialogue appears twice as fast. Water animation may also be twice as fast; this is unconfirmed without comparison.
+- These are outstanding defects; the central elapsed-time hook is not sufficient to declare full normal-speed support.
+- Removed the gameplay Escape-to-quit handler. Escape still dismisses runtime overlays; window-close remains available. Targeted runtime rebuild passed; game executable and packaged test executable hashes match. Live Escape behavior has not yet been tested.
+- Latest on-disk save backed up locally to arceus-runs/save-before-no-escape-20261106-031854.
+- Previous agent-launched experimental session logged no SDL joysticks. Desktop launch previously detected the DualSense Edge; controller detection in this updated build is pending the next user launch.
+Completed controller test: timing-20261106-031922-185
+- DualSense Edge Wireless Controller detected with 6 axes and 17 buttons; sensors enabled.
+- Log ended with Exit; no JIT misses and no clock guard/order warnings found.
+- Latest save files written at 03:26:34 local and backed up to arceus-runs/save-after-controller-test-20261106-032730.
+- Main swapchain submission interval after warmup: mean 16.8669 ms, median 16.6625 ms, p95 17.9578 ms. These are CPU submission intervals, not display completion.
+- One early VK_ERROR_OUT_OF_DATE_KHR on the first swapchain; subsequent swapchain produced 25,768 accepted calls.
+- User remains unsure whether menu animations are fast or simply smoother. Menu, dialogue and water timing require matched elapsed-time comparisons; no blanket animation slowdown applied.
+- Next comparison: use Capture-Arceus-Timing.cmd (30 FPS) and Test-Arceus-60FPS.cmd on the same save, same menu transition and same dialogue text/settings. Compare transition/reveal duration, not smoothness. Both retain Vulkan and manual close; Escape-to-quit is removed in the installed runtime.
+Dialogue investigation, after baseline timing-20261106-032757-489:
+- User confirms dialogue typing runs at twice normal speed in 60 FPS. Treat this as a confirmed user-observed defect, distinct from still-uncertain menu and water animation speed.
+- Baseline: mean submission interval 33.3540 ms, median 33.3235 ms, zero failed presents; DualSense detected; normal Exit. Latest save timestamp 03:33:05 local. Backup: arceus-runs/save-before-dialogue-probe-20261106-033900.
+- Static investigation located MessageView string references in a virtual function at main+0x120ae38, referenced by vtable slots at main+0x41046c0, +0x41057b0 and +0x41058b0. This function branches on the object's u32 field at +0xf0. The meanings of those states and their relationship to character reveal are not yet established.
+- Added optional SNX_ARCEUS_DIALOGUE_TRACE=1. It requires the existing full main build-ID match plus entry instruction guard. The wrapper calls the original exactly once with unchanged guest inputs, records state before/after, call ordinal, timestamp, object and caller. Logs first ten calls, state changes and every 60th call. No text contents, memory dumps or uploads.
+- This is a diagnostic, not a dialogue speed correction. Virtual-dispatch hooks may not see direct calls. Build and launcher syntax checks passed; live probe coverage remains untested.
+- Two launchers: Test-Arceus-Dialogue-30FPS.cmd and Test-Arceus-Dialogue-60FPS.cmd. For each, talk to the same repeatable NPC, let the same text finish revealing without holding a button, then close manually. This supplies state-transition timing to guide the targeted fix. Neither launcher has a timeout; Vulkan and the Escape correction remain.
+Follow-up animation audit:
+- User clarifies dialogue looked correct in BOTH new tests (60 FPS timing-20261106-033946-606 and 30 FPS timing-20261106-034159-321). No dialogue speed correction was added between these tests and the prior report. Treat earlier fast-dialogue report as unresolved/inconsistent, not a proven fix.
+- 60 FPS run main swapchain mean 16.6679 ms; baseline swapchains approximately 33.33-33.41 ms. Both detected DualSense and ended normally.
+- MessageView probe installed but recorded ZERO callbacks in both runs. It did not cover the dialogue exercised; cannot use it to infer reveal timing.
+- Shared clock callers main+0x294e264 and +0x294e6d0 load duration and only test >=1 before virtual callbacks at vtable+0xa8/+0xb0. Smaller positive duration therefore does not itself reduce callback frequency. Each downstream update must consume elapsed time or maintain its own timing. Do not globally halve callbacks, which may also affect input/render work.
+- Other sampled callers main+0x1e82938 and +0x2b4344c perform floating-point duration conversion/scaling; subsystem identification remains incomplete.
+- Blink string registration main+0x21b6ca8 pairs Blink with function main+0x1aafc18. That function checks a flag and a blink_disable query before triggering downstream functions. This is a candidate scripted blink entry, not evidence of the automatic blink interval or connection to the corrected clock. No blink speed changes made.
+- User observes frequent blinking at 30 FPS too. Blink frequency and eyelid animation duration must be evaluated separately over matched scenes; both remain unverified.
+Optional 120 FPS diagnostic experiment:
+- User explicitly requested testing 120 FPS to amplify remaining timing defects.
+- SNX_ARCEUS_TARGET_FPS accepts exactly 60 or 120; unsupported nonempty values refuse initialization. Existing SNX_ARCEUS_FPS60=1 remains compatible. No flag means unchanged 30 FPS default.
+- Same guarded four-channel elapsed-time update, zero writes preserved, same 100 ms stall cap. Initial/reset duration now follows the selected target (8,333,333 ns at 120); subsequent updates use actual elapsed time even when rendering misses target.
+- New launcher Test-Arceus-120FPS.cmd selects 120, working Vulkan and existing controller environment, no automatic timeout. Escape remains non-exiting. Existing 30/60 launchers remain available.
+- Target runtime build and launcher syntax passed. Standalone C test checks four-channel coherence and elapsed-time conservation at mixed 120/60 intervals, as well as earlier 60/40 cases, reset and stall behavior. No live 120 FPS validation yet.
+- Recommended diagnostic order: same stationary scene (blink interval versus eyelid motion, water), fixed walking/roll route, dialogue without holding buttons, menu transitions, then encounter/battle. Check observed frame timing before interpreting a lack of increased speed as evidence; a 120 cap does not guarantee 120 actual presents.
+- Known limitations remain: no matched visual measurements, message probe had no callback coverage, shared-clock scheduling gates may still permit per-frame counters downstream. No global animation slowdown or callback skipping added.
+Subsystem fix candidate following timing-20261106-034927-483:
+- User reports fast blinking, Poké Ball flight and water; broken NPC interactions; possibly fast cutscene cameras; nearly stalled Pokémon release effects. Movement and character animation looked normal.
+- Main swapchain: mean submission interval 10.4223 ms (~95.95 submissions/s), median 9.3219 ms, p95 14.0221 ms. No failed presents or clock-order guard warnings. These are API submissions, not display completion. Last save remains 03:33:05 local; backed up before deployment to arceus-runs/save-before-subsystem-fixes-20261106-040454.
+- WaterCurrentTime update at main+0x29faf8c builds float 1/30 and adds it every update. Optional patch replaces the two constant-building instructions with ADRP/LDR from a dedicated mapped guest page. The four-channel clock update writes elapsed seconds to that cell; water consumes the same measured duration. Existing wrap behavior remains.
+- Effect-group update at main+0x2b90040 divides channel-1 ns by 16,666,666, truncates to integer, then converts back to float. Sub-16.67 ms frames therefore contribute zero; this strongly matches the stalled release-effect report. Optional patch replaces integer conversion with FCVT S1,D0 and removes the redundant integer-to-float conversion. The downstream group calculator accepts float progress and stores it as float. Causality for the specific reported animation still needs live validation.
+- Both patches are guarded by the existing complete main build-ID check, exact original instruction words, and AOT invalidation metadata/function coverage. They change in-memory instructions only. Existing runtime jit_code_changed invalidates affected AOT/direct/inlined copies so changed code is recompiled. Original game files and code DLL remain unchanged.
+- Opt-in environment: SNX_ARCEUS_TIMING_FIXES=1, requiring experimental 60 or 120 FPS. New launchers: Test-Arceus-Timing-Fixes-120FPS.cmd and Test-Arceus-Timing-Fixes-60FPS.cmd. Existing launchers leave these new fixes OFF for comparison.
+- Targeted runtime build passed, launcher syntax passed. Local descriptor checker loaded only the code DLL metadata (no guest execution): ABI 15, 227110 functions, invalidation metadata present, water patch covered by function main+0x29fa554 (12320 bytes), effect patch by main+0x2b8fe98 (776 bytes). New instruction encoding independently checked with LLVM assembler/disassembler.
+- Numeric regression check at 30/60/96/120 FPS: corrected water accumulates ~1 second per second; fractional effect progress ~60 ticks per second; old effect path gives zero steady progress at 96/120. Existing elapsed-time C tests passed. Live JIT application and gameplay remain untested.
+- Next focused test: observe water and release a Pokémon at 120 using the new launcher. Do not interpret these two changes as fixes for fast ball flight, blinking, NPC behavior or cutscene cameras; those remain unresolved. Close manually; no timeout, no Escape exit, working Vulkan retained. All files/logs remain local; no commits/pushes/PRs.

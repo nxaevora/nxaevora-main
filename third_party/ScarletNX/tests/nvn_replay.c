@@ -71,6 +71,7 @@ typedef struct {
     NvnOpCopyTexture gpu_copy_texture;
     NvnOpReportCounter gpu_report;
     NvnOpBindImage gpu_bind_image;
+    NvnOpTransformFeedback gpu_xfb;
     uint32_t fault_count;
     const char* last_fault;
     uint64_t last_fault_value;
@@ -203,6 +204,9 @@ static int mock_gpu_op(void* ctx, NvnOpCode code, const void* payload) {
         break;
     case NVN_OP_BIND_IMAGE:
         k->gpu_bind_image = *(const NvnOpBindImage*)payload;
+        break;
+    case NVN_OP_TRANSFORM_FEEDBACK:
+        k->gpu_xfb = *(const NvnOpTransformFeedback*)payload;
         break;
     default:
         return 0;
@@ -927,6 +931,28 @@ static void test_raster_methods(void) {
     nvn_oplist_free(&lu);
 }
 
+static void test_reset_counter(void) {
+    Mock k = {0};
+    NvnReplayEnv env = make_env(&k);
+    NvnOpList l = {0};
+    NvnReplayStats st = {0};
+    NvnOpResetCounter samples = {1u, 0u}, primitives = {14u, 0u}, bad = {17u, 0u};
+    NvnOpRaster point = {NVN_RASTER_POINT_SIZE, {0x40800000u, 0u, 0u}};
+    CHECK(nvn_oplist_append(&l, NVN_OP_RESET_COUNTER, &samples, sizeof samples));
+    CHECK(nvn_oplist_append(&l, NVN_OP_RESET_COUNTER, &bad, sizeof bad));
+    CHECK(nvn_oplist_append(&l, NVN_OP_RESET_COUNTER, &primitives, sizeof primitives));
+    CHECK(nvn_oplist_append(&l, NVN_OP_SET_RASTER, &point, sizeof point));
+    nvn_replay_list(&env, &l, &st);
+    CHECK(k.write_count == 4);
+    CHECK(k.writes[0].method == 0x54C && k.writes[0].value == 0x01u);
+    CHECK(k.writes[1].method == 0x54C && k.writes[1].value == 0x10u);
+    CHECK(k.writes[2].method == 0x546 && k.writes[2].value == 0x40800000u);
+    CHECK(k.writes[3].method == 0x68B && k.writes[3].value == 0u);
+    CHECK(st.replayed[NVN_OP_RESET_COUNTER] == 2 && st.replayed[NVN_OP_SET_RASTER] == 1);
+    CHECK(st.faults == 1 && k.last_fault && !strcmp(k.last_fault, "counter type") && k.last_fault_value == 17u);
+    nvn_oplist_free(&l);
+}
+
 static void test_raster_bad_payload(void) {
     Mock k = {0};
     NvnReplayEnv env = make_env(&k);
@@ -1370,6 +1396,23 @@ static void test_gpu_ops_reach_callback(void) {
     nvn_oplist_free(&l);
 }
 
+static void test_transform_feedback_op(void) {
+    Mock k = {0};
+    NvnReplayEnv env = make_env(&k);
+    NvnOpList l = {0};
+    NvnReplayStats st = {0};
+    k.gpu_op_ok = 1;
+    NvnOpTransformFeedback end = {NVN_XFB_END, 0u, 0x400002000ull}, bad = {NVN_XFB_KIND_COUNT, 0u, 0x10ull};
+    CHECK(nvn_oplist_append(&l, NVN_OP_TRANSFORM_FEEDBACK, &bad, sizeof bad));
+    CHECK(nvn_oplist_append(&l, NVN_OP_TRANSFORM_FEEDBACK, &end, sizeof end));
+    nvn_replay_list(&env, &l, &st);
+    CHECK(k.gpu_op_calls == 1 && k.gpu_op_code == NVN_OP_TRANSFORM_FEEDBACK);
+    CHECK(k.gpu_xfb.kind == NVN_XFB_END && k.gpu_xfb.address == 0x400002000ull);
+    CHECK(st.replayed[NVN_OP_TRANSFORM_FEEDBACK] == 1 && st.faults == 1);
+    CHECK(k.last_fault && !strcmp(k.last_fault, "transform feedback kind") && k.last_fault_value == NVN_XFB_KIND_COUNT);
+    nvn_oplist_free(&l);
+}
+
 static void test_gpu_ops_null_callback(void) {
     Mock k = {0};
     NvnReplayEnv env = make_env(&k);
@@ -1465,6 +1508,7 @@ int main(void) {
     test_bind_program();
     test_draw_path_bad_payload();
     test_raster_methods();
+    test_reset_counter();
     test_raster_bad_payload();
     test_bind_vertex_attrib();
     test_bind_vertex_stream();
@@ -1472,6 +1516,7 @@ int main(void) {
     test_vertex_ops_bad_payload();
     test_gpu_ops_reach_callback();
     test_gpu_ops_null_callback();
+    test_transform_feedback_op();
     test_gpu_ops_refused();
     test_gpu_ops_bad_payload();
     test_gpu_ops_range_checks();

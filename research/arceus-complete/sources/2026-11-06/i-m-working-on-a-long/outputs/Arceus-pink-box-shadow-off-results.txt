@@ -1,0 +1,36 @@
+Pink-box shadow-OFF comparison — 2026-11-06
+
+Confirmed: disabling native shadows does not remove the purple box highlights.
+Preserve the accepted shadow fix. No repeat shadow-ON test is needed for this
+discriminator; the earlier accepted ON capture already shows the same symptom.
+
+Run: C:/Users/brett/Documents/Codex/work/arceus-runs/timing-20261106-184235-253
+Closed normally: game_exit=0. No ArceusTest process found during inspection.
+native_shadows=false; DualSense Edge and both sensors detected.
+Two detailed captures succeeded,64 attachments each, zero failures:
+  184316 buffers1, present2560 — frontal box
+  184325 buffers2, present3597 — mission-complete view
+Both visibly show the purple scratches and edges reported by the user.
+
+Raw producer surfaces changed as intended:1365x1365 OFF vs1024x1024 ON.
+Thus the test exercised different GPU shadow behavior, beyond its settings label.
+The same2560x1440 scene lighting buffer already contains purple before final
+postprocessing. The two approximate tabletop views have very similar lighting
+statistics:2.31% classified-purple pixels ON vs2.21% OFF; mean raw lighting RGB
+ON .088779/.059687/.052560, OFF .088556/.059560/.052310. These are distribution
+comparisons, not registered pixel equality or proof of identical illumination.
+
+The purple is not confined to high material-green values:2202 of2431 purple
+tabletop pixels in OFF have green<=15 in that material buffer. A metal-like
+mask alone is therefore insufficient. At six sampled tabletop pixels, earlier
+emission-like and three half-resolution lighting inputs are zero while main
+lighting is purple. No NaN/inf in decoded scene lighting.
+
+Next: trace material/reflection/environment terms through the ha_light family,
+especially the normal/reflection direction and cube samples. Exact per-pixel
+shader and cause remain unproven; first-occurrence descriptor logs cannot prove
+that history. No speculative shader change or additional test was launched.
+
+Reproducible local analysis: this chat's work/pink-box/compare_shadow_modes.py,
+shadow-comparison.json, shadow-off/materials.json and pixel-samples.json.
+Original raw captures and installed runtime are untouched. Project memory updated.

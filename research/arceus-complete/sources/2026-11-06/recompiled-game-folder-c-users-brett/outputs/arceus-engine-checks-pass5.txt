@@ -1,0 +1,40 @@
+ARCEUS ENGINE OFFLINE CHECKS, PASS 5
+2026-11-06
+Four isolated guest-instruction fixtures; no live game test.
+
+dialogue:
+dialogue instruction checks=344 failures=0 compiled_functions=9
+
+AI scheduler:
+groups=1 assumed_scheduler_hz=30 per_bucket_selection_hz=30.000000 cycles=8
+groups=1 assumed_scheduler_hz=60 per_bucket_selection_hz=60.000000 cycles=8
+groups=1 assumed_scheduler_hz=120 per_bucket_selection_hz=120.000000 cycles=8
+groups=4 assumed_scheduler_hz=30 per_bucket_selection_hz=7.500000 cycles=8
+groups=4 assumed_scheduler_hz=60 per_bucket_selection_hz=15.000000 cycles=8
+groups=4 assumed_scheduler_hz=120 per_bucket_selection_hz=30.000000 cycles=8
+groups=6 assumed_scheduler_hz=30 per_bucket_selection_hz=5.000000 cycles=8
+groups=6 assumed_scheduler_hz=60 per_bucket_selection_hz=10.000000 cycles=8
+groups=6 assumed_scheduler_hz=120 per_bucket_selection_hz=20.000000 cycles=8
+groups=8 assumed_scheduler_hz=30 per_bucket_selection_hz=3.750000 cycles=8
+groups=8 assumed_scheduler_hz=60 per_bucket_selection_hz=7.500000 cycles=8
+groups=8 assumed_scheduler_hz=120 per_bucket_selection_hz=15.000000 cycles=8
+groups=16 assumed_scheduler_hz=30 per_bucket_selection_hz=1.875000 cycles=8
+groups=16 assumed_scheduler_hz=60 per_bucket_selection_hz=3.750000 cycles=8
+groups=16 assumed_scheduler_hz=120 per_bucket_selection_hz=7.500000 cycles=8
+Scheduler guest checks=83449 failures=0 compiled_functions=3
+
+event clocks:
+in-range first_stop_call=62 timer=2.06666613
+recovery first_fade_out_call=182 total=6.03332901
+hold first_fade_in_call=31 hold=1.03333366
+event guest checks=750 failures=0 compiled_functions=10
+
+physics dispatch:
+dispatcher guest scenarios=130 checks=927 failures=0 compiled_functions=2
+
+Total: 85470 checks; zero failures; 24 compiled guest-code entries.
+Entries include bounded instruction slices and dynamic branch entries, not only whole functions.
+Fixture responses for external code are synthetic; these are not live FPS measurements.
+Detailed extraction and stub boundaries: arceus-research-provenance-pass5.json.
+The dialogue and event suites were extended after independent cross-review; these are their final results.
+Runtime and packaged executables were not rebuilt or changed.
