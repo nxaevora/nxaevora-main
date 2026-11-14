@@ -1165,3 +1165,55 @@ Runs of the update program with `nvn_drawrec=1`. The compare output stays local.
 The compare finds no difference between the two paths in the target scenes, in the values that a signature records
 (decision 5). The blend state, the viewports and the constant buffer bindings are not in a signature, so this result
 does not cover them.
+
+## Stage 5 measure plan (2026-11-14)
+
+Goal: CPU time, frame time and dropped draws of `nvn_native=1`, compared with `nvn_native=0` (`nvn-plan.md`, stage 5).
+
+### Facts that decide the plan
+
+- Measures that exist: the debug window (`vk/debug_stats.c`, window only, `cpu_ms` is the whole process), the `perf:` line
+  (`runtime/main.c`, frames a second every 5 s), the slow-frame line (over 50 ms) and the line of each 600 presents
+  (`vk/renderer.c`, `g_vk_drawn` and `g_vk_skipped` of the renderer, both paths), `vk_gpu_profile` (GPU time), `profile`
+  (`profiler_win32.c`, sampled CPU per function in `profile.txt`), the `nvn-native` frame line (native path only: faults,
+  dropped, missing, skipped lists). Tracy (`SNX_TRACY`) is off in the default build.
+- No measure gives the CPU time of the decode, and no measure splits the CPU time by path.
+- Old path: the guest thread runs the NVN library, the ioctl and `gpu_submit` (`gpu.c`, `job_new` and `scan_job` copy and
+  scan the entries). The `GPU` thread runs `run_job`, which calls `pb_decode` and `method_call` for each word.
+- Native path: the guest thread runs `native_call` and the handlers that record the commands. The `GPU` thread runs
+  `frame_run` and `frame_replay_lists`. Both paths reach `maxwell3d_method` and the same renderer, so the work below it is
+  not removed.
+- `nvn_trace=1` wraps each NVN call and `nvn_drawrec=1` hashes each renderer call: both add CPU time to the measure.
+
+### Decisions
+
+1. A timer for each side and each path, with the same scope. Old path: the guest side is `gpu_submit` from entry to return,
+   the `GPU` side is `run_job`. Native path: the guest side is `native_call` from entry to return (all handlers), the `GPU`
+   side is `frame_run`. Each timer adds the nanoseconds of the monotonic clock to a counter of its side.
+2. The timers run only with the new setting `nvn_measure=1` (default 0), because `native_call` runs many thousand times in
+   a frame and the clock reads cost time.
+3. One log line `nvn-measure:` each 600 presents (the count of the renderer line): the path, the presents, the guest ms
+   and the `GPU` ms for each frame (mean), the frame time median, 99th percentile and maximum of the presents of the window,
+   and the draws and skipped draws of the renderer in the window. The frame times come from the present times that
+   `renderer.c` has. The log line is the only output: no window, no file.
+4. The pure parts (the percentiles from a fixed array, the means) go into a function with host tests. The counters are
+   atomic, because the guest threads and the `GPU` thread add to them.
+
+### Runs (the user)
+
+Settings for each measure run: `nvn_measure=1`, `nvn_trace=0`, `nvn_drawrec=0`, `nvn_selftest=0`, `nvn_exectest=0`,
+`profile=0`. All other settings the same in both paths (also `vk_record`, `render_resolution`, `anti_aliasing`).
+
+- Scene A: Obsidian Fieldlands, stand at one place, camera still, 60 s.
+- Scene B: Obsidian Fieldlands, the same walk of about 60 s.
+- Scene C: a battle with a wild Pokemon, from start to end.
+- Each scene three times for each path, to see the spread. Then one run of each path with `profile=1` (scene B) to see the
+  functions that use the CPU.
+- Quality: missing draws or wrong effects are checked by the user on the screen in the same scenes. A crash in a run is
+  reported. The draw record compare of stage 4 is the check of the draw calls.
+
+### Work order (one session each)
+
+1. Code writer: `nvn_measure` (decisions 1 to 4) with host tests. Review, build, `ctest`, commit.
+2. The user makes the runs. The agent reads the `nvn-measure:` lines and writes the result here.
+3. The user decides if the old path is removed.
