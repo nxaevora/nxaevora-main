@@ -1191,7 +1191,8 @@ Goal: CPU time, frame time and dropped draws of `nvn_native=1`, compared with `n
    the `GPU` side is `run_job`. Native path: the guest side is `native_call` from entry to return (all handlers), the `GPU`
    side is `frame_run` up to `frame_end`. Each timer adds the nanoseconds of the monotonic clock to a counter of its side.
    Two parts are left out so that the scopes match: `frame_show` (the present is not in `run_job`), and the time a handler
-   waits for the GPU in `kthread_wait` or `syncpt_wait` (on the old path the game's library waits, not `gpu_submit`).
+   waits for the GPU in `kthread_wait` or `syncpt_wait` or for `present_pace` (on the old path the game's library or
+   `vi.c` waits, not `gpu_submit`).
    Limit: the old guest side does not include the game's NVN library code that writes the commands. `profile=1` shows it.
 2. The timers run only with the new setting `nvn_measure=1` (default 0), because `native_call` runs many thousand times in
    a frame and the clock reads cost time.
@@ -1220,3 +1221,18 @@ Settings for each measure run: `nvn_measure=1`, `nvn_trace=0`, `nvn_drawrec=0`, 
 1. Code writer: `nvn_measure` (decisions 1 to 4) with host tests. Review, build, `ctest`, commit.
 2. The user makes the runs. The agent reads the `nvn-measure:` lines and writes the result here.
 3. The user decides if the old path is removed.
+
+### First runs (2026-11-14)
+
+Update program, Obsidian Fieldlands (still and walk) and a battle in one run of about 190 s for each path.
+
+- `GPU` side: native 3.7 to 13.6 ms per frame, old 6.4 to 14.1 ms, about 4 to 15% less at the same draw count. The work
+  below `maxwell3d_method` is the same in both paths, so only the decode is removed.
+- Frame time: median 33.1 to 33.3 ms and 99th percentile 37 to 45 ms on both paths. No skipped draw on either path.
+- Native guest side: 22 to 30 ms per frame in the first two runs. The handler report showed the cause:
+  `nvnWindowAcquireTexture` held 138 s of the 159 s handler time (23 ms per call) in `present_pace`, the swap interval
+  2 pace. It is a wait, so it is now left out as the GPU waits are.
+- Without that wait the handlers use about 3.6 ms per frame of wall time (38.6 million calls, about 6400 a frame), and
+  2 ms of it is a wait for `objs_lock`, which each handler holds for the whole call. Not yet checked: which thread holds
+  it then (another game thread that calls NVN, or the `GPU` thread). The most called handlers are command buffer state
+  calls of 0.4 to 1.4 us each.

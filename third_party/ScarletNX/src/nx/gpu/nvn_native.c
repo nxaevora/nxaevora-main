@@ -6287,8 +6287,9 @@ static void h_sync_create_gl_sync(CPU* c, u64 entry) {
 
 enum { NVN_ACQUIRE_OK = 0, NVN_ACQUIRE_FAILED = 1 };
 /* Ends a failed acquire: the operation, the reason, the addresses and the result. objs_lock is held. */
-/* The time this thread's handler waited for the GPU. native_call leaves it out of the nvn_measure guest time: on the
-   old path the same waits run in the game's library, not in gpu_submit (nvn-design.md, "Stage 5 measure plan"). */
+/* The time this thread's handler waited for the GPU or the present pace. native_call leaves it out of the nvn_measure
+   guest time: on the old path the same waits run in the game's library or in vi.c, not in gpu_submit
+   (nvn-design.md, "Stage 5 measure plan"). */
 static _Thread_local u64 t_handler_wait_ns;
 static u64 handler_wait_start(void) { return g_settings.nvn_measure ? plat_ns() : 0; }
 static void handler_wait_end(u64 start_ns) {
@@ -6323,7 +6324,9 @@ static void window_acquire_texture(CPU* c, u64 queue_addr, u64 window_addr, u64 
     }
     uint32_t interval = window->interval;
     pm_unlock(&objs_lock);
+    const u64 pace_start = handler_wait_start(); /* the old path paces in vi.c's dequeue, outside gpu_submit */
     present_pace(interval);
+    handler_wait_end(pace_start);
     objs_lock_take();
     window = known_record(window_addr, NVN_OBJ_WINDOW);
     sync = has_sync ? known_record(sync_addr, NVN_OBJ_SYNC) : NULL;
@@ -7938,13 +7941,13 @@ static void report_measure(void) {
         const u64 calls = __atomic_load_n(&s->measure_calls, __ATOMIC_RELAXED);
         const u64 wall_ns = walls[top[n]];
         if (!calls) continue;
-        LOG("nvn-measure: handler %s calls=%llu wall_ms=%.3f us_per_call=%.3f lock_ms=%.3f gpu_wait_ms=%.3f\n",
+        LOG("nvn-measure: handler %s calls=%llu wall_ms=%.3f us_per_call=%.3f lock_ms=%.3f wait_ms=%.3f\n",
             s->name, (unsigned long long)calls, (double)wall_ns / 1000000.0,
             (double)wall_ns / (double)calls / 1000.0,
             (double)__atomic_load_n(&s->lock_ns, __ATOMIC_RELAXED) / 1000000.0,
             (double)__atomic_load_n(&s->gpu_wait_ns, __ATOMIC_RELAXED) / 1000000.0);
     }
-    LOG("nvn-measure: handlers total calls=%llu wall_ms=%.3f lock_ms=%.3f gpu_wait_ms=%.3f\n",
+    LOG("nvn-measure: handlers total calls=%llu wall_ms=%.3f lock_ms=%.3f wait_ms=%.3f\n",
         (unsigned long long)total_calls, (double)total_wall / 1000000.0, (double)total_lock / 1000000.0,
         (double)total_gpu / 1000000.0);
 }
