@@ -1723,17 +1723,17 @@ static void program_build_compute(const NvnProgramComputeIn* in, uint32_t* words
     program_push_word(words, at, in->h6fc);
     program_push_word(words, at, in->h710);
     program_push_word(words, at, in->h70c);
-    program_push_word(words, at, in->h718);
-    program_push_word(words, at, in->h71c);
-    program_push_word(words, at, in->h720);
-    program_push_word(words, at, in->h724);
-    program_push_word(words, at, in->h728);
-    program_push_word(words, at, in->h72c);
-    program_push_word(words, at, in->h730);
-    program_push_word(words, at, in->h734);
+    program_push_word(words, at, in->block_x);
+    program_push_word(words, at, in->block_y);
+    program_push_word(words, at, in->block_z);
+    program_push_word(words, at, in->shared_bytes);
+    program_push_word(words, at, in->local_pos);
+    program_push_word(words, at, in->local_neg);
+    program_push_word(words, at, in->local_crs);
+    program_push_word(words, at, in->barriers);
     program_push_word(words, at, in->h6f8);
-    program_push_word(words, at, in->h750_low);
-    program_push_word(words, at, in->h750_high);
+    program_push_word(words, at, in->h778_low);
+    program_push_word(words, at, in->h778_high);
     program_push_word(words, at, in->flags);
     program_push_word(words, at, 0u);
 }
@@ -1876,6 +1876,80 @@ int nvn_program_xfb_words(const uint8_t* blob, uint32_t* words, uint32_t max, ui
     return 1;
 }
 
+/* The compute header offsets of the library (d8363c0, d837ae8, d836f10, d8543a0). */
+#define NVN_PROGRAM_COMPUTE_OFFSET_LAYOUT     0x8u
+#define NVN_PROGRAM_COMPUTE_OFFSET_CODE       0x708u
+#define NVN_PROGRAM_COMPUTE_OFFSET_CB         0x700u
+#define NVN_PROGRAM_COMPUTE_OFFSET_H6FC       0x6FCu
+#define NVN_PROGRAM_COMPUTE_OFFSET_H710       0x710u
+#define NVN_PROGRAM_COMPUTE_OFFSET_H70C       0x70Cu
+#define NVN_PROGRAM_COMPUTE_OFFSET_BLOCK_X    0x748u
+#define NVN_PROGRAM_COMPUTE_OFFSET_BLOCK_Y    0x74Cu
+#define NVN_PROGRAM_COMPUTE_OFFSET_BLOCK_Z    0x750u
+#define NVN_PROGRAM_COMPUTE_OFFSET_SHARED     0x754u
+#define NVN_PROGRAM_COMPUTE_OFFSET_LOCAL_POS  0x758u
+#define NVN_PROGRAM_COMPUTE_OFFSET_LOCAL_NEG  0x75Cu
+#define NVN_PROGRAM_COMPUTE_OFFSET_LOCAL_CRS  0x760u
+#define NVN_PROGRAM_COMPUTE_OFFSET_BARRIERS   0x764u
+#define NVN_PROGRAM_COMPUTE_OFFSET_H6F8       0x6F8u
+#define NVN_PROGRAM_COMPUTE_OFFSET_H778       0x778u /* word 14 is the low u32, word 15 the high u32 */
+#define NVN_PROGRAM_COMPUTE_OFFSET_FLAG_0     0x830u
+#define NVN_PROGRAM_COMPUTE_OFFSET_FLAG_1     0x831u
+#define NVN_PROGRAM_COMPUTE_OFFSET_FLAG_2     0x832u
+#define NVN_PROGRAM_COMPUTE_LAYOUT_FLAGS      13u    /* the flag bytes exist at layout 13 and above */
+#define NVN_PROGRAM_COMPUTE_HEADER_BYTES_SMALL 0x780u
+#define NVN_PROGRAM_COMPUTE_HEADER_BYTES_FLAGS 0x833u
+
+static uint32_t program_compute_read_u32(const uint8_t* at) {
+    uint32_t word;
+    memcpy(&word, at, sizeof word);
+    return word;
+}
+
+uint32_t nvn_program_compute_header_bytes(uint32_t layout) {
+    if (layout >= NVN_PROGRAM_LAYOUT_FIRST && layout < NVN_PROGRAM_COMPUTE_LAYOUT_FLAGS)
+        return NVN_PROGRAM_COMPUTE_HEADER_BYTES_SMALL;
+    if (layout >= NVN_PROGRAM_COMPUTE_LAYOUT_FLAGS && layout <= NVN_PROGRAM_LAYOUT_LAST)
+        return NVN_PROGRAM_COMPUTE_HEADER_BYTES_FLAGS;
+    return 0;
+}
+
+int nvn_program_compute_in_from_header(const uint8_t* header, uint32_t bytes, uint32_t entry_word,
+                                       NvnProgramComputeIn* out) {
+    if (!header || !out) return 0;
+    if (bytes < NVN_PROGRAM_COMPUTE_OFFSET_LAYOUT + sizeof(uint32_t)) return 0;
+    const uint32_t layout = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_LAYOUT);
+    const uint32_t size = nvn_program_compute_header_bytes(layout);
+    if (!size || bytes < size) return 0;
+    uint64_t words_14_15;
+    memcpy(&words_14_15, header + NVN_PROGRAM_COMPUTE_OFFSET_H778, sizeof words_14_15);
+    NvnProgramComputeIn compute;
+    compute.code_offset = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_CODE) + entry_word;
+    compute.cb_offset = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_CB) + entry_word;
+    compute.h6fc = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_H6FC);
+    compute.h710 = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_H710);
+    compute.h70c = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_H70C);
+    compute.block_x = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_BLOCK_X);
+    compute.block_y = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_BLOCK_Y);
+    compute.block_z = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_BLOCK_Z);
+    compute.shared_bytes = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_SHARED);
+    compute.local_pos = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_LOCAL_POS);
+    compute.local_neg = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_LOCAL_NEG);
+    compute.local_crs = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_LOCAL_CRS);
+    compute.barriers = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_BARRIERS);
+    compute.h6f8 = program_compute_read_u32(header + NVN_PROGRAM_COMPUTE_OFFSET_H6F8);
+    compute.h778_low = (uint32_t)words_14_15;
+    compute.h778_high = (uint32_t)(words_14_15 >> 32);
+    compute.flags = 0;
+    if (layout >= NVN_PROGRAM_COMPUTE_LAYOUT_FLAGS) {
+        if (header[NVN_PROGRAM_COMPUTE_OFFSET_FLAG_0] & 1u) compute.flags |= NVN_PROGRAM_COMPUTE_FLAG_0;
+        if (header[NVN_PROGRAM_COMPUTE_OFFSET_FLAG_1] & 1u) compute.flags |= NVN_PROGRAM_COMPUTE_FLAG_1;
+        if (header[NVN_PROGRAM_COMPUTE_OFFSET_FLAG_2] & 1u) compute.flags |= NVN_PROGRAM_COMPUTE_FLAG_2;
+    }
+    *out = compute;
+    return 1;
+}
+
 int nvn_program_compute_from_words(const uint32_t* words, uint32_t count, NvnProgramComputeIn* out) {
     if (!words || !out || count != NVN_PROGRAM_COMPUTE_WORDS) return 0;
     out->code_offset = words[0];
@@ -1883,17 +1957,17 @@ int nvn_program_compute_from_words(const uint32_t* words, uint32_t count, NvnPro
     out->h6fc = words[2];
     out->h710 = words[3];
     out->h70c = words[4];
-    out->h718 = words[5];
-    out->h71c = words[6];
-    out->h720 = words[7];
-    out->h724 = words[8];
-    out->h728 = words[9];
-    out->h72c = words[10];
-    out->h730 = words[11];
-    out->h734 = words[12];
+    out->block_x = words[5];
+    out->block_y = words[6];
+    out->block_z = words[7];
+    out->shared_bytes = words[8];
+    out->local_pos = words[9];
+    out->local_neg = words[10];
+    out->local_crs = words[11];
+    out->barriers = words[12];
     out->h6f8 = words[13];
-    out->h750_low = words[14];
-    out->h750_high = words[15];
+    out->h778_low = words[14];
+    out->h778_high = words[15];
     out->flags = words[16];
     return 1;
 }
@@ -3173,17 +3247,17 @@ int nvn_compute_qmd_build(const NvnProgramComputeIn* prog, uint32_t x, uint32_t 
     qmd[COMPUTE_QMD_GRID_DIM_X] = x & COMPUTE_QMD_GRID_X_MAX;
     qmd[COMPUTE_QMD_GRID_DIM_YZ] = (y & COMPUTE_QMD_GRID_YZ_MAX) | (z << COMPUTE_QMD_GRID_Z_SHIFT);
     qmd[COMPUTE_QMD_SHARED_ALLOC] =
-        (((prog->h724 + 0xFFu) >> COMPUTE_QMD_SHARED_ALLOC_SHIFT) & COMPUTE_QMD_SHARED_ALLOC_MASK)
+        (((prog->shared_bytes + 0xFFu) >> COMPUTE_QMD_SHARED_ALLOC_SHIFT) & COMPUTE_QMD_SHARED_ALLOC_MASK)
         << COMPUTE_QMD_SHARED_ALLOC_SHIFT;
-    qmd[COMPUTE_QMD_BLOCK_DIM_X] = (prog->h718 & COMPUTE_QMD_GRID_YZ_MAX) << COMPUTE_QMD_BLOCK_X_SHIFT;
-    qmd[COMPUTE_QMD_BLOCK_DIM_YZ] = (prog->h71c & COMPUTE_QMD_GRID_YZ_MAX) |
-                                   ((prog->h720 & COMPUTE_QMD_GRID_YZ_MAX) << COMPUTE_QMD_BLOCK_Z_SHIFT);
+    qmd[COMPUTE_QMD_BLOCK_DIM_X] = (prog->block_x & COMPUTE_QMD_GRID_YZ_MAX) << COMPUTE_QMD_BLOCK_X_SHIFT;
+    qmd[COMPUTE_QMD_BLOCK_DIM_YZ] = (prog->block_y & COMPUTE_QMD_GRID_YZ_MAX) |
+                                   ((prog->block_z & COMPUTE_QMD_GRID_YZ_MAX) << COMPUTE_QMD_BLOCK_Z_SHIFT);
     qmd[COMPUTE_QMD_LOCAL_POS_ALLOC] =
-        (prog->h728 & COMPUTE_QMD_LOCAL_MASK) | ((prog->h734 & COMPUTE_QMD_BARRIER_MASK) << COMPUTE_QMD_BARRIER_SHIFT);
+        (prog->local_pos & COMPUTE_QMD_LOCAL_MASK) | ((prog->barriers & COMPUTE_QMD_BARRIER_MASK) << COMPUTE_QMD_BARRIER_SHIFT);
     qmd[COMPUTE_QMD_LOCAL_NEG_ALLOC] =
-        (prog->h72c & COMPUTE_QMD_LOCAL_MASK) | (COMPUTE_QMD_GPR_ALLOC_UNKNOWN << COMPUTE_QMD_GPR_SHIFT);
+        (prog->local_neg & COMPUTE_QMD_LOCAL_MASK) | (COMPUTE_QMD_GPR_ALLOC_UNKNOWN << COMPUTE_QMD_GPR_SHIFT);
     qmd[COMPUTE_QMD_LOCAL_CRS_ALLOC] =
-        (prog->h730 & COMPUTE_QMD_LOCAL_MASK) | (COMPUTE_QMD_SASS_VERSION_UNKNOWN << COMPUTE_QMD_GPR_SHIFT);
+        (prog->local_crs & COMPUTE_QMD_LOCAL_MASK) | (COMPUTE_QMD_SASS_VERSION_UNKNOWN << COMPUTE_QMD_GPR_SHIFT);
     uint32_t enable = COMPUTE_QMD_CBUF0_ENABLE;
     compute_qmd_cbuf_config(qmd, 0, binds->cbuf0_address, NVN_COMPUTE_CBUF0_BYTES);
     if (prog->h6fc) {

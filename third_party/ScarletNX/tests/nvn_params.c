@@ -1768,9 +1768,9 @@ static void test_program_build_compute(void) {
     const NvnProgramComputeIn compute = {
         .code_offset = 0x11111111u, .cb_offset = 0x22222222u,
         .h6fc = 0x33333333u, .h710 = 0x44444444u, .h70c = 0x55555555u,
-        .h718 = 0x66666666u, .h71c = 0x77777777u, .h720 = 0x88888888u, .h724 = 0x99999999u,
-        .h728 = 0xAAAAAAAAu, .h72c = 0xBBBBBBBBu, .h730 = 0xCCCCCCCCu, .h734 = 0xDDDDDDDDu,
-        .h6f8 = 0xEEEEEEEEu, .h750_low = 0x12345678u, .h750_high = 0x9ABCDEF0u,
+        .block_x = 0x66666666u, .block_y = 0x77777777u, .block_z = 0x88888888u, .shared_bytes = 0x99999999u,
+        .local_pos = 0xAAAAAAAAu, .local_neg = 0xBBBBBBBBu, .local_crs = 0xCCCCCCCCu, .barriers = 0xDDDDDDDDu,
+        .h6f8 = 0xEEEEEEEEu, .h778_low = 0x12345678u, .h778_high = 0x9ABCDEF0u,
         .flags = 0x5u,
     };
     uint32_t words[NVN_PROGRAM_WORDS_MAX] = {0};
@@ -2913,8 +2913,8 @@ static void test_highest_enabled_index(void) {
 static void test_compute_qmd_build(void) {
     const NvnProgramComputeIn prog = {
         .code_offset = 0x2000u, .cb_offset = 0x1000u, .h6fc = 0x40u,
-        .h718 = 8u, .h71c = 4u, .h720 = 2u, .h724 = 0x1001u,
-        .h728 = 0x12345u, .h72c = 0x23456u, .h730 = 0x34567u, .h734 = 0x1Fu,
+        .block_x = 8u, .block_y = 4u, .block_z = 2u, .shared_bytes = 0x1001u,
+        .local_pos = 0x12345u, .local_neg = 0x23456u, .local_crs = 0x34567u, .barriers = 0x1Fu,
     };
     NvnComputeBinds binds = {0};
     binds.cbuf0_address = 0x400002000ull;
@@ -3044,9 +3044,9 @@ static void test_compute_cbuf0_build(void) {
 static void test_program_compute_round_trip(void) {
     const NvnProgramComputeIn compute = {
         .code_offset = 0x11u, .cb_offset = 0x22u, .h6fc = 0x33u, .h710 = 0x44u, .h70c = 0x55u,
-        .h718 = 0x66u, .h71c = 0x77u, .h720 = 0x88u, .h724 = 0x99u, .h728 = 0xAAu,
-        .h72c = 0xBBu, .h730 = 0xCCu, .h734 = 0xDDu, .h6f8 = 0xEEu,
-        .h750_low = 0x12345678u, .h750_high = 0x9ABCDEF0u, .flags = 0x5u,
+        .block_x = 0x66u, .block_y = 0x77u, .block_z = 0x88u, .shared_bytes = 0x99u, .local_pos = 0xAAu,
+        .local_neg = 0xBBu, .local_crs = 0xCCu, .barriers = 0xDDu, .h6f8 = 0xEEu,
+        .h778_low = 0x12345678u, .h778_high = 0x9ABCDEF0u, .flags = 0x5u,
     };
     uint32_t words[NVN_PROGRAM_WORDS_MAX] = {0};
     uint32_t count = 0;
@@ -3057,6 +3057,100 @@ static void test_program_compute_round_trip(void) {
     CHECK(!nvn_program_compute_from_words(words, NVN_PROGRAM_COMPUTE_WORDS - 1u, &back));
     CHECK(!nvn_program_compute_from_words(NULL, NVN_PROGRAM_COMPUTE_WORDS, &back));
     CHECK(!nvn_program_compute_from_words(words, NVN_PROGRAM_COMPUTE_WORDS, NULL));
+}
+
+static void put_u32_le(uint8_t* at, uint32_t value) { memcpy(at, &value, sizeof value); }
+static void put_u64_le(uint8_t* at, uint64_t value) { memcpy(at, &value, sizeof value); }
+
+/* A synthetic header with a distinct value at each compute offset. The old offsets keep other values. */
+static void fill_compute_header(uint8_t* header, uint32_t layout) {
+    memset(header, 0xCC, 0x840u);
+    put_u32_le(header + 0x8u, layout);
+    put_u32_le(header + 0x6FCu, 0x00020001u);
+    put_u32_le(header + 0x700u, 0x00040003u);
+    put_u32_le(header + 0x708u, 0x00060005u);
+    put_u32_le(header + 0x70Cu, 0x00080007u);
+    put_u32_le(header + 0x710u, 0x000A0009u);
+    put_u32_le(header + 0x748u, 0x000C000Bu);
+    put_u32_le(header + 0x74Cu, 0x000E000Du);
+    put_u32_le(header + 0x750u, 0x0010000Fu);
+    put_u32_le(header + 0x754u, 0x00120011u);
+    put_u32_le(header + 0x758u, 0x00140013u);
+    put_u32_le(header + 0x75Cu, 0x00160015u);
+    put_u32_le(header + 0x760u, 0x00180017u);
+    put_u32_le(header + 0x764u, 0x001A0019u);
+    put_u32_le(header + 0x6F8u, 0x001C001Bu);
+    put_u64_le(header + 0x778u, 0x9ABCDEF012345678ull);
+    for (uint32_t i = 0; i < 8u; i++) put_u32_le(header + 0x718u + i * 4u, 0xDEAD0000u + i);
+    header[0x769] = 0xFFu;
+    header[0x76A] = 0xFFu;
+    header[0x76B] = 0xFFu;
+}
+
+static void check_compute_in(const NvnProgramComputeIn* compute, uint32_t flags) {
+    CHECK(compute->code_offset == 0x00060005u + 0x10u);
+    CHECK(compute->cb_offset == 0x00040003u + 0x10u);
+    CHECK(compute->h6fc == 0x00020001u);
+    CHECK(compute->h710 == 0x000A0009u);
+    CHECK(compute->h70c == 0x00080007u);
+    CHECK(compute->block_x == 0x000C000Bu);
+    CHECK(compute->block_y == 0x000E000Du);
+    CHECK(compute->block_z == 0x0010000Fu);
+    CHECK(compute->shared_bytes == 0x00120011u);
+    CHECK(compute->local_pos == 0x00140013u);
+    CHECK(compute->local_neg == 0x00160015u);
+    CHECK(compute->local_crs == 0x00180017u);
+    CHECK(compute->barriers == 0x001A0019u);
+    CHECK(compute->h6f8 == 0x001C001Bu);
+    CHECK(compute->h778_low == 0x12345678u);
+    CHECK(compute->h778_high == 0x9ABCDEF0u);
+    CHECK(compute->flags == flags);
+}
+
+static void test_program_compute_from_header(void) {
+    uint8_t header[0x840];
+    const uint32_t entry_word = 0x10u;
+    CHECK(nvn_program_compute_header_bytes(4u) == 0u);
+    CHECK(nvn_program_compute_header_bytes(5u) == 0x780u);
+    CHECK(nvn_program_compute_header_bytes(12u) == 0x780u);
+    CHECK(nvn_program_compute_header_bytes(13u) == 0x833u);
+    CHECK(nvn_program_compute_header_bytes(16u) == 0x833u);
+    CHECK(nvn_program_compute_header_bytes(17u) == 0u);
+    /* Layout 13 reads the flag bytes at 0x830, and only bit 0 of each byte counts. */
+    fill_compute_header(header, 13u);
+    for (uint32_t flags = 0; flags < 8u; flags++) {
+        header[0x830] = (uint8_t)((flags & 1u) ? 0xFFu : 0xF0u);
+        header[0x831] = (uint8_t)((flags & 2u) ? 0xFFu : 0xF0u);
+        header[0x832] = (uint8_t)((flags & 4u) ? 0xFFu : 0xF0u);
+        NvnProgramComputeIn compute;
+        memset(&compute, 0xEE, sizeof compute);
+        CHECK(nvn_program_compute_in_from_header(header, 0x833u, entry_word, &compute));
+        check_compute_in(&compute, flags);
+    }
+    /* Layout 5 reads no flag bytes. */
+    fill_compute_header(header, 5u);
+    header[0x830] = 0xFFu;
+    header[0x831] = 0xFFu;
+    header[0x832] = 0xFFu;
+    NvnProgramComputeIn compute;
+    memset(&compute, 0xEE, sizeof compute);
+    CHECK(nvn_program_compute_in_from_header(header, 0x780u, entry_word, &compute));
+    check_compute_in(&compute, 0u);
+    /* Refusals leave the output unchanged. */
+    NvnProgramComputeIn keep;
+    memset(&keep, 0xEE, sizeof keep);
+    const NvnProgramComputeIn before = keep;
+    fill_compute_header(header, 4u);
+    CHECK(!nvn_program_compute_in_from_header(header, 0x833u, entry_word, &keep));
+    fill_compute_header(header, 17u);
+    CHECK(!nvn_program_compute_in_from_header(header, 0x833u, entry_word, &keep));
+    fill_compute_header(header, 13u);
+    CHECK(!nvn_program_compute_in_from_header(header, 0x832u, entry_word, &keep));
+    fill_compute_header(header, 5u);
+    CHECK(!nvn_program_compute_in_from_header(header, 0x77Fu, entry_word, &keep));
+    CHECK(!nvn_program_compute_in_from_header(NULL, 0x833u, entry_word, &keep));
+    CHECK(!nvn_program_compute_in_from_header(header, 0x833u, entry_word, NULL));
+    CHECK(memcmp(&keep, &before, sizeof keep) == 0);
 }
 
 static void test_u1_window_fields(void) {
@@ -3634,6 +3728,7 @@ int main(int argc, char** argv) {
     test_compute_qmd_build();
     test_compute_cbuf0_build();
     test_program_compute_round_trip();
+    test_program_compute_from_header();
     test_word_stream();
     test_barrier_words();
     test_pushbuf_decode();

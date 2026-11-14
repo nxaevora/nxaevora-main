@@ -1045,3 +1045,123 @@ Open after the review of 4-u3-4 (the game does not reach these paths up to the t
   each queue across jobs, owned by the GPU thread, reset only with the queue.
 - A cross-queue wait on a `PENDING` fence (item 7, and the command buffer `WaitSync` op, which only logs) does not hold the
   consumer back. Fix: keep the dependency and park the dependent job until the producer job ends.
+
+## Stage 4 compare: the draw record (2026-11-14)
+
+The exit condition of stage 4 asks for a comparison of `nvn_native=0` and `nvn_native=1` in the target scenes. The user chose
+the scenes (Obsidian Fieldlands and a battle, one run with each path) and the method: the runtime records its own draw state,
+and a script compares the two records. Screenshots are not used.
+
+### Facts that decide the design
+
+Checked in the code on 2026-11-14 (analyser report, five claims checked again by the caller):
+
+- Both paths call the same `Renderer` through `g_renderer` (`renderer.h:152`). It is set once at static init
+  (`vk/renderer.c:924`). Only the selftest swaps it for one job (`nvn_selftest_cmd.c:369`, restored at :421). No code calls
+  the Vulkan backend directly for drawing.
+- Both paths put the 3D state into `GpuChannel.r3d[]` through `maxwell3d_method`. The old path decodes the game's stream.
+  The native replay writes the methods on the private channel of the queue (`nvn_native.c:5089`).
+- The GPU addresses are not equal. The native path takes its own pool addresses from `nvn_gpu_va_alloc` in another order,
+  and its shader base is the host constant `NVN_SHADER_REGION_BASE` (`nvn_native.c:327`, written at :5579). So no address,
+  host pointer, channel id or predicate goes into a record.
+- A frame ends at `present_buffer`. The old path calls it in `vi_show_buffer` through `present.c:25`. The native path calls
+  it in `frame_show` (`nvn_native.c:6599`). Both run on the GPU thread as a `gpu_call` item and hold no runtime lock. The
+  old path can drop a present whose key changed (`vi.c:227`), so the two runs are keyed on presents, not on game frames.
+- The draw, clear, dispatch and copy calls run on the GPU thread. The backend takes only its own `vk_lock`.
+- `shader_hash` (`shader/shader.h:175`) is backend independent and ends a program at its EXIT.
+- `nvn_selftest_rec.c` is a test double (no forward, no lock, no frame end). Only its idea of a snapshot is reused.
+
+### Decisions
+
+1. **Setting.** `nvn_drawrec` (int 0 1, default 0, startup) in `settings.txt`, next to `nvn_native`. It works with
+   `nvn_native=0` and `=1`. It does not need `nvn_trace`.
+2. **Module.** A new file pair `src/nx/gpu/draw_record.{h,c}`. `draw_record_init()` is called in `snx_main` after
+   `nvn_native_init()` (`main.c:956`) and before `video_init` (`main.c:981`), when no other thread uses `g_renderer`. It
+   copies `*g_renderer` into a static `Renderer`, replaces the eight recorded fields with wrappers and sets `g_renderer` to the
+   copy. A field that is NULL in the backend stays NULL. All other fields stay the backend pointers.
+3. **Recorded calls.** `clear`, `draw`, `draw_texture`, `blit`, `dma_copy`, `blit_mem`, `dispatch` and `present_buffer`. Each
+   wrapper records first, then forwards with the same arguments. The record step only reads its arguments, `ch->r3d[]`,
+   `ch->rcomp[]` and guest memory (for the shader hash). It does not change them.
+4. **Lock and threads.** One mutex of the module (`rec_lock`), a leaf lock. The wrapper holds it only in the record step and
+   never while it forwards. The file writes happen outside the lock, from a copy made under it.
+5. **Signature of a call.** A 64-bit hash of path-independent values only:
+   - draw: `indexed`, `topology`, `count`, `instances`; for each enabled program of `MAXWELL3D_PIPELINES` (6 programs of 16
+     words) the `shader_hash` of its code at the shader base plus its offset; for each color target that `RT_CONTROL` enables,
+     the format, width, height and layer words (not the address words); the depth target format and size when depth is on.
+     `first`, `base_vertex` and `base_instance` are left out: they can depend on the buffer layout of the path.
+   - clear: the argument `v`, the clear color or depth value that `v` selects, and the format and size of that target.
+   - draw_texture: the rectangle and step words (0x420 to 0x427) and the format of color target 0.
+   - dispatch: the `shader_hash` of `code`, the grid and block sizes and the shared memory size of the QMD.
+   - blit: format, linear, block height, width and height of both surfaces, and the rectangle arguments.
+   - dma_copy: the flags (multi, remap, fill, ...), width, lines, line bytes, and the block linear flag and pitch of each side.
+     `snap` is left out (only the old path takes a snapshot, `gpu.c:1150`).
+   - blit_mem: bpp, the rectangle and `fmt`.
+   - present_buffer: w, h, pitch, layout and fmt.
+6. **Shader hash cache.** The hash of a program is kept in a fixed table keyed by its GPU address, so a draw does not walk the
+   code again. A full table hashes without a cache and counts the misses. Changed 2026-11-14 (`4b9404d`): the game writes
+   other programs at the same addresses, so the table checks an entry once in each epoch of the backend with its write
+   tracking (`code_same`, `vk/pipeline.c:399`) and hashes it again when it may have changed. An epoch ends at each
+   `mem_may_have_changed` of the renderer (a submitted job, the end of a wait, a frame start), not only at a present. A
+   shader instruction invalidate (`method_barrier` kind 5) and a renderer `reset` clear the table, as the backend drops its
+   address shortcuts there. The
+   log line `draw record: N shader programs hashed again with a new hash` counts the hashes that the check changed.
+7. **Per frame.** Between two presents the module counts the calls of each kind and adds the signatures into two frame hashes:
+   one that depends on the order and one that does not (a sum). At `present_buffer` it appends one line to the frame file
+   and resets the counts.
+8. **Per run.** A fixed open-addressing table maps each signature to its count and to a short text of its first call (kind,
+   topology, count, shader hashes, target formats and sizes). A full table stops new entries, counts them, and logs one line.
+   The table is written to the signature file every `DRAWREC_TABLE_WRITE_FRAMES` presents and at a clean exit, through a
+   temporary file and a rename, so a killed game keeps the last copy.
+9. **Files.** In the game folder, beside the log: `<exe>.drawrec<N>.frames.txt` and `<exe>.drawrec<N>.sigs.txt`, where `N`
+   is the value of `nvn_native`, so the two runs do not overwrite each other. A new run of the same path replaces them.
+   An open or write error logs one line with the path and turns the record off. The game goes on.
+10. **Compare.** A script `tools/drawrec_compare.py` reads the files of the two runs. The two runs are separate plays, so
+    frames do not align. The script reports: the signatures found in one run only, ordered by count per frame; for the shared
+    signatures, the ratio of their counts per frame; and the median, minimum and maximum of each call count per frame. It writes
+    no file into the repository.
+
+### Tests
+
+- A host test `tests/draw_record.c` for the pure parts: the signature of each kind from a register array and a fake memory
+  reader, the leaving out of the address words (a change of an address does not change the signature), the frame hashes
+  (order dependent and order independent), the table (insert, count, full table), and the shader hash cache (graphics and
+  compute keys, probe collisions, full cache, clear, the check once for each present).
+
+### Work order (one session each)
+
+1. Code writer: the module, the setting, the call in `main.c`, the test. Review, build, `ctest`, commit.
+2. Code writer: `tools/drawrec_compare.py`. The caller checks it on two record files of one short run with each path.
+3. The user runs Obsidian Fieldlands and a battle with `nvn_drawrec=1`, once with `nvn_native=0` and once with `=1`. The caller
+   runs the script and reports the differences.
+
+### Limits
+
+- If the native path changes the shader code bytes (for example a patch of a program), each draw signature differs. The
+  compare then shows it in the shader hashes of the signature text.
+- The scene is played by hand, so a signature found in one run only can come from a different action of the player. Rare
+  signatures are judged by their text, not by their presence alone.
+
+### Result (2026-11-14)
+
+Runs of the update program with `nvn_drawrec=1`. The compare output stays local.
+
+- **Title screen, first run.** On the native path every compute dispatch had the block size 0x0x0, so `vk_dispatch` skipped
+  it. Cause: `program_read_compute_in` read the compute words 5 to 12, 14, 15 and the flag bytes at wrong header offsets.
+  The library reads words 5 to 12 at h+0x748 to h+0x764, words 14 and 15 as the u64 at h+0x778, and the flags as bit 0 of
+  the bytes h+0x830 to h+0x832 for layout 13 to 16 (else 0). It stores the nine fragment bytes as 0 or 1 (d837c64). Fixed in
+  `b2a302c` with the pure function `nvn_program_compute_in_from_header` and host tests. Run again: the dispatches have the
+  block size 32x1x1 on both paths, and no signature is found in the native run only.
+- **Obsidian Fieldlands and a battle, first pair.** Some draws had the same count and fragment shader in both runs but another
+  vertex shader hash. Cause: the record's shader hash cache (decision 6) kept the hash of the first program at an address.
+  Fixed in `4b9404d`.
+- **Obsidian Fieldlands and a battle, second pair** (`nvn_native=0`: 3744 presents, `=1`: 3776 presents). Both runs ended
+  normally, with no fault, drop or refusal. No vertex or compute shader hash is found in one run only. The draw that had two
+  stale hashes in the first pair has the same hash in both runs. The dispatches match. The median calls per frame: draw 544
+  and 514, clear 58, dispatch 5, blit 4 in both. The signatures in one run only are draws with the same shaders and another
+  instance or vertex count (grass, particles, the camera place and the time of the play), and six clears found once each in
+  the native run, of the same kind as the rare clears of the old run. Coverage: 99.5% of the calls of the old run and 99.9% of
+  the native run are in shared signatures.
+
+The compare finds no difference between the two paths in the target scenes, in the values that a signature records
+(decision 5). The blend state, the viewports and the constant buffer bindings are not in a signature, so this result
+does not cover them.

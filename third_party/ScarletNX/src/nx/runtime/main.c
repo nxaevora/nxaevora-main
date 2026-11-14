@@ -10,6 +10,7 @@
 #include "common/utilities/build_info.h"
 #include "common/utilities/common.h"
 #include "common/utilities/ini_lines.h"
+#include "nx/gpu/draw_record.h"
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/nvn_native.h"
 #include "nx/gpu/nvn_trace.h"
@@ -501,6 +502,7 @@ void snx_save_before_exit(void) {
         svc_core_exit();
         jit_report();
         nvn_trace_report();
+        draw_record_save();
         nvn_native_report();
         saved = 1;
     }
@@ -955,6 +957,7 @@ int snx_main(int argc, char** argv) {
     kernel_load_symbols();
     nvn_native_init(); /* before the trace, which wraps the slots that the native layer fills */
     nvn_trace_init();
+    draw_record_init(); /* wraps g_renderer, before the video and the GPU thread */
     arceus_clock_init();
     /* after the trace, which says whether calls must go through the slots it wraps. The JIT compiles A64: a 32-bit
        game's blocks are arm.c's, and its hints are A32 block keys the JIT must not warm-compile */

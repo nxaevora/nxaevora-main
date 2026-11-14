@@ -129,6 +129,10 @@ Content: textures, compute, synchronization (fences and events) and memory shari
 Exit condition: in the target scenes, the drawing and the behavior match the old path in a comparison, and each of the 523
 functions is implemented and checked as the coverage file says.
 
+Status (2026-11-14): both parts are true. The comparison of Obsidian Fieldlands and a battle by the draw record found no
+difference between the two paths (`nvn-design.md`, "Stage 4 compare: the draw record", "Result"). All 523 rows of the coverage
+file are `implemented` with a check or a reason (`nvn-unobserved.md`, 4-u3-5 and 4-u4).
+
 ## Stage 5: Measure performance and quality
 
 Content: CPU time, frame time and dropped draws, compared with the old path.
