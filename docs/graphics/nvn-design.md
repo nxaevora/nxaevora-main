@@ -1275,3 +1275,53 @@ Run of 2026-11-14 (`3eac584` code, update program, field and a battle, 193 s, cl
 
 Conclusion: the game records different command buffers on many threads at the same time, and the one global lock makes
 them run one after the other. A split must let the handlers of different command buffers run at the same time.
+
+### Split design: `objs_lock` as a read-write lock (decided 2026-11-14)
+
+The user chose a read-write lock (not a lock per command buffer, not a lock-free table) and a concurrent use check that is
+always on.
+
+Facts checked in the code:
+
+- `PMutex` is an `SRWLOCK` on Windows and a `pthread_mutex_t` on POSIX (`common/filesystem/host.h`). An `SRWLOCK` has a
+  shared mode. `kthread_wait(&frame_done_cv, &objs_lock, ...)` waits with the lock in exclusive mode.
+- `nvn_objtab_find` and `probe` only read the table, so a find under the shared mode is safe while every
+  `nvn_objtab_put` and `nvn_objtab_remove` runs under the exclusive mode.
+- `rec_get` can make a record. `command_bind_state` (the `BindBlendState` family) calls it, so today a bind can write the
+  table when the game never called SetDefaults on the state object.
+- `lists` (the command lists) is used by `EndRecording` (publish), `CallCommands` (ref), `CopyCommands` (find and copy),
+  `AddControlMemory` (unref), the queue submit, `frame_finish` (release) and the `GPU` thread (find).
+- `COMMAND_LOG` counts with a plain `++`. `LOG_LIMIT` is atomic.
+
+Decisions:
+
+1. `host.h` gets `pm_lock_shared`, `pm_unlock_shared` and `pm_trylock_shared` for a `PMutex`: the `SRWLOCK` shared calls on
+   Windows. On POSIX they take the mutex in the normal way (correct, but no parallel readers) until the Linux work. They
+   note waits and report to the profiler as `pm_lock` does. `PMutex` stays the type, so `kthread_wait` does not change.
+2. `lists` gets its own mutex `lists_lock`. Lock order: `objs_lock` (either mode), then `lists_lock`, then `g_qlk`. The
+   `GPU` thread takes only `lists_lock` for its list finds. A found list stays alive through the references of its frame,
+   as today.
+3. A handler can take `objs_lock` in the shared mode only when it (a) finds records with `known_record` or
+   `nvn_objtab_find` and never makes or removes one, (b) changes no record except the command buffer named by x0, (c) uses
+   `lists` only under `lists_lock`, and (d) changes globals only with atomics. All other handlers keep the exclusive mode.
+4. The first shared set: the recording, setter and getter handlers of command buffers, `nvnBufferMap` and
+   `nvnBufferGetAddress`. `CommandBufferInitialize` and `Finalize` stay exclusive (they make and remove the record). A bind
+   of a state object without a record reads the library defaults into a local array and makes no record.
+5. Concurrent use check, always on: `CommandBufferRec` gets an owner thread id. A shared handler sets it with one
+   compare-and-swap from 0 at the start and clears it at the end. When another thread owns it, the handler writes a
+   limited log line, counts the conflict, releases the shared mode and runs under the exclusive mode, which waits until
+   all shared holders leave. So a conflict is reported and still correct.
+6. `nvn_measure` splits the lock lines by mode (shared and exclusive takes, blocked count and wait of each). The holder code
+   of a shared take is the last shared taker, which is enough to name the handlers.
+
+Work order (each step is built, tested with `ctest` and committed alone):
+
+1. Decision 1 with a host test: two shared takes at the same time succeed, an exclusive try fails while a shared
+   holder is in, and a shared try fails while an exclusive holder is in (Windows only).
+2. Decision 2 (`lists_lock`), with no shared mode yet. A user run checks that nothing changed.
+3. Decisions 3 to 6: the mode argument of the take, the owner check, the first shared set and the measure split.
+4. User runs with `nvn_measure=1`: the field and a battle, compared with the run above (2.0 to 2.4 ms of lock wait per
+   frame). Many runs, because a race can show only now and then.
+
+Expected effect: the holders that become shared made 8.4 s of the 11.6 s of wait. The exclusive handlers still block
+the shared ones, for example `nvnMemoryPoolInitialize` (494 us per call).
