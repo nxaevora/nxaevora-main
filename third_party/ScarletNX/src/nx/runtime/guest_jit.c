@@ -10,7 +10,7 @@
 #include "nx/runtime/main.h"
 #include "nx/runtime/options.h"
 #include "nx/runtime/rtapi.h"
-#include "nx/gpu/nvn_trace.h"
+#include "nx/gpu/nvn/diag/nvn_trace.h"
 #include "nx/memory/mem.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"

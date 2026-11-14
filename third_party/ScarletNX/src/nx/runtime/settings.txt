@@ -745,7 +745,7 @@ setting NVN trace
     startup
     words Off|On
     help 1 = logs each NVN function the game resolves, the GPFIFO submissions during each queue call, and at exit
-    help the calls of every function used (gpu/nvn_trace.c). Calls by direct branch are counted only in a game
+    help the calls of every function used (gpu/nvn/diag/nvn_trace.c). Calls by direct branch are counted only in a game
     help recompiled with --hook-direct-calls. The game runs slower
 setting NVN native
     key nvn_native
@@ -753,7 +753,7 @@ setting NVN native
     default 0
     startup
     words Off|On
-    help 1 = the host answers the NVN functions of the game (gpu/nvn_native.c) and the game's NVN library is not run. A
+    help 1 = the host answers the NVN functions of the game (gpu/nvn/nvn_native.c) and the game's NVN library is not run. A
     help function the host does not have yet stops the game (nvn_native_missing). 0 = the library runs as always.
     help Phase 6 of NXAevora, under construction: with 1 the game draws, but some objects such as characters are missing
 setting NVN draw record
@@ -762,7 +762,7 @@ setting NVN draw record
     default 0
     startup
     words Off|On
-    help 1 = the runtime records the draw, clear, dispatch, copy and present calls of the renderer (gpu/draw_record.c)
+    help 1 = the runtime records the draw, clear, dispatch, copy and present calls of the renderer (gpu/nvn/diag/draw_record.c)
     help and writes per frame counts and a signature table to <game>.drawrec<N>.frames.txt and
     help <game>.drawrec<N>.sigs.txt, N being nvn_native. 0 = no record
 setting NVN measure
@@ -771,7 +771,7 @@ setting NVN measure
     default 0
     startup
     words Off|On
-    help 1 = logs the CPU time of the guest and GPU sides of both NVN paths each 600 presents (gpu/nvn_measure.c),
+    help 1 = logs the CPU time of the guest and GPU sides of both NVN paths each 600 presents (gpu/nvn/diag/nvn_measure.c),
     help with the frame time median, 99th percentile, maximum and the draw counts. 0 = no measure and no clock read
 setting NVN native missing
     key nvn_native_missing
@@ -789,7 +789,7 @@ setting NVN selftest
     startup
     words Off|On
     help 1 = at the first nvnQueueInitialize, the same scripted calls go to the game's NVN library and to the host
-    help handlers, and the results are compared (gpu/nvn_selftest.c). The result is in the log. It needs nvn_trace=1
+    help handlers, and the results are compared (gpu/nvn/test/nvn_selftest.c). The result is in the log. It needs nvn_trace=1
     help and nvn_native=0. A diagnostic: it draws nothing and writes no object of the game
 setting NVN selftest mutation
     key nvn_selftest_mutate
@@ -799,7 +799,7 @@ setting NVN selftest mutation
     help The name of one NVN function whose host call gets a changed argument in the selftest command buffer cases, or
     help one execution test case (exec_fence_order, exec_gpu_to_cpu, exec_cpu_to_gpu, exec_timeout, exec_event_report,
     help exec_two_queues, exec_cb_fence_flush, exec_queue_reinit). A test of the comparison. Empty: none
-    help (gpu/nvn_selftest_cmd.c, gpu/nvn_exectest.c)
+    help (gpu/nvn/test/nvn_selftest_cmd.c, gpu/nvn/test/nvn_exectest.c)
 setting NVN exectest
     key nvn_exectest
     int 0 1
@@ -807,7 +807,7 @@ setting NVN exectest
     startup
     words Off|On
     help 1 = at the first nvnQueueInitialize, the execution test runs real work through the host handlers on its own
-    help queues and checks the result in memory (gpu/nvn_exectest.c). The result is in the log. It needs nvn_trace=1 and
+    help queues and checks the result in memory (gpu/nvn/test/nvn_exectest.c). The result is in the log. It needs nvn_trace=1 and
     help nvn_native=1. A diagnostic: it draws nothing and writes no object of the game
 setting Shader corpus
     key shader_corpus

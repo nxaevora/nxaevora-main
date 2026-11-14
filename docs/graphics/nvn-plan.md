@@ -9,7 +9,7 @@ stage does not start before that. The plan is a proposal until the user accepts 
 - The game calls NVN functions through a dispatch table. The NVN library is inside the game. It writes methods into
   push buffers, and the runtime reads them from the GPFIFO (`src/nx/gpu/maxwell/`, about the console GPU engines and
   the macros in `mme*.c`). The Vulkan side is in `src/nx/gpu/vk/` (`render.c`, `pipeline.c`, `record.c`, `surface.c`).
-- `nvn_trace=1` (`src/nx/gpu/nvn_trace.c`) already lists the NVN functions that the game resolves and counts the calls.
+- `nvn_trace=1` (`src/nx/gpu/nvn/diag/nvn_trace.c`) already lists the NVN functions that the game resolves and counts the calls.
   It wraps the dispatch table entries. It does not see direct branches, so its counts are lower bounds. Calls that the
   game makes without the table are not seen.
 - The translation of shader binaries (`src/nx/gpu/shader/`) and the pipeline cache are independent of the command

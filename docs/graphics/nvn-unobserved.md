@@ -188,7 +188,7 @@ functions that no run reached stay `implemented` plus `unit`, `selftest` or `exe
   separate columns for `selftest`, `exec` and `seen`. Done 2026-11-06 except the trace of the argument values: the tool
   reads the 523 names and addresses from the sdk module (`--sdk`) or a trace log (`--log`). The first file has 274 host
   handlers and 249 missing-function handlers, and every one of the 242 functions of `nvn-calls.md` has a host handler.
-  The trace of the argument values is in `gpu/nvn_enum_trace.c` (2026-11-10): with `nvn_trace=1`, each new value of an
+  The trace of the argument values is in `gpu/nvn/diag/nvn_enum_trace.c` (2026-11-10): with `nvn_trace=1`, each new value of an
   enum or flag register of 63 observed functions gives one line `nvn-enum: <function> w<N>=<hex>`, at most 64 for each
   function. Run 2 (2026-11-10, update program to the title, DrawElements masks fixed to w1 and w2) logged 277 distinct values
   of all 63 functions, the same set as run 1 except DrawElements. The three DrawElements functions use only mode 4 (triangles)
