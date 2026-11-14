@@ -65,7 +65,8 @@ static void objs_lock_take(void) {
 }
 /* The frame job tells the guest waits that it freed an image and updated the syncs. */
 static PCond frame_done_cv;
-static NvnListStore lists; /* the command lists of the game, guarded by objs_lock */
+static NvnListStore lists; /* the command lists of the game, guarded by lists_lock */
+static PMutex lists_lock = PMUTEX_INIT;
 /* The frame line counters (3c decision 12). The four guarded by objs_lock are read and written with it; the other two
    are atomic because missing_handler and the recorder run without it. */
 static uint32_t frame_acquires, frame_submitted_lists, frame_skipped_lists, frame_unmet_event_waits;
@@ -669,7 +670,9 @@ static void h_queue_initialize(CPU* c, u64 entry) {
     GpuChannel* channel = NULL;
     if (old) { /* initialized again without Finalize */
         queue_drop_frame_syncs(queue_addr, &old->pending);
+        pm_lock(&lists_lock);
         nvn_frame_release(&old->pending, &lists);
+        pm_unlock(&lists_lock);
         pc_broadcast(&frame_done_cv); /* a waiter of a dropped fence must see its state */
         channel_id = old->channel_id;
         channel = old->channel;
@@ -3052,12 +3055,14 @@ static CommandBufferRec* command_buffer(u64 addr, const char* operation) {
 static void command_buffer_drop_owned(CommandBufferRec* cb, int (*test)(const OwnedList*, uint64_t, uint64_t),
                                       uint64_t begin, uint64_t end) {
     uint32_t kept = 0;
+    pm_lock(&lists_lock);
     for (uint32_t i = 0; i < cb->owned_count; i++) {
         if (test(&cb->owned[i], begin, end))
             nvn_list_unref(&lists, cb->owned[i].handle);
         else
             cb->owned[kept++] = cb->owned[i];
     }
+    pm_unlock(&lists_lock);
     cb->owned_count = kept;
 }
 static int owned_any(const OwnedList* l, uint64_t begin, uint64_t end) { (void)l; (void)begin; (void)end; return 1; }
@@ -3213,8 +3218,10 @@ static void h_command_buffer_end_recording(CPU* c, u64 entry) {
     uint64_t handle = 0;
     if (cb && cb->recording) {
         cb->recording = 0;
+        pm_lock(&lists_lock);
         handle = nvn_list_publish(&lists, &cb->open);
         if (!handle) fatal("nvn-native: out of memory for a command list\n");
+        pm_unlock(&lists_lock);
         if (!command_buffer_own(cb, handle)) fatal("nvn-native: out of memory for the lists of a command buffer\n");
     }
     c->x[0] = handle; /* 0 outside a recording, as in the library */
@@ -4463,18 +4470,24 @@ static void h_command_buffer_call_commands(CPU* c, u64 entry) {
         else
             for (u32 i = 0; i < count; i++) {
                 NvnOpCall op = {gr64(c->x[2] + (u64)i * 8)};
-                if (!cb->recording)
+                if (!cb->recording) {
                     command_record(cb, c->x[0], name, NVN_OP_CALL, &op, sizeof op);
-                else if (!nvn_list_ref(&lists, op.handle))
-                    command_dropped(cb, name, "handle is not a live list", op.handle);
-                else
-                    command_record(cb, c->x[0], name, NVN_OP_CALL, &op, sizeof op);
+                } else {
+                    pm_lock(&lists_lock);
+                    const int live = nvn_list_ref(&lists, op.handle);
+                    pm_unlock(&lists_lock);
+                    if (!live)
+                        command_dropped(cb, name, "handle is not a live list", op.handle);
+                    else
+                        command_record(cb, c->x[0], name, NVN_OP_CALL, &op, sizeof op);
+                }
             }
     }
     pm_unlock(&objs_lock);
 }
 /* CopyCommands: a deep copy of each source list into the open list, as the library copies command memory. A CALL op
-   keeps its reference model and takes one more, so the destination does not depend on the source after the call. */
+   keeps its reference model and takes one more, so the destination does not depend on the source after the call.
+   Caller holds lists_lock: the copy reads src and refs the CALL targets. */
 static void command_copy_commands(CommandBufferRec* cb, const NvnOpList* src, const char* operation) {
     if (!cb->recording) {
         command_dropped(cb, operation, "outside a recording", src->ops);
@@ -4500,12 +4513,15 @@ static void h_command_buffer_copy_commands(CPU* c, u64 entry) {
         else
             for (u32 i = 0; i < count; i++) {
                 uint64_t handle = gr64(c->x[2] + (u64)i * 8);
+                pm_lock(&lists_lock);
                 const NvnOpList* src = nvn_list_find(&lists, handle);
                 if (!src) {
+                    pm_unlock(&lists_lock);
                     command_dropped(cb, name, "handle is not a live list", handle);
                     continue;
                 }
                 command_copy_commands(cb, src, name);
+                pm_unlock(&lists_lock);
                 if (!cb->recording) break;
             }
     }
@@ -5101,9 +5117,9 @@ static uint32_t replay_host_read_register(void* ctx, uint32_t m) {
 }
 static const NvnOpList* replay_host_find_list(void* ctx, uint64_t handle) {
     (void)ctx;
-    objs_lock_take();
+    pm_lock(&lists_lock);
     const NvnOpList* list = nvn_list_find(&lists, handle);
-    pm_unlock(&objs_lock);
+    pm_unlock(&lists_lock);
     return list;
 }
 /* The replay thread owns the bind table; no lock is needed. A bind is state of the command buffer in the game, so the
@@ -6558,9 +6574,9 @@ static void frame_replay_lists(const FrameJob* job, NvnReplayStats* stats, uint6
     NvnReplayEnv env;
     nvn_native_replay_env(&host, job->window_origin_flip, &env);
     for (uint32_t i = 0; i < job->frame.handle_count; i++) {
-        objs_lock_take();
+        pm_lock(&lists_lock);
         const NvnOpList* list = nvn_list_find(&lists, job->frame.handles[i]);
-        pm_unlock(&objs_lock);
+        pm_unlock(&lists_lock);
         if (!list) {
             stats->faults++;
             LOG_LIMIT(FRAME_LOG_LIMIT, "nvn-native: frame handle=%llx is not a live list\n",
@@ -6584,9 +6600,9 @@ int nvn_native_selftest_replay(GpuChannel* ch, uint64_t handle, int window_origi
     host->clip_limit = NVN_REPLAY_CLIP_LIMIT;
     NvnReplayEnv env;
     nvn_native_replay_env(host, window_origin_flip, &env);
-    objs_lock_take();
+    pm_lock(&lists_lock);
     const NvnOpList* list = nvn_list_find(&lists, handle);
-    pm_unlock(&objs_lock);
+    pm_unlock(&lists_lock);
     if (!list) {
         LOG("nvn-native: selftest replay: handle=%llx is not a live list\n", (unsigned long long)handle);
         free(host);
@@ -6633,7 +6649,9 @@ static void frame_finish(FrameJob* job) {
         if (window && job->index < window->texture_count && window->states[job->index] == NVN_IMAGE_PRESENTED)
             window->states[job->index] = NVN_IMAGE_FREE;
     }
+    pm_lock(&lists_lock);
     nvn_frame_release(&job->frame, &lists);
+    pm_unlock(&lists_lock);
     frames_in_flight--;
     pc_broadcast(&frame_done_cv); /* the image and the syncs are up to date */
     pm_unlock(&objs_lock);
@@ -6668,7 +6686,9 @@ static void frame_line(const FrameJob* job, const NvnReplayStats* stats, int sho
     objs_lock_take();
     uint32_t submitted = frame_submitted_lists, skipped = frame_skipped_lists, acquires = frame_acquires;
     uint32_t unmet_event_waits = frame_unmet_event_waits;
+    pm_lock(&lists_lock);
     uint32_t live = nvn_list_live(&lists);
+    pm_unlock(&lists_lock);
     pm_unlock(&objs_lock);
     uint32_t gops = stats->replayed[NVN_OP_CLEAR_DEPTH_STENCIL] + stats->replayed[NVN_OP_CLEAR_TEXTURE] +
                     stats->replayed[NVN_OP_COPY_TEXTURE] + stats->replayed[NVN_OP_REPORT_COUNTER] +
@@ -6766,7 +6786,8 @@ static int queue_origin_flip(const QueueRec* q) {
 }
 /* Posts the pending frame of a queue as a job: one syncpoint increment, the value to the newest fence of each token,
    the init words once. Caller holds objs_lock and calls gpu_call with the result before the unlock, so the fence and
-   its job enter the GPU queue in that order. Lock order: objs_lock, then g_qlk; never take objs_lock with g_qlk held. */
+   its job enter the GPU queue in that order. Lock order: objs_lock, then lists_lock, then g_qlk; never take objs_lock
+   with lists_lock or g_qlk held. */
 static FrameJob* queue_post_frame(u64 queue_addr, QueueRec* q, const FrameTarget* target) {
     FrameJob* job = malloc(sizeof *job);
     if (!job) fatal("nvn-native: out of memory for the frame job of a queue\n");
@@ -6812,7 +6833,7 @@ static FrameJob* queue_post_frame(u64 queue_addr, QueueRec* q, const FrameTarget
 /* Follows the fence, wait and CALL ops of one submitted list. A fence becomes a token of the pending frame with the
    serial of that sync, so a newer fence replaces it. Its signal is at the end of the frame job, later than in the
    library: a waiter waits longer, never shorter. A wait only checks what the serial order has reached. *flush is set
-   to 1 when a fence token has FLUSH_FOR_CPU. Called with objs_lock held, after the lists were added to the frame. */
+   to 1 when a fence token has FLUSH_FOR_CPU. Caller holds objs_lock and lists_lock, after the lists were added. */
 static void queue_scan_list(u64 queue_addr, QueueRec* q, const char* name, const NvnOpList* list, uint64_t list_handle,
                             uint32_t depth, int* flush) {
     size_t pos = 0;
@@ -6908,6 +6929,8 @@ static void h_queue_submit_commands(CPU* c, u64 entry) {
     if (!handles) fatal("nvn-native: out of memory for the submitted handles of a queue\n");
     for (uint32_t i = 0; i < handle_count; i++) handles[i] = gr64(c->x[2] + (u64)i * 8);
     uint32_t skipped = 0;
+    int flush = 0;
+    pm_lock(&lists_lock);
     int result = nvn_frame_add_lists(&q->pending, &lists, handles, handle_count, &skipped);
     if (result == NVN_FRAME_MEMORY) {
         free(handles);
@@ -6917,7 +6940,6 @@ static void h_queue_submit_commands(CPU* c, u64 entry) {
         LOG_LIMIT(QUEUE_LOG_LIMIT, "nvn-native: %s queue=%llx count=%u does not fit in the pending frame\n",
                   name, (unsigned long long)c->x[0], handle_count);
     } else {
-        int flush = 0;
         if (skipped)
             LOG_LIMIT(QUEUE_LOG_LIMIT, "nvn-native: %s queue=%llx skipped %u handles that are not live lists\n",
                       name, (unsigned long long)c->x[0], skipped);
@@ -6927,10 +6949,11 @@ static void h_queue_submit_commands(CPU* c, u64 entry) {
         }
         frame_submitted_lists += handle_count - skipped;
         frame_skipped_lists += skipped;
-        if (flush && !nvn_frame_is_empty(&q->pending)) {
-            const FrameTarget target = {.kind = NVN_FRAME_FLUSH};
-            job = queue_post_frame(c->x[0], q, &target);
-        }
+    }
+    pm_unlock(&lists_lock);
+    if (flush && !nvn_frame_is_empty(&q->pending)) {
+        const FrameTarget target = {.kind = NVN_FRAME_FLUSH};
+        job = queue_post_frame(c->x[0], q, &target);
     }
     free(handles);
     if (job) gpu_call(frame_run, job, NULL, 0);
