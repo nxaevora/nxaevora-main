@@ -264,6 +264,7 @@ static void test_defaults_on(void) {
         "SNX_ARCEUS_LIST_SCROLL_FIX", "SNX_ARCEUS_WALL_JUMP_FIX", "SNX_ARCEUS_LEDGE_FIX",
         "SNX_ARCEUS_CLIMB_STEP", "SNX_ARCEUS_MOVEMENT_FIX", "SNX_ARCEUS_CAPPED_FALL_FIX",
         "SNX_ARCEUS_AIR_STEERING_FIX", "SNX_ARCEUS_RIDE_SWAP_FIX", "SNX_ARCEUS_MOVEMENT_SITES",
+        "SNX_ARCEUS_RIDE_RAMP_FIX", "SNX_ARCEUS_CLOUD_FIX",
         "SNX_ARCEUS_CAMERA_SPEED",
         "SNX_ARCEUS_CLOCK_TRACE", "SNX_ARCEUS_DIALOGUE_TRACE", "SNX_ARCEUS_CAMERA_TRACE",
         "SNX_ARCEUS_TIMING_RESEARCH", "SNX_ARCEUS_CADENCE_CENSUS", "SNX_ARCEUS_GRAVITY_PROBE",
@@ -333,13 +334,25 @@ static void test_defaults_on(void) {
         "SNX_ARCEUS_TIMER_CARRY_FIX", "SNX_ARCEUS_AI_TICK_FIX", "SNX_ARCEUS_TURN_FIX",
         "SNX_ARCEUS_LIST_SCROLL_FIX", "SNX_ARCEUS_WALL_JUMP_FIX", "SNX_ARCEUS_LEDGE_FIX",
         "SNX_ARCEUS_MOVEMENT_FIX", "SNX_ARCEUS_CAPPED_FALL_FIX", "SNX_ARCEUS_AIR_STEERING_FIX",
-        "SNX_ARCEUS_RIDE_SWAP_FIX",
+        "SNX_ARCEUS_RIDE_SWAP_FIX", "SNX_ARCEUS_RIDE_RAMP_FIX",
         "SNX_ARCEUS_DIRECT_MOVE_FIX", "SNX_ARCEUS_FIELD_WAZA_FIX", "SNX_ARCEUS_WAZA_OBJECT_FIX"
     };
     for (unsigned i = 0; i < sizeof enabled / sizeof enabled[0]; i++)
         assert(arceus_switch_enabled(enabled[i], 1));
     assert(waza_shot_mode_value() == 2);
-    assert(movement_mask_value() == 0x1fcul && climb_step_value() == 2);
+    /* Bits 2 to 8 and bit 10, the player's horizontal position step. */
+    assert(movement_mask_value() == 0x5fcul && climb_step_value() == 2);
+    /* The sky cloud fix: unset is all eight fields, 1 the first three, 0 off. */
+    assert(cloud_fix_value() == 2);
+    flag("SNX_ARCEUS_CLOUD_FIX", "1");
+    assert(cloud_fix_value() == 1);
+    flag("SNX_ARCEUS_CLOUD_FIX", "0");
+    assert(cloud_fix_value() == 0);
+    unset_flag("SNX_ARCEUS_CLOUD_FIX");
+    assert(ride_ramp_sites[0].owner == 0x257af70 && ride_ramp_sites[0].site == 0x257c9f4 &&
+           !ride_ramp_sites[0].negative);
+    assert(horizontal_move_site.owner == 0x1a0d9dc && horizontal_move_site.site == 0x1a0da20 &&
+           !horizontal_move_site.negative);
     /* The script tick: unset is the Braviary bit and the throw window. 0 turns each off, and a
        mask is used as given. */
     assert(script_tick_wanted() == 4 && script_windows_wanted() == 1);
@@ -383,8 +396,10 @@ static void test_defaults_on(void) {
     config = arceus_clock_config(g_opt_fps);
     assert(!config.write_fps && !config.skip_runtime_limit && config.initial_ns == ARCEUS_UNLOCKED_INITIAL_STEP_NS);
     flag("SNX_ARCEUS_MOVEMENT_SITES", "7fc");
-    assert(movement_mask_value() == 0x7fcul && (movement_mask_value() & 0x1fcul) == 0x1fcul &&
+    assert(movement_mask_value() == 0x7fcul && (movement_mask_value() & 0x5fcul) == 0x5fcul &&
            (movement_mask_value() & 0x200ul));
+    flag("SNX_ARCEUS_MOVEMENT_SITES", "1fc");
+    assert(movement_mask_value() == 0x1fcul);
     for (unsigned i = 0; i < sizeof enabled / sizeof enabled[0]; i++) {
         flag(enabled[i], "0");
         assert(!arceus_switch_enabled(enabled[i], 1));
@@ -519,6 +534,77 @@ static void audit_map_original(CPU* c, u64 entry) {
     c->pc = c->x[30];
 }
 /* Recover long-frame tick budget on later calls without replaying game callbacks. */
+static const float cloud_increments[4] = {.004f, .006f, -.007f, -.008f};
+static unsigned cloud_calls;
+static int cloud_replace_sky;
+static void cloud_original_stub(CPU* c, u64 entry) {
+    assert(entry == entry_pc);
+    const u64 sky = gr64(c->x[0] + 0x58);
+    for (unsigned k = 0; k < 4; k++) {
+        const u64 at = sky + 0x604 + 4 * k;
+        float value = guest_float(at) + cloud_increments[k];
+        if (value >= 1) value -= 1;
+        if (value <= -1) value += 1;
+        guest_float_write(at, value);
+    }
+    if (cloud_replace_sky) gw64(c->x[0] + 0x58, 0);
+    cloud_calls++;
+    c->x[0] = 77;
+    c->pc = c->x[30];
+}
+static void test_cloud_phases(void) {
+    const u64 sky = 1024;
+    double reference[4] = {0};
+    for (unsigned schedule = 0; schedule < 4; schedule++) {
+        memset(memory, 0, sizeof memory);
+        frame_step_address = 0xf00;
+        gw64(object + 0x58, sky);
+        cloud_phase_original = cloud_original_stub;
+        cloud_calls = cloud_replace_sky = 0;
+        for (unsigned k = 0; k < 4; k++) guest_float_write(sky + 0x604 + 4 * k, k < 2 ? .9995f : -.9995f);
+        double sums[4] = {0};
+        const unsigned frames = schedule == 0 ? 30 : schedule == 1 ? 60 : schedule == 2 ? 120 : 63;
+        for (unsigned i = 0; i < frames; i++) {
+            const u64 ns = schedule < 3 ? (1000000000ull + frames / 2) / frames
+                                      : i == 62 ? 8000000 : (i & 1 ? 20000000 : 12000000);
+            frame_step_write(ns);
+            float before[4];
+            for (unsigned k = 0; k < 4; k++) before[k] = guest_float(sky + 0x604 + 4 * k);
+            CPU c = {.x = {[0] = 128, [30] = 32}};
+            cloud_phase_update(&c, entry_pc);
+            assert(c.x[0] == 77 && c.pc == return_pc);
+            for (unsigned k = 0; k < 4; k++) {
+                float after = guest_float(sky + 0x604 + 4 * k);
+                if (!schedule) {
+                    float expected = before[k] + cloud_increments[k];
+                    if (expected >= 1) expected -= 1;
+                    if (expected <= -1) expected += 1;
+                    assert(float_bits(after) == float_bits(expected));
+                }
+                float delta = after - before[k];
+                if (delta > .5f) delta -= 1;
+                if (delta < -.5f) delta += 1;
+                sums[k] += delta;
+            }
+        }
+        assert(cloud_calls == frames);
+        for (unsigned k = 0; k < 4; k++) {
+            if (!schedule) reference[k] = sums[k];
+            else assert(fabs(sums[k] - reference[k]) < 1e-5);
+        }
+    }
+    /* If the original replaces its sky block, leave the old block's native output alone. */
+    gw64(object + 0x58, sky);
+    cloud_replace_sky = 1;
+    frame_step_write(16666667);
+    float expected = guest_float(sky + 0x604) + cloud_increments[0];
+    if (expected >= 1) expected -= 1;
+    CPU c = {.x = {[0] = 128, [30] = 32}};
+    cloud_phase_update(&c, entry_pc);
+    assert(guest_float(sky + 0x604) == expected);
+    cloud_replace_sky = 0;
+    frame_step_address = 0;
+}
 static void test_timer_carry(void) {
     for (unsigned enabled = 0; enabled < 2; enabled++) {
         timer_carry_fix = (int)enabled;
@@ -1550,7 +1636,17 @@ static unsigned tick_frame(u64 ns, int trigger) {
     step.step = ns;
     frame_step_write(ns);
     *GP(fields + 2) = (u8)trigger;
-    const u32 before = gr32(frame_step_address);
+    const u32 before = gr32(frame_step_address), derived = gr32(frame_step_address + 8);
+    /* The derived words follow the step: -10/step and 1/(30 x step). */
+    const float seconds = guest_float(frame_step_address);
+    assert(guest_float(frame_step_address + 8) == (seconds == NOMINAL_STEP_SECONDS ? -300.0f : -10.0f / seconds) &&
+           guest_float(frame_step_address + 20) == 1.0f / (30.0f * seconds));
+    /* At the game's own step they are the game's constants, so its division and product give
+       the game's values: -300 where the game divides by -300, and 1. */
+    frame_step_cell_write(NOMINAL_STEP_SECONDS);
+    assert(guest_float(frame_step_address + 8) == -300.0f && guest_float(frame_step_address + 20) == 1.0f &&
+           gr32(frame_step_address + 16) == 0x40490fdb);
+    frame_step_cell_write(seconds);
     for (unsigned post = 0; post < 2; post++) {
         CPU cpu = {.x = {[0] = 128, [2] = context, [30] = 64}, .pc = 16};
         const unsigned runs = tick_runs[post];
@@ -1560,6 +1656,7 @@ static unsigned tick_frame(u64 ns, int trigger) {
         /* A ticked script sees 1/30 s, and the cell and the field are back afterwards. */
         if (tick_runs[post] > runs && (script_tick_mask >> tick_class & 1)) assert(tick_cell == NOMINAL_STEP_SECONDS);
         assert(gr32(frame_step_address) == before && *GP(fields + 2) == (u8)trigger);
+        assert(gr32(frame_step_address + 8) == derived);
     }
     /* PreUpdate and PostUpdate of a frame share the decision. */
     assert(ran == 0 || ran == 2);
@@ -2300,6 +2397,7 @@ int main(void) {
     test_fade_slots_free();
     test_list_scroll();
     test_timer_carry();
+    test_cloud_phases();
     test_ai_tick();
     test_turn();
     test_air_steering();

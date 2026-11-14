@@ -41,10 +41,12 @@ Unset timing switches use the defaults below. `SNX_ARCEUS_TIMING_FIXES=0` turns 
 | `SNX_ARCEUS_LEDGE_FIX` | on | Leaves ledge movement at its authored rate. |
 | `SNX_ARCEUS_CLIMB_STEP` | 2 | Disables climb step and stop timing fixes. `1` enables the step fix only; `2` also enables the stop fix. |
 | `SNX_ARCEUS_MOVEMENT_FIX` | on | Leaves the selected character movement sites at their authored rates. |
-| `SNX_ARCEUS_MOVEMENT_SITES` | `0x1fc` | Not a boolean: selects movement sites by bit mask. Explicit masks are used as provided. |
+| `SNX_ARCEUS_MOVEMENT_SITES` | `0x5fc` | Not a boolean: selects movement sites by bit mask. Explicit masks are used as provided. |
 | `SNX_ARCEUS_CAPPED_FALL_FIX` | on | Disables the capped-fall correction. |
 | `SNX_ARCEUS_AIR_STEERING_FIX` | on | Leaves air steering at its authored rate. |
 | `SNX_ARCEUS_RIDE_SWAP_FIX` | on | Leaves ride-swap countdowns at their authored rate. |
+| `SNX_ARCEUS_RIDE_RAMP_FIX` | on | Leaves the ride controller's angle ramp at its authored rate. |
+| `SNX_ARCEUS_CLOUD_FIX` | 2 | Leaves the sky cloud layers at their authored rates. `1` fixes three of the eight fields; `2` all eight. |
 | `SNX_ARCEUS_DIRECT_MOVE_FIX` | on | Leaves the direct ground-move step at its authored rate. |
 | `SNX_ARCEUS_FIELD_WAZA_FIX` | on | Leaves field-move countdowns and turn input at their authored rates. |
 | `SNX_ARCEUS_WAZA_OBJECT_FIX` | on | Leaves attack-object timers at their authored rates; if shot fix stays on, logs one warning. |
@@ -59,7 +61,7 @@ Unset timing switches use the defaults below. `SNX_ARCEUS_TIMING_FIXES=0` turns 
 | `SNX_ARCEUS_GRAVITY_PROBE` | off | `=0` keeps the read-only probe off. |
 | `SNX_ARCEUS_FIXED_RESOLUTION` | off | `=0` leaves the game's automatic 3D resolution governor enabled. |
 
-The default movement mask selects bits 2 through 8, the seven player movement sites. Bits 0 and 1 remain off. An explicit mask such as `7fc` adds bit 9's capped-fall selection while preserving the same seven sites; this branch has no bit 10 site.
+The default movement mask selects bits 2 through 8, the seven player movement sites, and bit 10, the player's horizontal position step. Bits 0 and 1 remain off. An explicit mask such as `7fc` adds bit 9's capped-fall selection while preserving the same sites. `1fc` leaves bit 10 out.
 
 ## The shared step
 
@@ -200,8 +202,8 @@ that loads it, and the first one maps it. The `arceus-gravity-fix` line confirms
 ## Movement fix
 
 With only gravity on the elapsed time, sideways motion in the air still ran four times fast against the fall,
-because other character movement steps add acceleration times 1/30 once per call. The default-on `SNX_ARCEUS_MOVEMENT_FIX` covers nine of those constants and can make each load the frame step from the
-same cell. By default it turns on seven of them (bits 2 to 8, the player sites). Bits 0 and 1, the shared sites, turn on
+because other character movement steps add acceleration times 1/30 once per call. The default-on `SNX_ARCEUS_MOVEMENT_FIX` covers ten of those constants and can make each load the frame step from the
+same cell. By default it turns on eight of them (bits 2 to 8 and 10, the player sites). Bits 0 and 1, the shared sites, turn on
 only when an explicit mask sets them. Each is a MOV/MOVK pair of plus or minus 1/30:
 
 | Bit | Site | Owner |
@@ -216,9 +218,15 @@ only when an explicit mask sets them. Each is a MOV/MOVK pair of plus or minus 1
 | 7 | `main+1A17B10` | player state acceleration (`main+1A173B0`) |
 | 8 | `main+1A17F3C` | player state force (`main+1A173B0`) |
 
+| 10 | `main+1A0DA20` | player horizontal displacement (`main+1A0D9DC`) |
+
+Bit 10 is a different kind of step. `main+1A0D9DC` sets the player's position from the velocity at `+118` times 1/30
+on every call, after its caller has integrated the acceleration, so without it that displacement is 2 times too long
+at 60 FPS. It was on (mask `7fc`) in 59 play sessions at 60, 120 and unlocked frame rates. No session isolates it.
+
 `SNX_ARCEUS_MOVEMENT_SITES` is an optional hex mask over these bits, to test the sites one by one. Without it the
-default `0x1fc` turns on the seven sites of bits 2 to 8. An empty value turns on all nine. The `arceus-movement-fix` line
-gives the number installed and the mask.
+default `0x5fc` turns on the eight sites of bits 2 to 8 and 10. An empty value turns on all ten. The
+`arceus-movement-fix` line gives the number installed and the mask.
 
 ## Fade fix
 
@@ -231,6 +239,22 @@ waits to finish, and the authored delta is put back after each call unless the c
 kept for each fade object, up to 16. A fade-in frees its slot on the call that ends it. It starts over when the fade starts again (`main+C21D00` and `main+C227BC`)
 or when the frame, duration or state differ from what the last call left. With all slots in use a call runs as
 the original. The other fade modes are unchanged. `arceus-fade` lines count the calls.
+
+## Sky clouds
+
+The sky update `main+29BFDAC` advances eight fields of the sky block once per call, so the cloud layers and their
+ground shadows moved 2 times fast at 60 FPS and 4 times at 120. `SNX_ARCEUS_CLOUD_FIX=1` makes three of them use the
+elapsed time by loading derived words of the frame-step cell: `+614` divides its parameter by minus 10/step where the
+game divides by minus 300, and
+`+64C` and `+650` divide by the parameter times 30 times the step. The default, `2`, also covers `+5DC` in the same
+way and wraps the function to scale the four phase increments at `+604` to `+610` by the frame's share of 1/30 s.
+At the game's own step the derived words are the game's constants (minus 300 and 1), so all eight fields get the
+game's own values bit for bit, and a sky block that the call replaced is left alone.
+The fix patches game code only and needs nothing from the renderer.
+
+Played: at 30 FPS the clouds and their shadows look normal and at 120 FPS both were too fast. With value 1 the user
+called the clouds normal. Value 2 followed after a measurement showed five fields still stepping per call (2.04 times
+at 60 FPS, 4.08 at 120) and was on in 39 play sessions.
 
 ## Unlocked frame rate
 
@@ -348,6 +372,14 @@ The ride controller's update `main+2537B28` runs once per rendered frame and cou
 the swap that takes about 0.6 s at 30 FPS took 0.17 to 0.24 s unlocked. The default-on `SNX_ARCEUS_RIDE_SWAP_FIX`
 lets the waits count 30 times a second: on the other frames a running count goes in one higher and comes out as it was.
 A count the call did not touch is left as the game set it. `arceus-ride-swap` lines log counts that start or end.
+
+## Ride angle ramp
+
+The ride controller update `main+257AF70` advances an angle at `+324` by a parameter times 1/30 on every call, up to
+the limit at `+690`. The default-on `SNX_ARCEUS_RIDE_RAMP_FIX` makes the constant at `main+257C9F4` load the frame
+step, so the ramp keeps its authored rate and its limit. Nothing else in the function is changed. It refuses unless
+the next use of the constant is the float move it expects. The fix was on in 58 play sessions at 60, 120 and
+unlocked frame rates. No session isolates it.
 
 ## Wild Pokémon attacks
 

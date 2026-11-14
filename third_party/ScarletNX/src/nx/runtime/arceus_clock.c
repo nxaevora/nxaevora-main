@@ -53,7 +53,7 @@ static int arceus_switch_enabled(const char* name, int default_on) {
 }
 static unsigned long movement_mask_value(void) {
     const char* value = getenv("SNX_ARCEUS_MOVEMENT_SITES");
-    if (!value) return 0x1fcul;
+    if (!value) return 0x5fcul;
     return *value ? strtoul(value, NULL, 16) : ~0ul;
 }
 static int climb_step_value(void) {
@@ -129,7 +129,8 @@ static void water_step_write(u64 ns) {
 static u64 frame_step_address;
 /* One per main-loop frame: an engine frame identity for per-frame pairing. */
 static u64 frame_step_frames;
-/* The cell's two words: the step in seconds and its negative. */
+/* The cell's words: the step in seconds, its negative, and three derived words. */
+#define FRAME_STEP_CELL_WORDS 6
 static void frame_step_cell_write(float seconds) {
     const float negative = -seconds;
     u32 bits;
@@ -137,6 +138,16 @@ static void frame_step_cell_write(float seconds) {
     gw32(frame_step_address, bits);
     memcpy(&bits, &negative, sizeof bits);
     gw32(frame_step_address + 4, bits);
+    /* Derived words for the sky cloud fix: -10/step at +8, pi at +16 and 1/(30 x step) at +20.
+       At the game's own step they are the game's constants, -300 and 1, so its results are
+       the same bit for bit. */
+    const float derived[3] = {seconds == NOMINAL_STEP_SECONDS ? -300.0f : -10.0f / seconds, 3.14159274f,
+                              1.0f / (30.0f * seconds)};
+    const u32 at[3] = {8, 16, 20};
+    for (unsigned k = 0; k < 3; k++) {
+        memcpy(&bits, &derived[k], sizeof bits);
+        gw32(frame_step_address + at[k], bits);
+    }
 }
 static void frame_step_write(u64 ns) {
     if (!frame_step_address) return;
@@ -1789,6 +1800,10 @@ static const FrameStepSite movement_sites[] = {
     {0x1a173b0,0x22a4,0xfc180fea,0x1a17f3c,0,"player state force"},
 };
 #define MOVEMENT_SITES (sizeof movement_sites / sizeof movement_sites[0])
+/* Bit 9 belongs to capped_fall_init. Bit 10 changes the player's +118 horizontal
+   position step from v/30 to v*elapsed, after its caller has integrated acceleration. */
+static const FrameStepSite horizontal_move_site =
+    {0x1a0d9dc,0x11c,0xd10203ff,0x1a0da20,0,"player horizontal displacement"};
 static void movement_fix_init(void) {
     if (!main_base ||  !arceus_switch_enabled("SNX_ARCEUS_MOVEMENT_FIX", 1)) return;
     if (!clocks_installed) {
@@ -1799,13 +1814,36 @@ static void movement_fix_init(void) {
     if (!frame_step_cell_init("arceus-movement-fix")) return;
     /* Optional hex mask over movement_sites (bit 0 is the first) to test sites one by one. */
     const unsigned long mask = movement_mask_value();
-    FrameStepSite chosen[MOVEMENT_SITES];
+    FrameStepSite chosen[MOVEMENT_SITES + 1];
     unsigned n = 0;
     for (unsigned k = 0; k < MOVEMENT_SITES; k++)
         if (mask >> k & 1) chosen[n++] = movement_sites[k];
+    if (mask & 0x400ul) chosen[n++] = horizontal_move_site;
     const unsigned sites = frame_step_sites_init(chosen, n, "arceus-movement-fix");
-    LOG("arceus-movement-fix: EXPERIMENT: %u of %u character movement sites (mask %lx) use min(1/30, elapsed), cell=%llx\n",
-        sites, (unsigned)MOVEMENT_SITES, mask, (unsigned long long)frame_step_address);
+    LOG("arceus-movement-fix: EXPERIMENT: %u of %u selected character movement sites (mask %lx) use min(1/30, elapsed), cell=%llx\n",
+        sites, n, mask, (unsigned long long)frame_step_address);
+}
+/* 257AF70 advances a controller angle by param/30 up to +690 each call.
+   Change only that accumulator's step, preserving the authored rate and cap. */
+static const FrameStepSite ride_ramp_sites[] = {
+    {0x257af70,0x20d0,0xd10383ff,0x257c9f4,0,"ride angle ramp"},
+};
+static void ride_ramp_fix_init(void) {
+    if (!main_base || !arceus_switch_enabled("SNX_ARCEUS_RIDE_RAMP_FIX", 1)) return;
+    if (!clocks_installed) {
+        WARN("arceus-ride-ramp: refused without elapsed-time clocks\n");
+        return;
+    }
+    if (!g_mod->nfns || !g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale || !g_mod->entry_fn) return;
+    /* The constant feeds FMOV S0,W8, without changing a pointer. */
+    if (!readable(main_base + 0x257c9fc, 4) || gr32(main_base + 0x257c9fc) != 0x1e270100) {
+        WARN("arceus-ride-ramp: refused float-use guard\n");
+        return;
+    }
+    if (!frame_step_cell_init("arceus-ride-ramp")) return;
+    const unsigned sites = frame_step_sites_init(ride_ramp_sites, 1, "arceus-ride-ramp");
+    LOG("arceus-ride-ramp: EXPERIMENT: %u of 1 ride angle ramp sites use min(1/30, elapsed), cell=%llx\n",
+        sites, (unsigned long long)frame_step_address);
 }
 static void gravity_fix_init(void) {
     if (!main_base ||  !arceus_switch_enabled("SNX_ARCEUS_GRAVITY_FIX", 1)) return;
@@ -3820,17 +3858,17 @@ static void script_tick_bridge(CPU* c, u64 entry, unsigned class_index, unsigned
     __atomic_add_fetch(&script_tick_ran, 1, __ATOMIC_RELAXED);
     if (changed) __atomic_add_fetch(&script_tick_latched, changed, __ATOMIC_RELAXED);
     /* Everything the script calls sees a whole 1/30 s in the frame step cell. */
-    u32 cell[2];
+    u32 cell[FRAME_STEP_CELL_WORDS];
     const int outer = usable && !script_tick_depth;
     if (outer) {
-        for (unsigned k = 0; k < 2; k++) cell[k] = gr32(frame_step_address + 4 * k);
+        for (unsigned k = 0; k < FRAME_STEP_CELL_WORDS; k++) cell[k] = gr32(frame_step_address + 4 * k);
         frame_step_cell_write(NOMINAL_STEP_SECONDS);
     }
     script_tick_depth++;
     script_class_run(c, entry, class_index, script_tick_originals[class_index][post]);
     script_tick_depth--;
     if (outer)
-        for (unsigned k = 0; k < 2; k++) gw32(frame_step_address + 4 * k, cell[k]);
+        for (unsigned k = 0; k < FRAME_STEP_CELL_WORDS; k++) gw32(frame_step_address + 4 * k, cell[k]);
     if (blended) {
         pm_lock(&script_tick_lock);
         rotation_blend_bridge(frame, ns, 2, object);
@@ -3846,6 +3884,105 @@ static void script_tick_bridge(CPU* c, u64 entry, unsigned class_index, unsigned
     static void script_tick_post_##n(CPU* c, u64 entry) { script_tick_bridge(c, entry, n, 1); }
 SCRIPT_TICK_BRIDGES(0) SCRIPT_TICK_BRIDGES(1) SCRIPT_TICK_BRIDGES(2) SCRIPT_TICK_BRIDGES(3) SCRIPT_TICK_BRIDGES(4)
 SCRIPT_TICK_BRIDGES(5) SCRIPT_TICK_BRIDGES(6) SCRIPT_TICK_BRIDGES(7) SCRIPT_TICK_BRIDGES(8) SCRIPT_TICK_BRIDGES(9)
+/* Sky clouds: 29BFDAC (vtable 41823B0) adds param/-300 to sky +614 and subtracts
+   sin/(param x 30) from +64C and cos/(param x 30) from +650 on every call, so the
+   cloud layers moved 4x per second at 120 FPS. With SNX_ARCEUS_CLOUD_FIX=1 these steps
+   use min(1/30, elapsed): the divisor -10/step at +614, and s11 = param/step for the other two. */
+/* CLOUD_FIX=2, the default, also scales the four wrapped phase increments the original
+   adds at 30 Hz. Keep full-step output bit exact and leave a replaced sky block alone. */
+static GuestFn cloud_phase_original;
+static void cloud_phase_update(CPU* c, u64 entry) {
+    const u64 object = c->x[0];
+    const u64 sky = readable(object + 0x58, 8) ? gr64(object + 0x58) : 0;
+    const int valid = sky && readable(sky, 0x660);
+    float before[4] = {0};
+    if (valid)
+        for (unsigned k = 0; k < 4; k++) before[k] = guest_float(sky + 0x604 + 4 * k);
+    const float seconds = guest_float(frame_step_address);
+    cloud_phase_original(c, entry);
+    /* Rounded 30 Hz nanoseconds can be one float ULP below 1/30. Keep that native result too. */
+    const float full_step = (float)(33333333.0 / 1000000000.0);
+    if (!valid || !(seconds > 0.0f && seconds < full_step) ||
+        !readable(object + 0x58, 8) || gr64(object + 0x58) != sky || !writable(sky, 0x660)) return;
+    const float ratio = seconds / NOMINAL_STEP_SECONDS;
+    for (unsigned k = 0; k < 4; k++) {
+        const u64 at = sky + 0x604 + 4 * k;
+        const float after = guest_float(at);
+        if (!isfinite(before[k]) || !isfinite(after)) continue;
+        float delta = after - before[k];
+        if (delta > 0.5f) delta -= 1.0f;
+        if (delta < -0.5f) delta += 1.0f;
+        float value = before[k] + delta * ratio;
+        if (value >= 1.0f) value -= 1.0f;
+        if (value <= -1.0f) value += 1.0f;
+        guest_float_write(at, value);
+    }
+}
+/* 2 all eight sky fields (also when unset), 1 the first three, 0 off. */
+static int cloud_fix_value(void) {
+    const char* value = getenv("SNX_ARCEUS_CLOUD_FIX");
+    if (!value || !strcmp(value, "2")) return 2;
+    return !strcmp(value, "1");
+}
+static void cloud_fix_init(void) {
+    const int value = cloud_fix_value(), expanded = value == 2;
+    if (!main_base || !value) return;
+    if (!clocks_installed) {
+        WARN("arceus-cloud: refused without elapsed-time clocks\n");
+        return;
+    }
+    if (!g_mod->nfns || !g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale || !g_mod->entry_fn) return;
+    const u64 owner = main_base + 0x29bfdac, one = owner + 0x1b7c, two = owner + 0x2bec;
+    /* The +614 step (MOV W8 -300, LDR S0 param, FMOV S1, FDIV), the s11 default and found-path
+       product, the pi build at the common join, and both FDIV S0,S0,S11 uses. */
+    static const u32 one_words[4] = {0x52b872c8, 0xbd403160, 0x1e270101, 0x1e211800};
+    static const u32 two_words[4] = {0x5281fb68, 0x72a80928, 0x1e270101, 0x1e210808};
+    int ok = covers_exactly(owner, 0x3060) && readable(owner, 0x3060) && gr32(owner) == 0xd103c3ff &&
+             gr32(owner + 0x21f8) == 0x1e27d00b && gr32(owner + 0x2be0) == 0xbd403181 &&
+             gr32(owner + 0x2be4) == 0x1e27d002 && gr32(owner + 0x2be8) == 0x1e22082b &&
+             gr32(owner + 0x2c04) == 0x1e2b1800 && gr32(owner + 0x2c40) == 0x1e2b1800;
+    for (unsigned k = 0; ok && k < 4; k++) ok = gr32(one + 4 * k) == one_words[k] && gr32(two + 4 * k) == two_words[k];
+    const u64 extra = owner + 0x1a48;
+    if (expanded) {
+        for (unsigned k = 0; ok && k < 4; k++) ok = gr32(extra + 4 * k) == one_words[k];
+        ok = ok && gr32(main_base + 0x29c23cc) == 0x1e2b0842 &&
+             gr32(main_base + 0x29c1fa4) == 0x1e27d00b;
+    }
+    if (!ok) {
+        WARN("arceus-cloud: refused guard\n");
+        return;
+    }
+    if (!frame_step_cell_init("arceus-cloud")) return;
+    const u64 page_one = ((frame_step_address >> 12) - (one >> 12)) & 0x1fffff;
+    const u64 page_two = ((frame_step_address >> 12) - (two >> 12)) & 0x1fffff;
+    /* ADRP X8, cell; LDR S1,[X8,#8] (-10/step); LDR S0 param. The game's FDIV S0,S0,S1 stays.
+       X8 is reloaded at +1BAC. */
+    gw32(one, 0x90000008 | (u32)((page_one & 3) << 29) | (u32)((page_one >> 2) << 5));
+    gw32(one + 4, 0xbd400901);
+    gw32(one + 8, 0xbd403160);
+    /* ADRP X8, cell; LDP S1,S2,[X8,#16] (pi, 1/(30 x step)); FMUL S11,S11,S2. The FMUL S8 stays. */
+    gw32(two, 0x90000008 | (u32)((page_two & 3) << 29) | (u32)((page_two >> 2) << 5));
+    gw32(two + 4, 0x2d420901);
+    gw32(two + 8, 0x1e22096b);
+    if (expanded) {
+        const u64 pages = ((frame_step_address >> 12) - (extra >> 12)) & 0x1fffff;
+        gw32(extra, 0x90000008 | (u32)((pages & 3) << 29) | (u32)((pages >> 2) << 5));
+        gw32(extra + 4, 0xbd400901);
+        gw32(extra + 8, 0xbd403160);
+    }
+    jit_code_changed(owner, 0x3060);
+    if (expanded) {
+        cloud_phase_original = jit_wait(owner);
+        if (!cloud_phase_original) {
+            WARN("arceus-cloud: phase wrapper compile failed\n");
+            return;
+        }
+        __atomic_store_n(&g_disp[(owner - g_code_lo) / 4], cloud_phase_update, __ATOMIC_RELEASE);
+        LOG("arceus-cloud: EXPERIMENT: extra sky phases +5DC/+604/+608/+60C/+610 use elapsed time\n");
+    }
+    LOG("arceus-cloud: EXPERIMENT: sky cloud layers +614/+64C/+650 use min(1/30, elapsed), cell=%llx\n",
+        (unsigned long long)frame_step_address);
+}
 static void script_tick_init(void) {
     static const GuestFn wrappers[SCRIPT_TICK_CLASSES][2] = {
         {script_tick_pre_0, script_tick_post_0}, {script_tick_pre_1, script_tick_post_1},
@@ -4169,6 +4306,7 @@ void arceus_clock_post_jit(void) {
     world_timers_init();
     gravity_fix_init();
     movement_fix_init();
+    ride_ramp_fix_init();
     capped_fall_init();
     ai_tick_fix_init();
     turn_fix_init();
@@ -4179,6 +4317,7 @@ void arceus_clock_post_jit(void) {
     capture_fix_init();
     battle_sequence_fix_init();
     map_cursor_fix_init();
+    cloud_fix_init();
     fade_fix_init();
     climb_step_init();
     wall_jump_fix_init();
