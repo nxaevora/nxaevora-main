@@ -1098,8 +1098,11 @@ Checked in the code on 2026-11-14 (analyser report, five claims checked again by
    - blit_mem: bpp, the rectangle and `fmt`.
    - present_buffer: w, h, pitch, layout and fmt.
 6. **Shader hash cache.** The hash of a program is kept in a fixed table keyed by its GPU address, so a draw does not walk the
-   code again. Limit: a program written again at the same address during a run keeps its old hash. A full table hashes
-   without a cache and counts the misses.
+   code again. A full table hashes without a cache and counts the misses. Changed 2026-11-14 (`4b9404d`): the game writes
+   other programs at the same addresses, so the table checks an entry once for each present with the write tracking of the
+   backend (`code_same`, `vk/pipeline.c:399`) and hashes it again when it may have changed. A shader instruction invalidate
+   (`method_barrier` kind 5) and a renderer `reset` clear the table, as the backend drops its address shortcuts there. The
+   log line `draw record: N shader programs hashed again with a new hash` counts the hashes that the check changed.
 7. **Per frame.** Between two presents the module counts the calls of each kind and adds the signatures into two frame hashes:
    one that depends on the order and one that does not (a sum). At `present_buffer` it appends one line to the frame file
    and resets the counts.
@@ -1119,7 +1122,8 @@ Checked in the code on 2026-11-14 (analyser report, five claims checked again by
 
 - A host test `tests/draw_record.c` for the pure parts: the signature of each kind from a register array and a fake memory
   reader, the leaving out of the address words (a change of an address does not change the signature), the frame hashes
-  (order dependent and order independent), and the table (insert, count, full table).
+  (order dependent and order independent), the table (insert, count, full table), and the shader hash cache (graphics and
+  compute keys, probe collisions, full cache, clear, the check once for each present).
 
 ### Work order (one session each)
 
@@ -1134,3 +1138,26 @@ Checked in the code on 2026-11-14 (analyser report, five claims checked again by
   compare then shows it in the shader hashes of the signature text.
 - The scene is played by hand, so a signature found in one run only can come from a different action of the player. Rare
   signatures are judged by their text, not by their presence alone.
+
+### Result (2026-11-14)
+
+Runs of the update program with `nvn_drawrec=1`. The compare output stays local.
+
+- **Title screen, first run.** On the native path every compute dispatch had the block size 0x0x0, so `vk_dispatch` skipped
+  it. Cause: `program_read_compute_in` read the compute words 5 to 12, 14, 15 and the flag bytes at wrong header offsets.
+  The library reads words 5 to 12 at h+0x748 to h+0x764, words 14 and 15 as the u64 at h+0x778, and the flags as bit 0 of
+  the bytes h+0x830 to h+0x832 for layout 13 to 16 (else 0). It stores the nine fragment bytes as 0 or 1 (d837c64). Fixed in
+  `b2a302c` with the pure function `nvn_program_compute_in_from_header` and host tests. Run again: the dispatches have the
+  block size 32x1x1 on both paths, and no signature is found in the native run only.
+- **Obsidian Fieldlands and a battle, first pair.** Some draws had the same count and fragment shader in both runs but another
+  vertex shader hash. Cause: the record's shader hash cache (decision 6) kept the hash of the first program at an address.
+  Fixed in `4b9404d`.
+- **Obsidian Fieldlands and a battle, second pair** (`nvn_native=0`: 3744 presents, `=1`: 3776 presents). Both runs ended
+  normally, with no fault, drop or refusal. No vertex or compute shader hash is found in one run only. The draw that had two
+  stale hashes in the first pair has the same hash in both runs. The dispatches match. The median calls per frame: draw 544
+  and 514, clear 58, dispatch 5, blit 4 in both. The signatures in one run only are draws with the same shaders and another
+  instance or vertex count (grass, particles, the camera place and the time of the play), and six clears found once each in
+  the native run, of the same kind as the rare clears of the old run. Coverage: 99.5% of the calls of the old run and 99.9% of
+  the native run are in shared signatures.
+
+The compare finds no difference between the two paths in the target scenes.
