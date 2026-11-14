@@ -762,7 +762,7 @@ target_link_libraries(snx-test-imgui-settings PRIVATE scarletnx-common m)
 target_include_directories(snx-test-imgui-settings PRIVATE "${PROJECT_BINARY_DIR}/generated")
 add_test(NAME imgui_settings COMMAND snx-test-imgui-settings)
 
-add_executable(snx-test-nvn-objtab nvn_objtab.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_objtab.c")
+add_executable(snx-test-nvn-objtab nvn/nvn_objtab.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_objtab.c")
 snx_test_target(snx-test-nvn-objtab 11)
 add_test(NAME nvn_objtab COMMAND snx-test-nvn-objtab)
 
@@ -776,68 +776,68 @@ snx_test_target(snx-test-arceus-clock 11)
 target_link_libraries(snx-test-arceus-clock PRIVATE m)
 add_test(NAME arceus_clock COMMAND snx-test-arceus-clock)
 
-add_executable(snx-test-nvn-cmdlist nvn_cmdlist.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_cmdlist.c")
+add_executable(snx-test-nvn-cmdlist nvn/nvn_cmdlist.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_cmdlist.c")
 snx_test_target(snx-test-nvn-cmdlist 11)
 add_test(NAME nvn_cmdlist COMMAND snx-test-nvn-cmdlist)
 
-add_executable(snx-test-nvn-frame nvn_frame.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_frame.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_cmdlist.c")
+add_executable(snx-test-nvn-frame nvn/nvn_frame.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_frame.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_cmdlist.c")
 snx_test_target(snx-test-nvn-frame 11)
 add_test(NAME nvn_frame COMMAND snx-test-nvn-frame)
 
-add_executable(snx-test-nvn-replay nvn_replay.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_replay.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_cmdlist.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_params.c")
+add_executable(snx-test-nvn-replay nvn/nvn_replay.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_replay.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_cmdlist.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_params.c")
 snx_test_target(snx-test-nvn-replay 11)
 add_test(NAME nvn_replay COMMAND snx-test-nvn-replay)
 
-add_executable(snx-test-nvn-rt nvn_rt.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_rt.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_params.c")
+add_executable(snx-test-nvn-rt nvn/nvn_rt.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_rt.c" "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_params.c")
 snx_test_target(snx-test-nvn-rt 11)
 if(NOT WIN32)
     target_link_libraries(snx-test-nvn-rt PRIVATE m)
 endif()
 add_test(NAME nvn_rt COMMAND snx-test-nvn-rt)
 
-add_executable(snx-test-draw-record draw_record.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_record_sig.c")
+add_executable(snx-test-draw-record nvn/draw_record.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/diag/draw_record_sig.c")
 snx_test_target(snx-test-draw-record 11)
 add_test(NAME draw_record COMMAND snx-test-draw-record)
 
-add_executable(snx-test-nvn-measure nvn_measure.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_measure_calc.c")
+add_executable(snx-test-nvn-measure nvn/nvn_measure.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/diag/nvn_measure_calc.c")
 snx_test_target(snx-test-nvn-measure 11)
 add_test(NAME nvn_measure COMMAND snx-test-nvn-measure)
 
-add_executable(snx-test-nvn-params nvn_params.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_params.c")
+add_executable(snx-test-nvn-params nvn/nvn_params.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/nvn_params.c")
 snx_test_target(snx-test-nvn-params 11)
 if(NOT WIN32)
     target_link_libraries(snx-test-nvn-params PRIVATE m)
 endif()
 add_test(NAME nvn_params COMMAND snx-test-nvn-params)
 
-add_executable(snx-test-nvn-exectest nvn_exectest.c)
+add_executable(snx-test-nvn-exectest nvn/nvn_exectest.c)
 snx_test_target(snx-test-nvn-exectest 11)
 add_test(NAME nvn_exectest COMMAND snx-test-nvn-exectest)
 
-add_executable(snx-test-nvn-enum-trace nvn_enum_trace.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_enum_trace.c")
+add_executable(snx-test-nvn-enum-trace nvn/nvn_enum_trace.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/diag/nvn_enum_trace.c")
 snx_test_target(snx-test-nvn-enum-trace 11)
 add_test(NAME nvn_enum_trace COMMAND snx-test-nvn-enum-trace)
 
-add_executable(snx-test-nvn-selftest-cmp nvn_selftest_cmp.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_selftest_cmp.c")
+add_executable(snx-test-nvn-selftest-cmp nvn/nvn_selftest_cmp.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/test/nvn_selftest_cmp.c")
 snx_test_target(snx-test-nvn-selftest-cmp 11)
 add_test(NAME nvn_selftest_cmp COMMAND snx-test-nvn-selftest-cmp)
 
-add_executable(snx-test-nvn-selftest-mem nvn_selftest_mem.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_selftest_mem.c")
+add_executable(snx-test-nvn-selftest-mem nvn/nvn_selftest_mem.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/test/nvn_selftest_mem.c")
 snx_test_target(snx-test-nvn-selftest-mem 11)
 add_test(NAME nvn_selftest_mem COMMAND snx-test-nvn-selftest-mem)
 
-add_executable(snx-test-nvn-selftest-rec nvn_selftest_rec.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_selftest_rec.c"
-    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_selftest_cmp.c")
+add_executable(snx-test-nvn-selftest-rec nvn/nvn_selftest_rec.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/test/nvn_selftest_rec.c"
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/test/nvn_selftest_cmp.c")
 snx_test_target(snx-test-nvn-selftest-rec 11)
 target_include_directories(snx-test-nvn-selftest-rec PRIVATE "${PROJECT_BINARY_DIR}/generated")
 add_test(NAME nvn_selftest_rec COMMAND snx-test-nvn-selftest-rec)
 
-add_executable(snx-test-nvn-selftest-dec nvn_selftest_dec.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_selftest_dec.c")
+add_executable(snx-test-nvn-selftest-dec nvn/nvn_selftest_dec.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/test/nvn_selftest_dec.c")
 snx_test_target(snx-test-nvn-selftest-dec 11)
 add_test(NAME nvn_selftest_dec COMMAND snx-test-nvn-selftest-dec)
 
-add_executable(snx-test-nvn-selftest-regdiff nvn_selftest_regdiff.c
-    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_selftest_regdiff.c")
+add_executable(snx-test-nvn-selftest-regdiff nvn/nvn_selftest_regdiff.c
+    "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn/test/nvn_selftest_regdiff.c")
 snx_test_target(snx-test-nvn-selftest-regdiff 11)
 add_test(NAME nvn_selftest_regdiff COMMAND snx-test-nvn-selftest-regdiff)
 
@@ -1602,11 +1602,11 @@ add_executable(snx-test-astc-blocks astc_blocks.c support/astc.c)
 snx_test_target(snx-test-astc-blocks 23)
 add_test(NAME astc_blocks COMMAND snx-test-astc-blocks)
 
-add_executable(snx-test-nvn-command-gap nvn_command_gap.c support/nvn_command_gap.c)
+add_executable(snx-test-nvn-command-gap nvn/nvn_command_gap.c nvn/support/nvn_command_gap.c)
 snx_test_target(snx-test-nvn-command-gap 23)
 add_test(NAME nvn_command_gap COMMAND snx-test-nvn-command-gap)
 
-add_executable(snx-test-nvn-control nvn_control.c support/nvn_control.c)
+add_executable(snx-test-nvn-control nvn/nvn_control.c nvn/support/nvn_control.c)
 snx_test_target(snx-test-nvn-control 23)
 add_test(NAME nvn_control COMMAND snx-test-nvn-control)
 

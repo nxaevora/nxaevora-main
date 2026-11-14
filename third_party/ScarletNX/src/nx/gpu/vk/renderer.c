@@ -23,7 +23,7 @@
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/scale.h"
 #include "nx/gpu/vk/debug_stats.h"
-#include "nx/gpu/nvn_measure.h"
+#include "nx/gpu/nvn/diag/nvn_measure.h"
 #include "nx/memory/mem.h"
 #include "nx/memory/own.h"
 #include "nx/gpu/vk/pending_pages.h"

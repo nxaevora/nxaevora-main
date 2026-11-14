@@ -18,8 +18,8 @@ tool keeps them.
 - checks: the checks that passed, with their scope (`unit`, `selftest R/M/S/Y` with the build, `exec`). The build
   `update 1.1.1` is the library of that update: the `sdk` module with the build ID
   `B39ADD63421BE525D352E576DAB438D3812EDFF0`. The argument sets of a selftest check are the cases of the function in
-  `third_party/ScarletNX/src/nx/gpu/nvn_selftest*.c`, and each case line of the selftest log names its arguments. seen: a game run
-  with `nvn_native=1` that called it and was read. A function with checks and without seen is not verified in the game.
+  `third_party/ScarletNX/src/nx/gpu/nvn/test/nvn_selftest*.c`, and each case line of the selftest log names its
+  arguments. seen: a game run with `nvn_native=1` that called it and was read. A function with checks and without seen is not verified in the game.
 
 ## Summary
 
@@ -246,7 +246,7 @@ tool keeps them.
 | `nvnCommandBufferClearDepthStencil` | G9 | d84aae0 | 17178 | implemented | selftest S (update 1.1.1, 2026-11-12) |  |  |
 | `nvnCommandBufferClearTexture` | G9 | d857610 | 2290 | implemented | selftest S (update 1.1.1, 2026-11-12), exec (update 1.1.1, 2026-11-13) |  | selftest: the render target address registers (r3d.0x200, 0x201) are not compared |
 | `nvnCommandBufferCopyTextureToTexture` | G9 | d82bfd0 | 150 | implemented | selftest S (update 1.1.1, 2026-11-12) |  | selftest: the per-side texture address registers are not compared |
-| `nvnCommandBufferDispatchCompute` | G9 | d84da90 | 41793 | implemented |  |  | no check: packs the three group counts into the op, no pure part; the replay of the op: test_dispatch (tests/nvn_replay.c) |
+| `nvnCommandBufferDispatchCompute` | G9 | d84da90 | 41793 | implemented |  |  | no check: packs the three group counts into the op, no pure part; the replay of the op: test_dispatch (tests/nvn/nvn_replay.c) |
 | `nvnCommandBufferEndTransformFeedback` | G9 | d84b610 | 13670 | implemented | unit (nvn_params, nvn_replay) |  | library read: 0x1D1 off, four reports |
 | `nvnCommandBufferReportCounter` | G9 | d856900 | 37762 | implemented | exec (update 1.1.1, 2026-11-13) |  |  |
 | `nvnCommandBufferResetCounter` | G9 | d856b40 | 9962 | implemented | unit (nvn_params, nvn_replay) |  | library read: 0x54C from the table at de877bc |

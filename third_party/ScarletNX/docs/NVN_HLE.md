@@ -72,9 +72,9 @@ and [compute class](https://github.com/NVIDIA/open-gpu-doc/blob/master/classes/c
 
 | File | What it is | Built into |
 | --- | --- | --- |
-| `src/nx/gpu/nvn_trace.c` | `nvn_trace=1` inventory of resolved and called NVN functions | the runtime |
-| `tests/support/nvn_control.c` | decoders for the 12-word macro 38 indexed draw and the macro 12 program bind | `tests/nvn_control.c` |
-| `tests/support/nvn_command_gap.c` | classifier of Maxwell method write effects in a span of command words | `tests/nvn_command_gap.c` |
+| `src/nx/gpu/nvn/diag/nvn_trace.c` | `nvn_trace=1` inventory of resolved and called NVN functions | the runtime |
+| `tests/nvn/support/nvn_control.c` | decoders for the 12-word macro 38 indexed draw and the macro 12 program bind | `tests/nvn/nvn_control.c` |
+| `tests/nvn/support/nvn_command_gap.c` | classifier of Maxwell method write effects in a span of command words | `tests/nvn/nvn_command_gap.c` |
 
 Every `SNX_NVN_*` variable is gone: these are `[Debug]` settings now. `gpu_trace_target=address[:bytes]` (`vk/render.c`) logs the clears and
 draws that write a render target starting in that range, and replaced the older GPU trace variables.

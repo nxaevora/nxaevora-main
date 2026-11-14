@@ -201,7 +201,7 @@ a risk. The risk that remains is a hidden use of the stored address or of the po
 
 ## 2-3 Where the host layer attaches (2026-11-02)
 
-Method: `third_party/ScarletNX/src/nx/gpu/nvn_trace.c`, `runtime/main.c`, `runtime/loader.h`, the settings file, and the
+Method: `third_party/ScarletNX/src/nx/gpu/nvn/diag/nvn_trace.c`, `runtime/main.c`, `runtime/loader.h`, the settings file, and the
 disassembly of the resolver stubs in the `sdk` module.
 
 How `nvn_trace` works, and what the host layer reuses:
@@ -211,7 +211,7 @@ How `nvn_trace` works, and what the host layer reuses:
   dispatch slot `g_disp[(addr - g_code_lo) / 4]` of `nvnBootstrapLoader` with a wrapper. The wrapper then replaces the slot of
   `nvnDeviceGetProcAddress`. Each name that the game resolves gets a wrapper in the slot of its address.
 - With `nvn_native=1` the host handlers replace the game's NVN library for every call through the table. The loader hooks are the
-  ones of `gpu/nvn_trace.c`, one level below it: `nvn_native_init` runs first, and the trace wraps what the slots then hold, so it
+  ones of `gpu/nvn/diag/nvn_trace.c`, one level below it: `nvn_native_init` runs first, and the trace wraps what the slots then hold, so it
   counts the host calls too. A function without a handler gets the missing-function handler, so one run lists every missing function.
 - A handler is a `GuestFn(CPU* c, u64 entry)`. The arguments are `c->x[0..7]` (and `c->v[]` for floats), the result is
   `c->x[0]`, and guest memory is read and written with `GP()`, `gr64()` and the like. The game calls NVN through pointers, and the
@@ -224,7 +224,7 @@ How `nvn_trace` works, and what the host layer reuses:
 
 Design of the attachment:
 
-1. A new file `gpu/nvn_native.c` with `nvn_native_init()`, called in `main.c` next to `nvn_trace_init()`, and a startup setting
+1. A new file `gpu/nvn/nvn_native.c` with `nvn_native_init()`, called in `main.c` next to `nvn_trace_init()`, and a startup setting
    `nvn_native` (0 or 1, default 0) in `settings.txt`.
 2. The resolver hooks (bootstrap and `GetProcAddress`) are shared with `nvn_trace.c`. Today they are private to it. The change
    is to move them into one small piece that calls a list of "on resolve" functions: the native layer first (it installs its
@@ -565,7 +565,7 @@ first runs of 3b and 3c can move a function from one group to another.
 
 Files (new unless it says changed). The names are a proposal, the split follows the groups.
 
-- `third_party/ScarletNX/src/nx/gpu/nvn_native.h`: the shared types (object table, the side table of 2-1, the recorder types).
+- `third_party/ScarletNX/src/nx/gpu/nvn/nvn_native.h`: the shared types (object table, the side table of 2-1, the recorder types).
 - `nvn_native.c`: the table switch (2-3), "not implemented" handler, G1, G4 and the frame job (2-5 b).
 - `nvn_native_mem.c`: G2 and the GPU address rule of 2-2.
 - `nvn_native_tex.c`: G3, G5, the storage size function, the TIC and TSC encoders (stage 4 uses them with the pools).
@@ -574,7 +574,7 @@ Files (new unless it says changed). The names are a proposal, the split follows 
 - `nvn_trace.c` (changed): the diagnostic of 3a, and the switch to the host table.
 - `nvn_selftest.c` (new): the selftest and the execution test (`nvn-unobserved.md`, "The selftest"), with the recording `Renderer` backend and
   the comparer. The comparer is a separate pure part, so that host tests can use it.
-- `tests/nvn_native.c` (new) and `CMakeLists.txt` (changed): the tests below.
+- `tests/nvn/nvn_native.c` (new) and `CMakeLists.txt` (changed): the tests below.
 - `docs/build/runtime-changes.md` (changed): one row for each commit that touches the runtime.
 
 Steps. Each step is one commit. The game is not started by the agent.
@@ -691,9 +691,9 @@ guess (rule: mechanism first). Each part is one commit.
 
 | Part | Content | State |
 | --- | --- | --- |
-| 3b-1 | The setting `nvn_native`, `gpu/nvn_native.c` (loader hooks below the trace, missing-function handler, exit report), `gpu/nvn_objtab.c` (the record table, test `nvn_objtab`), and the trace of the queries (`nvn-value:` lines for `nvnDeviceGetInteger` and six other queries). | Written and built. The unit tests pass, except `tracked_material`, which fails on the two SMAA `.dds` files that were added before this work (not caused by it). Not run in the game. |
+| 3b-1 | The setting `nvn_native`, `gpu/nvn/nvn_native.c` (loader hooks below the trace, missing-function handler, exit report), `gpu/nvn/nvn_objtab.c` (the record table, test `nvn_objtab`), and the trace of the queries (`nvn-value:` lines for `nvnDeviceGetInteger` and six other queries). | Written and built. The unit tests pass, except `tracked_material`, which fails on the two SMAA `.dds` files that were added before this work (not caused by it). Not run in the game. |
 | 3b-2 | A diagnostic run with `nvn_trace=1` to the title: the agent reads the `nvn-value:` lines. | Done (2026-11-02). The values are in "3b-2 Result" below. |
-| 3b-3 | G1: device and queue builders, `DeviceInitialize`, `DeviceGetInteger` (the table of 3b-2), `GetTimestampInNanoseconds`, `QueueInitialize`. | Written and built (30 handlers, `gpu/nvn_params.c`, test `nvn_params`). Not run with `nvn_native=1`. See "3b-3 Result". |
+| 3b-3 | G1: device and queue builders, `DeviceInitialize`, `DeviceGetInteger` (the table of 3b-2), `GetTimestampInNanoseconds`, `QueueInitialize`. | Written and built (30 handlers, `gpu/nvn/nvn_params.c`, test `nvn_params`). Not run with `nvn_native=1`. See "3b-3 Result". |
 | 3b-4 | G2: memory pool and the GPU address rule (2-2). | Written and built (13 handlers, test `nvn_params`, row 0029). Run of 2026-11-02: all 13 ran without a failure. The GPU page table mapping of a pool is not connected. |
 | 3b-5 | G3 and G5: texture objects, the storage size function (read from the library's disassembly, tested against the 3a table), the pools. | Written and built (29 handlers, row 0030, test `nvn_params`; 40 of 40 size queries of the archived run agree). Not run with `nvn_native=1`. |
 | 3b-6a | G4: window builder and initialization, interval and crop setters, and sync initialization. | Written. |
@@ -773,7 +773,7 @@ Library functions read (update 1.1.1 `sdk` module):
   +0x19dc (the window origin and depth mode) were 1 and 1 at that time.
 - `nvnQueueBuilderGetQueueMemorySize` (d8383f0): reads the builder (flags at +0x10, set bytes at +0x14 to +0x17, sizes at +0x18,
   +0x1c, +0x20) and six device words (+0x8c, +0x94, +0x98, +0xe0, +0xe4, +0x1af4). The run shows 0x80, 2, 1, 1, 0x1000 and 0. The
-  game's builder had flags 0, command 0x20000, compute 0x40000, control 0x20000. The port in `gpu/nvn_params.c` gives 0x8a000 for
+  game's builder had flags 0, command 0x20000, compute 0x40000, control 0x20000. The port in `gpu/nvn/nvn_params.c` gives 0x8a000 for
   it, the library's answer (hand-checked step by step, and in the test `nvn_params`).
 - `nvnDeviceGetInteger` (d82d060): calls d831f40, a switch over `what` (0 to 0x62) that returns a device field or a constant. The
   host uses the table of 3b-2. A `what` that no run asked for gets 0 and one log line.
@@ -896,7 +896,7 @@ unknown part stops with a log line.
    and `CallCommands` take ids only. An id that is not valid is skipped with a log line (counted).
 5. **Lists and ops.** An op is an opcode with a payload of at most `NVN_OP_MAX_PAYLOAD` (512) bytes, padded to 8 bytes (changed
    in the work: `SET_RENDER_TARGETS` holds 8 targets with copied views, so 32 bytes do not fit; viewport and scissor are one op
-   for each rectangle). The list lives in an arena of the command buffer (`gpu/nvn_cmdlist.c`). Values are copied at
+   for each rectangle). The list lives in an arena of the command buffer (`gpu/nvn/nvn_cmdlist.c`). Values are copied at
    record time (viewport floats, scissor integers, clear color, barrier bits, render target arguments). Objects (texture, pool) are
    held as address plus generation and read at replay. Ops of 3c: `SET_TEXTURE_POOL`, `SET_SAMPLER_POOL`, `SET_RENDER_TARGETS`,
    `SET_VIEWPORTS`, `SET_SCISSORS`, `CLEAR_COLOR`, `BARRIER`, `CALL`. Any other command buffer function is a missing function:
@@ -1075,7 +1075,7 @@ Checked in the code on 2026-11-14 (analyser report, five claims checked again by
 
 1. **Setting.** `nvn_drawrec` (int 0 1, default 0, startup) in `settings.txt`, next to `nvn_native`. It works with
    `nvn_native=0` and `=1`. It does not need `nvn_trace`.
-2. **Module.** A new file pair `src/nx/gpu/draw_record.{h,c}`. `draw_record_init()` is called in `snx_main` after
+2. **Module.** A new file pair `src/nx/gpu/nvn/diag/draw_record.{h,c}`. `draw_record_init()` is called in `snx_main` after
    `nvn_native_init()` (`main.c:956`) and before `video_init` (`main.c:981`), when no other thread uses `g_renderer`. It
    copies `*g_renderer` into a static `Renderer`, replaces the eight recorded fields with wrappers and sets `g_renderer` to the
    copy. A field that is NULL in the backend stays NULL. All other fields stay the backend pointers.
@@ -1122,7 +1122,7 @@ Checked in the code on 2026-11-14 (analyser report, five claims checked again by
 
 ### Tests
 
-- A host test `tests/draw_record.c` for the pure parts: the signature of each kind from a register array and a fake memory
+- A host test `tests/nvn/draw_record.c` for the pure parts: the signature of each kind from a register array and a fake memory
   reader, the leaving out of the address words (a change of an address does not change the signature), the frame hashes
   (order dependent and order independent), the table (insert, count, full table), and the shader hash cache (graphics and
   compute keys, probe collisions, full cache, clear, the check once for each present).
