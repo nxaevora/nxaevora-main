@@ -6419,13 +6419,15 @@ static void h_sync_wait(CPU* c, u64 entry) {
         const u64 wait_start = handler_wait_start();
         if (action == NVN_SYNC_ACTION_WAIT_FRAME) {
             kthread_wait(&frame_done_cv, &objs_lock, left);
+            handler_wait_end(wait_start);
         } else {
             const uint32_t id = sync->syncpoint, value = sync->value;
             pm_unlock(&objs_lock);
             syncpt_wait(id, value, left);
+            /* End the wait first: objs_lock_take counts a blocked take as lock time. */
+            handler_wait_end(wait_start);
             objs_lock_take();
         }
-        handler_wait_end(wait_start);
         waited = 1;
         sync = known_record(sync_addr, NVN_OBJ_SYNC);
         if (!sync) {
