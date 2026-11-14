@@ -1189,7 +1189,10 @@ Goal: CPU time, frame time and dropped draws of `nvn_native=1`, compared with `n
 
 1. A timer for each side and each path, with the same scope. Old path: the guest side is `gpu_submit` from entry to return,
    the `GPU` side is `run_job`. Native path: the guest side is `native_call` from entry to return (all handlers), the `GPU`
-   side is `frame_run`. Each timer adds the nanoseconds of the monotonic clock to a counter of its side.
+   side is `frame_run` up to `frame_end`. Each timer adds the nanoseconds of the monotonic clock to a counter of its side.
+   Two parts are left out so that the scopes match: `frame_show` (the present is not in `run_job`), and the time a handler
+   waits for the GPU in `kthread_wait` or `syncpt_wait` (on the old path the game's library waits, not `gpu_submit`).
+   Limit: the old guest side does not include the game's NVN library code that writes the commands. `profile=1` shows it.
 2. The timers run only with the new setting `nvn_measure=1` (default 0), because `native_call` runs many thousand times in
    a frame and the clock reads cost time.
 3. One log line `nvn-measure:` each 600 presents (the count of the renderer line): the path, the presents, the guest ms

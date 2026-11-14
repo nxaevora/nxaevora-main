@@ -7,6 +7,7 @@
 #include "nx/gpu/nvn_native.h"
 #include "nx/gpu/nvn_cmdlist.h"
 #include "nx/gpu/nvn_frame.h"
+#include "nx/gpu/nvn_measure.h"
 #include "nx/gpu/nvn_objtab.h"
 #include "nx/gpu/nvn_params.h"
 #include "nx/gpu/nvn_rt.h"
@@ -6270,6 +6271,14 @@ static void h_sync_create_gl_sync(CPU* c, u64 entry) {
 
 enum { NVN_ACQUIRE_OK = 0, NVN_ACQUIRE_FAILED = 1 };
 /* Ends a failed acquire: the operation, the reason, the addresses and the result. objs_lock is held. */
+/* The time this thread's handler waited for the GPU. native_call leaves it out of the nvn_measure guest time: on the
+   old path the same waits run in the game's library, not in gpu_submit (nvn-design.md, "Stage 5 measure plan"). */
+static _Thread_local u64 t_handler_wait_ns;
+static u64 handler_wait_start(void) { return g_settings.nvn_measure ? plat_ns() : 0; }
+static void handler_wait_end(u64 start_ns) {
+    if (g_settings.nvn_measure) t_handler_wait_ns += plat_ns() - start_ns;
+}
+
 static void window_acquire_failed(CPU* c, const char* operation, u64 queue_addr, u64 window_addr, u64 sync_addr,
                                   u64 index_addr, const char* reason) {
     LOG("nvn-native: %s failed: %s (queue=%llx window=%llx sync=%llx index=%llx)\n", operation, reason,
@@ -6312,7 +6321,9 @@ static void window_acquire_texture(CPU* c, u64 queue_addr, u64 window_addr, u64 
     int32_t index = nvn_window_pick_image(window->states, window->texture_count, window->last_index);
     /* A PRESENTED image comes back when its frame job finishes. */
     while (index < 0 && nvn_window_has_presented(window->states, window->texture_count)) {
+        const u64 wait_start = handler_wait_start();
         kthread_wait(&frame_done_cv, &objs_lock, -1);
+        handler_wait_end(wait_start);
         window = known_record(window_addr, NVN_OBJ_WINDOW);
         sync = has_sync ? known_record(sync_addr, NVN_OBJ_SYNC) : NULL;
         reason = nvn_window_acquire_refusal(1, 1, window != NULL, !has_sync || sync != NULL,
@@ -6386,6 +6397,7 @@ static void h_sync_wait(CPU* c, u64 entry) {
             result = NVN_SYNC_WAIT_TIMEOUT;
             break;
         }
+        const u64 wait_start = handler_wait_start();
         if (action == NVN_SYNC_ACTION_WAIT_FRAME) {
             kthread_wait(&frame_done_cv, &objs_lock, left);
         } else {
@@ -6394,6 +6406,7 @@ static void h_sync_wait(CPU* c, u64 entry) {
             syncpt_wait(id, value, left);
             pm_lock(&objs_lock);
         }
+        handler_wait_end(wait_start);
         waited = 1;
         sync = known_record(sync_addr, NVN_OBJ_SYNC);
         if (!sync) {
@@ -6677,6 +6690,8 @@ static void frame_run(void* arg) {
     FrameJob* job = arg;
     static uint32_t frame_jobs, flush_jobs; /* only the GPU thread runs the frame jobs */
     const int flush = job->kind == NVN_FRAME_FLUSH;
+    const int measure = g_settings.nvn_measure;
+    u64 measure_t0 = measure ? plat_ns() : 0;
     frame_begin();
     FrameParts parts = {0};
     if (!flush) {
@@ -6690,6 +6705,7 @@ static void frame_run(void* arg) {
     uint32_t dispatch_refusals = 0;
     frame_replay_lists(job, &stats, &dispatches, &dispatch_refusals);
     frame_end(job);
+    if (measure) nvn_measure_native_gpu(plat_ns() - measure_t0);
     int shown = flush ? 0 : frame_show(job, &parts);
     uint32_t list_count = job->frame.handle_count;
     uint32_t fences = job->frame.token_count;
@@ -7003,7 +7019,11 @@ static void h_queue_finish(CPU* c, u64 entry) {
     }
     if (job) gpu_call(frame_run, job, NULL, 0);
     pm_unlock(&objs_lock);
-    if (wait) syncpt_wait(id, value, -1);
+    if (wait) {
+        const u64 wait_start = handler_wait_start();
+        syncpt_wait(id, value, -1);
+        handler_wait_end(wait_start);
+    }
 }
 /* QueueFinalize would destroy the queue and its channel; the host keeps the record to the process end. */
 static void h_queue_finalize(CPU* c, u64 entry) {
@@ -7729,7 +7749,11 @@ static void native_call(CPU* c, u64 entry) {
     NativeSlot* s = slot_find(entry);
     if (!s) fatal("nvn-native: a host handler runs for an address it never registered (%llx)\n", (unsigned long long)entry);
     u64 lr = c->x[30];
+    const int measure = g_settings.nvn_measure;
+    u64 measure_t0 = measure ? plat_ns() : 0;
+    t_handler_wait_ns = 0;
     s->handler(c, entry);
+    if (measure) nvn_measure_native_guest(plat_ns() - measure_t0 - t_handler_wait_ns);
     c->pc = lr;
 }
 

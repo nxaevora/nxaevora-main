@@ -23,6 +23,7 @@
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/scale.h"
 #include "nx/gpu/vk/debug_stats.h"
+#include "nx/gpu/nvn_measure.h"
 #include "nx/memory/mem.h"
 #include "nx/memory/own.h"
 #include "nx/gpu/vk/pending_pages.h"
@@ -545,6 +546,7 @@ static void show(Surf* src, u32 fw, u32 fh, u32 transform, int game) {
         g_vk_present++;
         stats_frame(now_ns);
         debug_stats_frame(now_ns, now_ns - show_start_ns, is[3], is[6]);
+        nvn_measure_present(now_ns);
         vk_mem_present();
         if (g_last) vk_surf_touch(g_last); /* what screenshots read stays */
         vk_tex_frame();

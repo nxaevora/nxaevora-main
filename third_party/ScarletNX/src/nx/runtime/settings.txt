@@ -765,6 +765,14 @@ setting NVN draw record
     help 1 = the runtime records the draw, clear, dispatch, copy and present calls of the renderer (gpu/draw_record.c)
     help and writes per frame counts and a signature table to <game>.drawrec<N>.frames.txt and
     help <game>.drawrec<N>.sigs.txt, N being nvn_native. 0 = no record
+setting NVN measure
+    key nvn_measure
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = logs the CPU time of the guest and GPU sides of both NVN paths each 600 presents (gpu/nvn_measure.c),
+    help with the frame time median, 99th percentile, maximum and the draw counts. 0 = no measure and no clock read
 setting NVN native missing
     key nvn_native_missing
     int 0 1
