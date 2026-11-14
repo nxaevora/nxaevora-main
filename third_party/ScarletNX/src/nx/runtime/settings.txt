@@ -756,6 +756,15 @@ setting NVN native
     help 1 = the host answers the NVN functions of the game (gpu/nvn_native.c) and the game's NVN library is not run. A
     help function the host does not have yet stops the game (nvn_native_missing). 0 = the library runs as always.
     help Phase 6 of NXAevora, under construction: with 1 the game draws, but some objects such as characters are missing
+setting NVN draw record
+    key nvn_drawrec
+    int 0 1
+    default 0
+    startup
+    words Off|On
+    help 1 = the runtime records the draw, clear, dispatch, copy and present calls of the renderer (gpu/draw_record.c)
+    help and writes per frame counts and a signature table to <game>.drawrec<N>.frames.txt and
+    help <game>.drawrec<N>.sigs.txt, N being nvn_native. 0 = no record
 setting NVN native missing
     key nvn_native_missing
     int 0 1

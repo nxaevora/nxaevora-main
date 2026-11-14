@@ -795,6 +795,10 @@ if(NOT WIN32)
 endif()
 add_test(NAME nvn_rt COMMAND snx-test-nvn-rt)
 
+add_executable(snx-test-draw-record draw_record.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/draw_record_sig.c")
+snx_test_target(snx-test-draw-record 11)
+add_test(NAME draw_record COMMAND snx-test-draw-record)
+
 add_executable(snx-test-nvn-params nvn_params.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_params.c")
 snx_test_target(snx-test-nvn-params 11)
 if(NOT WIN32)
