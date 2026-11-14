@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the NXAevora contributors */
 /* The host's NVN command lists (gpu/nvn/nvn_cmdlist.c): the op list, the handles of published lists, the references that
-   keep a list alive, and the release of the lists that CALL ops name. */
+   keep a list alive, the release of the lists that CALL ops name, and the owner of a command buffer record. */
 #include "nx/gpu/nvn/nvn_cmdlist.h"
 #include <stdio.h>
 #include <string.h>
@@ -474,6 +474,20 @@ static void test_oplist_copy(void) {
     nvn_list_store_free(&s);
 }
 
+static void test_owner_claim(void) {
+    uint32_t owner = 0;
+    const uint32_t a = 11, b = 22;
+    CHECK(!nvn_owner_claim(&owner, 0) && owner == 0);      /* self 0 is refused, also when free */
+    CHECK(nvn_owner_claim(&owner, a) == 1 && owner == a);  /* A claims */
+    CHECK(!nvn_owner_claim(&owner, b) && owner == a);      /* B does not take it from A */
+    CHECK(!nvn_owner_claim(&owner, a) && owner == a);      /* the owner never nests */
+    nvn_owner_release(&owner);
+    CHECK(owner == 0);
+    CHECK(nvn_owner_claim(&owner, b) == 1 && owner == b);  /* B claims after the release */
+    nvn_owner_release(&owner);
+    CHECK(owner == 0);
+}
+
 int main(void) {
     test_append_next();
     test_append_refused();
@@ -491,6 +505,7 @@ int main(void) {
     test_oplist_copy();
     test_deep_chain();
     test_many_lists();
+    test_owner_claim();
     if (failures) {
         printf("%d failures\n", failures);
         return 1;

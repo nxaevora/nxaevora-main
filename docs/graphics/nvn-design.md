@@ -1327,3 +1327,8 @@ Work order (each step is built, tested with `ctest` and committed alone):
 
 Expected effect: the holders that become shared made 8.4 s of the 11.6 s of wait. The exclusive handlers still block
 the shared ones, for example `nvnMemoryPoolInitialize` (494 us per call).
+
+Step 3 (done 2026-11-14): 141 command buffer handlers, `nvnBufferMap` and `nvnBufferGetAddress` take the shared mode
+through `command_hold` and `command_unhold` (the owner helpers `nvn_owner_claim` and `nvn_owner_release` are in
+`nvn_cmdlist.c`). No handler of the set needed to stay exclusive. A conflict falls back to the exclusive mode and finds the
+record again, because a `Finalize` can run in the gap. Step 4 (the user runs) is open.

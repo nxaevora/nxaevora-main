@@ -249,4 +249,9 @@ int nvn_oplist_copy(NvnOpList* dst, const NvnOpList* src, NvnListStore* store, u
 uint32_t nvn_list_live(const NvnListStore* store);
 void nvn_list_store_free(NvnListStore* store);
 
+/* The owner of one command buffer record: one thread at a time. A claim takes the owner from 0 to self with one
+   compare-and-swap, and self 0 is never a valid thread id. A release stores 0. */
+int nvn_owner_claim(uint32_t* owner, uint32_t self);
+void nvn_owner_release(uint32_t* owner);
+
 #endif

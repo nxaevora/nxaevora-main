@@ -189,3 +189,11 @@ void nvn_list_store_free(NvnListStore* s) {
     free(s->free_index);
     *s = (NvnListStore){0};
 }
+
+int nvn_owner_claim(uint32_t* owner, uint32_t self) {
+    if (!self) return 0;
+    uint32_t expected = 0;
+    return __atomic_compare_exchange_n(owner, &expected, self, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) ? 1 : 0;
+}
+
+void nvn_owner_release(uint32_t* owner) { __atomic_store_n(owner, 0, __ATOMIC_RELEASE); }
