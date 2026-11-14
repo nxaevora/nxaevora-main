@@ -1165,3 +1165,91 @@ Runs of the update program with `nvn_drawrec=1`. The compare output stays local.
 The compare finds no difference between the two paths in the target scenes, in the values that a signature records
 (decision 5). The blend state, the viewports and the constant buffer bindings are not in a signature, so this result
 does not cover them.
+
+## Stage 5 measure plan (2026-11-14)
+
+Goal: CPU time, frame time and dropped draws of `nvn_native=1`, compared with `nvn_native=0` (`nvn-plan.md`, stage 5).
+
+### Facts that decide the plan
+
+- Measures that exist: the debug window (`vk/debug_stats.c`, window only, `cpu_ms` is the whole process), the `perf:` line
+  (`runtime/main.c`, frames a second every 5 s), the slow-frame line (over 50 ms) and the line of each 600 presents
+  (`vk/renderer.c`, `g_vk_drawn` and `g_vk_skipped` of the renderer, both paths), `vk_gpu_profile` (GPU time), `profile`
+  (`profiler_win32.c`, sampled CPU per function in `profile.txt`), the `nvn-native` frame line (native path only: faults,
+  dropped, missing, skipped lists). Tracy (`SNX_TRACY`) is off in the default build.
+- No measure gives the CPU time of the decode, and no measure splits the CPU time by path.
+- Old path: the guest thread runs the NVN library, the ioctl and `gpu_submit` (`gpu.c`, `job_new` and `scan_job` copy and
+  scan the entries). The `GPU` thread runs `run_job`, which calls `pb_decode` and `method_call` for each word.
+- Native path: the guest thread runs `native_call` and the handlers that record the commands. The `GPU` thread runs
+  `frame_run` and `frame_replay_lists`. Both paths reach `maxwell3d_method` and the same renderer, so the work below it is
+  not removed.
+- `nvn_trace=1` wraps each NVN call and `nvn_drawrec=1` hashes each renderer call: both add CPU time to the measure.
+
+### Decisions
+
+1. A timer for each side and each path, with the same scope. Old path: the guest side is `gpu_submit` from entry to return,
+   the `GPU` side is `run_job`. Native path: the guest side is `native_call` from entry to return (all handlers), the `GPU`
+   side is `frame_run` up to `frame_end`. Each timer adds the nanoseconds of the monotonic clock to a counter of its side.
+   Two parts are left out so that the scopes match: `frame_show` (the present is not in `run_job`), and the time a handler
+   waits for the GPU in `kthread_wait` or `syncpt_wait` or for `present_pace` (on the old path the game's library or
+   `vi.c` waits, not `gpu_submit`).
+   Limit: the old guest side does not include the game's NVN library code that writes the commands. `profile=1` shows it.
+2. The timers run only with the new setting `nvn_measure=1` (default 0), because `native_call` runs many thousand times in
+   a frame and the clock reads cost time.
+3. One log line `nvn-measure:` each 600 presents (the count of the renderer line): the path, the presents, the guest ms
+   and the `GPU` ms for each frame (mean), the frame time median, 99th percentile and maximum of the presents of the window,
+   and the draws and skipped draws of the renderer in the window. The frame times come from the present times that
+   `renderer.c` has. The log line is the only output: no window, no file.
+4. The pure parts (the percentiles from a fixed array, the means) go into a function with host tests. The counters are
+   atomic, because the guest threads and the `GPU` thread add to them.
+
+### Runs (the user)
+
+Settings for each measure run: `nvn_measure=1`, `nvn_trace=0`, `nvn_drawrec=0`, `nvn_selftest=0`, `nvn_exectest=0`,
+`profile=0`. All other settings the same in both paths (also `vk_record`, `render_resolution`, `anti_aliasing`).
+
+- Scene A: Obsidian Fieldlands, stand at one place, camera still, 60 s.
+- Scene B: Obsidian Fieldlands, the same walk of about 60 s.
+- Scene C: a battle with a wild Pokemon, from start to end.
+- Each scene three times for each path, to see the spread. Then one run of each path with `profile=1` (scene B) to see the
+  functions that use the CPU.
+- Quality: missing draws or wrong effects are checked by the user on the screen in the same scenes. A crash in a run is
+  reported. The draw record compare of stage 4 is the check of the draw calls.
+
+### Work order (one session each)
+
+1. Code writer: `nvn_measure` (decisions 1 to 4) with host tests. Review, build, `ctest`, commit.
+2. The user makes the runs. The agent reads the `nvn-measure:` lines and writes the result here.
+3. The user decides if the old path is removed.
+
+### First runs (2026-11-14)
+
+Update program, Obsidian Fieldlands (still and walk) and a battle in one run of about 190 s for each path.
+
+- `GPU` side: native 3.7 to 13.6 ms per frame, old 6.4 to 14.1 ms, about 4 to 15% less at the same draw count. The work
+  below `maxwell3d_method` is the same in both paths, so only the decode is removed.
+- Frame time: median 33.1 to 33.3 ms and 99th percentile 37 to 45 ms on both paths. No skipped draw on either path.
+- Native guest side: 22 to 30 ms per frame in the first two runs. The handler report showed the cause:
+  `nvnWindowAcquireTexture` held 138 s of the 159 s handler time (23 ms per call) in `present_pace`, the swap interval
+  2 pace. It is a wait, so it is now left out as the GPU waits are.
+- Without that wait the handlers use about 3.6 ms per frame of wall time (38.6 million calls, about 6400 a frame), and
+  2 ms of it is a wait for `objs_lock`, which each handler holds for the whole call. Not yet checked: which thread holds
+  it then (another game thread that calls NVN, or the `GPU` thread). The most called handlers are command buffer state
+  calls of 0.4 to 1.4 us each.
+
+### Result (2026-11-14, runs with the pace left out and `profile=1` runs)
+
+- Native guest side: 1.4 to 2.0 ms per frame of handler work, plus 1.9 to 2.3 ms of `objs_lock` wait. Old guest side in
+  `gpu_submit`: 0.01 to 0.02 ms.
+- Old path library: the `profile` samples in the `sdk` module are 7037 on the old path (180 s) and 2285 on the native path
+  (190 s), about 1.3 and 0.4 ms per frame. The sampler counts each thread each millisecond, also a blocked thread, and the
+  file lists only the 200 largest entries, so these are lower bounds. `d901df0` holds most of the difference (5588
+  against 1064).
+- `GPU` side: native 4 to 15% less at the same draw count (13.0 to 13.2 ms against 13.9 to 14.1 ms at about 538000
+  draws in 600 frames).
+- Frame time: the same on both paths at the 30 FPS pace (median 33.0 to 33.4 ms). No skipped draw on either path.
+
+Effect and limits: at 30 FPS the native path does not change the frame time. It removes the decode on the `GPU` thread
+(about 1 ms a frame in the busy scenes) and the library code on the game threads (at least about 1 ms), but its handlers
+add about 1.5 to 2 ms of work and 2 ms of `objs_lock` wait on the game threads. The lock wait is the largest cost that
+the native path adds.

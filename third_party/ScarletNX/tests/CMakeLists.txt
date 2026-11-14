@@ -799,6 +799,10 @@ add_executable(snx-test-draw-record draw_record.c "${PROJECT_SOURCE_DIR}/src/nx/
 snx_test_target(snx-test-draw-record 11)
 add_test(NAME draw_record COMMAND snx-test-draw-record)
 
+add_executable(snx-test-nvn-measure nvn_measure.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_measure_calc.c")
+snx_test_target(snx-test-nvn-measure 11)
+add_test(NAME nvn_measure COMMAND snx-test-nvn-measure)
+
 add_executable(snx-test-nvn-params nvn_params.c "${PROJECT_SOURCE_DIR}/src/nx/gpu/nvn_params.c")
 snx_test_target(snx-test-nvn-params 11)
 if(NOT WIN32)

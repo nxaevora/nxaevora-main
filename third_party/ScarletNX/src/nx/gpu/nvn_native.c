@@ -7,6 +7,8 @@
 #include "nx/gpu/nvn_native.h"
 #include "nx/gpu/nvn_cmdlist.h"
 #include "nx/gpu/nvn_frame.h"
+#include "nx/gpu/nvn_measure.h"
+#include "nx/gpu/nvn_measure_calc.h"
 #include "nx/gpu/nvn_objtab.h"
 #include "nx/gpu/nvn_params.h"
 #include "nx/gpu/nvn_rt.h"
@@ -31,6 +33,21 @@
    take objs_lock for the whole call, and their pointers into a record end with the call. */
 static NvnObjTab objs;
 static PMutex objs_lock = PMUTEX_INIT;
+/* The time this thread's handlers waited for objs_lock, which native_call leaves out of the nvn_measure guest time.
+   Only objs_lock_take writes it, and only while nvn_measure is on. */
+static _Thread_local u64 t_handler_lock_ns;
+
+/* Takes objs_lock for a handler. Under nvn_measure a blocked take adds its wait to t_handler_lock_ns. */
+static void objs_lock_take(void) {
+    if (!g_settings.nvn_measure) {
+        pm_lock(&objs_lock);
+        return;
+    }
+    if (pm_trylock(&objs_lock)) return;
+    const u64 start_ns = plat_ns();
+    pm_lock(&objs_lock);
+    t_handler_lock_ns += plat_ns() - start_ns;
+}
 /* The frame job tells the guest waits that it freed an image and updated the syncs. */
 static PCond frame_done_cv;
 static NvnListStore lists; /* the command lists of the game, guarded by objs_lock */
@@ -120,27 +137,27 @@ static NvnQueueBuilder* queue_builder(u64 addr) { return rec_get(addr, NVN_OBJ_Q
 /* G1: device builder and device (nvn-design.md, 2-6). The library's functions are plain field accesses. */
 static void h_device_builder_set_defaults(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     DeviceBuilderRec* b = rec_get(c->x[0], NVN_OBJ_DEVICE_BUILDER, sizeof *b);
     b->flags = 0;
     pm_unlock(&objs_lock);
 }
 static void h_device_builder_set_flags(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     ((DeviceBuilderRec*)rec_get(c->x[0], NVN_OBJ_DEVICE_BUILDER, sizeof(DeviceBuilderRec)))->flags = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_device_builder_get_flags(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = ((DeviceBuilderRec*)rec_get(c->x[0], NVN_OBJ_DEVICE_BUILDER, sizeof(DeviceBuilderRec)))->flags;
     pm_unlock(&objs_lock);
 }
 /* nvnDeviceInitialize(device, builder): the host has no device to set up, so it records the flags and says yes */
 static void h_device_initialize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     DeviceBuilderRec* b = rec_get(c->x[1], NVN_OBJ_DEVICE_BUILDER, sizeof *b);
     NvnObj* o = nvn_objtab_put(&objs, c->x[0], NVN_OBJ_DEVICE, sizeof(DeviceRec));
     if (!o) fatal("nvn-native: out of memory for the record of the device\n");
@@ -166,25 +183,25 @@ static void h_device_finalize_command_handle(CPU* c, u64 entry) {
 }
 static void h_device_set_window_origin_mode(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     device_rec(c->x[0])->window_origin = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_device_get_window_origin_mode(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = device_rec(c->x[0])->window_origin;
     pm_unlock(&objs_lock);
 }
 static void h_device_set_depth_mode(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     device_rec(c->x[0])->depth_mode = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_device_get_depth_mode(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = device_rec(c->x[0])->depth_mode;
     pm_unlock(&objs_lock);
 }
@@ -231,49 +248,49 @@ static void h_device_get_separate_sampler_handle(CPU* c, u64 entry) {
 /* G1: queue builder and queue */
 static void h_queue_builder_set_device(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     queue_builder(c->x[0])->device = c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_queue_builder_get_device(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = queue_builder(c->x[0])->device;
     pm_unlock(&objs_lock);
 }
 static void h_queue_builder_set_defaults(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     nvn_queue_builder_defaults(queue_builder(c->x[0]));
     pm_unlock(&objs_lock);
 }
 static void h_queue_builder_set_flags(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     queue_builder(c->x[0])->flags = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_queue_builder_get_flags(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = queue_builder(c->x[0])->flags;
     pm_unlock(&objs_lock);
 }
 static void h_queue_builder_set_priority(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     queue_builder(c->x[0])->priority = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_queue_builder_get_priority(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = queue_builder(c->x[0])->priority;
     pm_unlock(&objs_lock);
 }
 static void h_queue_builder_set_queue_memory(CPU* c, u64 entry) { /* (builder, memory, size) */
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnQueueBuilder* b = queue_builder(c->x[0]);
     b->memory = c->x[1];
     b->memory_size = (u32)c->x[2];
@@ -281,13 +298,13 @@ static void h_queue_builder_set_queue_memory(CPU* c, u64 entry) { /* (builder, m
 }
 static void h_queue_builder_get_memory(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = queue_builder(c->x[0])->memory;
     pm_unlock(&objs_lock);
 }
 static void h_queue_builder_get_memory_size(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = queue_builder(c->x[0])->memory_size;
     pm_unlock(&objs_lock);
 }
@@ -296,7 +313,7 @@ static void h_queue_builder_get_memory_size(CPU* c, u64 entry) {
 #define QUEUE_BUILDER_SIZE_HANDLERS(name, field, has)                                  \
     static void h_queue_builder_set_##name(CPU* c, u64 entry) {                        \
         (void)entry;                                                                   \
-        pm_lock(&objs_lock);                                                           \
+        objs_lock_take();                                                           \
         NvnQueueBuilder* b = queue_builder(c->x[0]);                                   \
         b->has = 1;                                                                    \
         b->field = (int32_t)c->x[1];                                                   \
@@ -304,7 +321,7 @@ static void h_queue_builder_get_memory_size(CPU* c, u64 entry) {
     }                                                                                  \
     static void h_queue_builder_get_##name(CPU* c, u64 entry) {                        \
         (void)entry;                                                                   \
-        pm_lock(&objs_lock);                                                           \
+        objs_lock_take();                                                           \
         NvnQueueBuilder* b = queue_builder(c->x[0]);                                   \
         gw32(c->x[1], (u32)b->field);                                                  \
         c->x[0] = b->has;                                                              \
@@ -317,7 +334,7 @@ QUEUE_BUILDER_SIZE_HANDLERS(command_flush_threshold, flush_threshold, has_flush_
 
 static void h_queue_builder_get_queue_memory_size(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = nvn_queue_memory_size(queue_builder(c->x[0]), &nvn_queue_device_words);
     pm_unlock(&objs_lock);
 }
@@ -513,7 +530,7 @@ static int queue_init_build(CPU* c, const NvnQueueBuilder* b, u64 queue_addr, Qu
     BuilderArena arena;
     if (!builder_arena_get(&arena)) return 0;
 
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const DeviceRec* device = known_record(b->device, NVN_OBJ_DEVICE);
     const uint32_t window_origin = device ? device->window_origin : 0;
     const uint32_t depth_mode = device ? device->depth_mode : 0;
@@ -536,7 +553,7 @@ static int queue_init_build(CPU* c, const NvnQueueBuilder* b, u64 queue_addr, Qu
     }
 
     uint64_t old_pool_size = 0;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const QueueRec* old = known_record(queue_addr, NVN_OBJ_QUEUE);
     const int reuse = old && old->pool_size >= pool_size;
     if (reuse) {
@@ -624,14 +641,14 @@ static void queue_drop_frame_syncs(u64 queue_addr, const NvnPendingFrame* frame)
 static void h_queue_initialize(CPU* c, u64 entry) {
     (void)entry;
     const u64 queue_addr = c->x[0]; /* the builder calls may change x0 */
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnQueueBuilder b = *queue_builder(c->x[1]);
     pm_unlock(&objs_lock);
     QueueInitBuild build;
     pm_lock(&builder_lock);
     const int built = queue_init_build(c, &b, queue_addr, &build); /* runs guest code, so no objs_lock */
     pm_unlock(&builder_lock);
-    pm_lock(&objs_lock);
+    objs_lock_take();
     QueueRec* old = known_record(queue_addr, NVN_OBJ_QUEUE);
     uint32_t channel_id = 0;
     GpuChannel* channel = NULL;
@@ -676,7 +693,7 @@ static QueueRec* queue_rec(u64 addr, const char* operation) {
 }
 /* The device of the queue record, for the execution test (nvn_exectest.c). 0 when the queue is unknown. */
 uint64_t nvn_native_queue_device(uint64_t queue) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const QueueRec* q = known_record(queue, NVN_OBJ_QUEUE);
     const uint64_t device = q ? q->builder.device : 0;
     pm_unlock(&objs_lock);
@@ -704,7 +721,7 @@ typedef struct {
    range are never freed: QueueFinalize has no handler. Returns 0 after a log line. */
 static int queue_pool_create(uint64_t size, uint64_t* storage, uint64_t* gpu) {
     const uint64_t bytes = (size + NVN_POOL_PAGE_SIZE - 1u) & ~(uint64_t)(NVN_POOL_PAGE_SIZE - 1u);
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint64_t cpu = kmem_alloc(bytes, MS_STATIC, PERM_RW);
     const uint64_t address = nvn_gpu_va_alloc(bytes, NVN_POOL_PAGE_SIZE);
     const int ok = cpu && address && nvn_gpu_map_range(address, cpu, bytes);
@@ -732,25 +749,25 @@ static uint64_t memory_pool_va_size(uint32_t flags, uint64_t size) {
 }
 static void h_memory_pool_builder_set_defaults(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     nvn_memory_pool_builder_defaults(memory_pool_builder(c->x[0]));
     pm_unlock(&objs_lock);
 }
 static void h_memory_pool_builder_set_device(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     memory_pool_builder(c->x[0])->device = c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_memory_pool_builder_set_flags(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     memory_pool_builder(c->x[0])->flags = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_memory_pool_builder_set_storage(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnMemoryPoolBuilder* b = memory_pool_builder(c->x[0]);
     b->storage = c->x[1];
     b->size = c->x[2];
@@ -759,25 +776,25 @@ static void h_memory_pool_builder_set_storage(CPU* c, u64 entry) {
 }
 static void h_memory_pool_builder_get_device(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = memory_pool_builder(c->x[0])->device;
     pm_unlock(&objs_lock);
 }
 static void h_memory_pool_builder_get_memory(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = memory_pool_builder(c->x[0])->storage;
     pm_unlock(&objs_lock);
 }
 static void h_memory_pool_builder_get_size(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = memory_pool_builder(c->x[0])->size;
     pm_unlock(&objs_lock);
 }
 static void h_memory_pool_builder_get_flags(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = memory_pool_builder(c->x[0])->flags;
     pm_unlock(&objs_lock);
 }
@@ -793,7 +810,7 @@ static void pool_initialize_error(NvnPoolResult result, u64 pool, const NvnMemor
 }
 static void h_memory_pool_initialize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnMemoryPoolBuilder b = *memory_pool_builder(c->x[1]);
     uint32_t flags;
     NvnPoolResult result = nvn_memory_pool_params(&b, NVN_POOL_PAGE_SIZE, &flags);
@@ -880,7 +897,7 @@ static void h_memory_pool_initialize(CPU* c, u64 entry) {
 
 static void h_memory_pool_finalize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnObj* o = nvn_objtab_find(&objs, c->x[0]);
     if (o && o->kind == NVN_OBJ_MEMORY_POOL) {
         MemoryPoolRec* p = o->data;
@@ -903,7 +920,7 @@ static void h_memory_pool_finalize(CPU* c, u64 entry) {
 #define MEMORY_POOL_GETTER(name, expression)                                        \
     static void h_memory_pool_##name(CPU* c, u64 entry) {                           \
         (void)entry;                                                                \
-        pm_lock(&objs_lock);                                                        \
+        objs_lock_take();                                                        \
         MemoryPoolRec* p = memory_pool_rec(c->x[0]);                                \
         c->x[0] = (expression);                                                     \
         pm_unlock(&objs_lock);                                                      \
@@ -914,7 +931,7 @@ MEMORY_POOL_GETTER(get_buffer_address, p->gpu_address)
 
 static void h_memory_pool_get_size(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = memory_pool_rec(c->x[0])->size;
     pm_unlock(&objs_lock);
 }
@@ -996,7 +1013,7 @@ static int map_virtual_batch(MemoryPoolRec* pool, u64 pool_addr, u64 requests, u
 static void h_memory_pool_map_virtual(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnMemoryPoolMapVirtual";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnObj* o = nvn_objtab_find(&objs, c->x[0]);
     MemoryPoolRec* pool = o && o->kind == NVN_OBJ_MEMORY_POOL ? o->data : NULL;
     const u32 count = (u32)c->x[1];
@@ -1032,13 +1049,13 @@ typedef struct { uint64_t pool, offset; } EventRec;
 static EventBuilderRec* event_builder(u64 addr) { return rec_get(addr, NVN_OBJ_EVENT_BUILDER, sizeof(EventBuilderRec)); }
 static void h_event_builder_set_defaults(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     *event_builder(c->x[0]) = (EventBuilderRec){0};
     pm_unlock(&objs_lock);
 }
 static void h_event_builder_set_storage(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     EventBuilderRec* b = event_builder(c->x[0]);
     b->pool = c->x[1];
     b->offset = c->x[2];
@@ -1046,20 +1063,20 @@ static void h_event_builder_set_storage(CPU* c, u64 entry) {
 }
 static void h_event_builder_get_memory_pool(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = event_builder(c->x[0])->pool;
     pm_unlock(&objs_lock);
 }
 static void h_event_builder_get_memory_offset(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = event_builder(c->x[0])->offset;
     pm_unlock(&objs_lock);
 }
 static void h_event_builder_get_storage(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnEventBuilderGetStorage";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint64_t addr = c->x[0];
     const EventBuilderRec* b = event_builder(addr);
     c->x[0] = 0;
@@ -1100,7 +1117,7 @@ static EventRec* event_rec(u64 addr) { return rec_get(addr, NVN_OBJ_EVENT, sizeo
 static void h_event_initialize(CPU* c, u64 entry) {
     (void)entry;
     const u64 event_addr = c->x[0], builder_addr = c->x[1];
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const EventBuilderRec* b = known_record(builder_addr, NVN_OBJ_EVENT_BUILDER);
     if (!b) {
         LOG_LIMIT(QUEUE_LOG_LIMIT, "nvn-native: nvnEventInitialize event=%llx builder=%llx is unknown\n",
@@ -1114,7 +1131,7 @@ static void h_event_initialize(CPU* c, u64 entry) {
 }
 static void h_event_finalize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (known_record(c->x[0], NVN_OBJ_EVENT)) nvn_objtab_remove(&objs, c->x[0]);
     pm_unlock(&objs_lock);
 }
@@ -1122,7 +1139,7 @@ static void h_event_get_value(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnEventGetValue";
     const u64 event_addr = c->x[0];
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const EventRec* e = known_record(event_addr, NVN_OBJ_EVENT);
     c->x[0] = 0;
     if (!e)
@@ -1135,7 +1152,7 @@ static void h_event_get_value(CPU* c, u64 entry) {
 }
 static void h_event_get_memory_pool(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const EventRec* e = known_record(c->x[0], NVN_OBJ_EVENT);
     if (!e) LOG_LIMIT(QUEUE_LOG_LIMIT, "nvn-native: nvnEventGetMemoryPool unknown event=%llx\n",
                       (unsigned long long)c->x[0]);
@@ -1144,7 +1161,7 @@ static void h_event_get_memory_pool(CPU* c, u64 entry) {
 }
 static void h_event_get_memory_offset(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const EventRec* e = known_record(c->x[0], NVN_OBJ_EVENT);
     if (!e) LOG_LIMIT(QUEUE_LOG_LIMIT, "nvn-native: nvnEventGetMemoryOffset unknown event=%llx\n",
                       (unsigned long long)c->x[0]);
@@ -1156,7 +1173,7 @@ static void h_event_signal(CPU* c, u64 entry) {
     static const char* const name = "nvnEventSignal";
     const u64 event_addr = c->x[0];
     const uint32_t mode = (uint32_t)c->x[1];
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const EventRec* e = known_record(event_addr, NVN_OBJ_EVENT);
     const u64 word = e ? event_value_address(e, name, event_addr) : 0;
     if (!e)
@@ -1196,7 +1213,7 @@ static void h_memory_pool_invalidate_mapped_range(CPU* c, u64 entry) {
 #define DESCRIPTOR_POOL_HANDLERS(name, kind)                                        \
     static void h_##name##_pool_initialize(CPU* c, u64 entry) {                     \
         (void)entry;                                                                \
-        pm_lock(&objs_lock);                                                        \
+        objs_lock_take();                                                        \
         DescriptorPoolRec* p = rec_get(c->x[0], kind, sizeof *p);                   \
         *p = (DescriptorPoolRec){c->x[1], c->x[2], (u32)c->x[3]};                   \
         c->x[0] = 1;                                                                \
@@ -1204,7 +1221,7 @@ static void h_memory_pool_invalidate_mapped_range(CPU* c, u64 entry) {
     }                                                                               \
     static void h_##name##_pool_get_size(CPU* c, u64 entry) {                       \
         (void)entry;                                                                \
-        pm_lock(&objs_lock);                                                        \
+        objs_lock_take();                                                        \
         DescriptorPoolRec* p = rec_get(c->x[0], kind, sizeof *p);                   \
         c->x[0] = p->count;                                                         \
         pm_unlock(&objs_lock);                                                      \
@@ -1215,7 +1232,7 @@ DESCRIPTOR_POOL_HANDLERS(sampler, NVN_OBJ_SAMPLER_POOL)
 #define DESCRIPTOR_POOL_MEMORY_HANDLERS(name, kind)                                 \
     static void h_##name##_pool_get_memory_pool(CPU* c, u64 entry) {                \
         (void)entry;                                                               \
-        pm_lock(&objs_lock);                                                       \
+        objs_lock_take();                                                       \
         const DescriptorPoolRec* p = known_record(c->x[0], kind);                   \
         if (!p) LOG("nvn-native: " #name " pool getter unknown pool=%llx\n", (unsigned long long)c->x[0]); \
         c->x[0] = p ? p->memory_pool : 0;                                          \
@@ -1223,7 +1240,7 @@ DESCRIPTOR_POOL_HANDLERS(sampler, NVN_OBJ_SAMPLER_POOL)
     }                                                                              \
     static void h_##name##_pool_get_memory_offset(CPU* c, u64 entry) {              \
         (void)entry;                                                               \
-        pm_lock(&objs_lock);                                                       \
+        objs_lock_take();                                                       \
         const DescriptorPoolRec* p = known_record(c->x[0], kind);                   \
         if (!p) LOG("nvn-native: " #name " pool getter unknown pool=%llx\n", (unsigned long long)c->x[0]); \
         c->x[0] = p ? p->offset : 0;                                               \
@@ -1260,20 +1277,20 @@ static MemoryPoolRec* buffer_pool(u64 addr, const char* operation, const BufferR
 }
 static void h_buffer_builder_set_device(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     buffer_builder(c->x[0])->device = c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_buffer_builder_set_defaults(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     BufferBuilderRec* b = buffer_builder(c->x[0]);
     b->pool = b->offset = b->size = 0; /* the device stays, as in the library */
     pm_unlock(&objs_lock);
 }
 static void h_buffer_builder_set_storage(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     BufferBuilderRec* b = buffer_builder(c->x[0]);
     b->pool = c->x[1];
     b->offset = c->x[2];
@@ -1282,25 +1299,25 @@ static void h_buffer_builder_set_storage(CPU* c, u64 entry) {
 }
 static void h_buffer_builder_get_size(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = buffer_builder(c->x[0])->size;
     pm_unlock(&objs_lock);
 }
 static void h_buffer_builder_get_device(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = buffer_builder(c->x[0])->device;
     pm_unlock(&objs_lock);
 }
 static void h_buffer_builder_get_memory_pool(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = buffer_builder(c->x[0])->pool;
     pm_unlock(&objs_lock);
 }
 static void h_buffer_builder_get_memory_offset(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = buffer_builder(c->x[0])->offset;
     pm_unlock(&objs_lock);
 }
@@ -1329,7 +1346,7 @@ static int buffer_initialize(BufferRec* r, const BufferBuilderRec* b) {
 }
 static void h_buffer_initialize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     BufferBuilderRec b = *buffer_builder(c->x[1]);
     u64 addr = c->x[0];
     BufferRec* r = rec_get(addr, NVN_OBJ_BUFFER, sizeof *r);
@@ -1346,7 +1363,7 @@ static void h_buffer_finalize(CPU* c, u64 entry) {
 }
 static void h_buffer_map(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const BufferRec* b = NULL;
     const MemoryPoolRec* pool = buffer_pool(c->x[0], "BufferMap", &b);
     u64 base = pool ? nvn_memory_pool_map(pool->flags, pool->storage) : 0;
@@ -1355,7 +1372,7 @@ static void h_buffer_map(CPU* c, u64 entry) {
 }
 static void h_buffer_get_address(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const BufferRec* b = NULL;
     const MemoryPoolRec* pool = buffer_pool(c->x[0], "BufferGetAddress", &b);
     c->x[0] = pool ? pool->gpu_address + b->offset : 0;
@@ -1363,7 +1380,7 @@ static void h_buffer_get_address(CPU* c, u64 entry) {
 }
 static void h_buffer_get_size(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const BufferRec* b = known_record(c->x[0], NVN_OBJ_BUFFER);
     if (!b) buffer_lost("BufferGetSize", c->x[0]);
     c->x[0] = b ? b->size : 0;
@@ -1371,7 +1388,7 @@ static void h_buffer_get_size(CPU* c, u64 entry) {
 }
 static void h_buffer_get_memory_pool(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const BufferRec* b = known_record(c->x[0], NVN_OBJ_BUFFER);
     if (!b) buffer_lost("BufferGetMemoryPool", c->x[0]);
     c->x[0] = b ? b->pool : 0;
@@ -1379,7 +1396,7 @@ static void h_buffer_get_memory_pool(CPU* c, u64 entry) {
 }
 static void h_buffer_get_memory_offset(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const BufferRec* b = known_record(c->x[0], NVN_OBJ_BUFFER);
     if (!b) buffer_lost("BufferGetMemoryOffset", c->x[0]);
     c->x[0] = b ? b->offset : 0;
@@ -1498,7 +1515,7 @@ static uint32_t native_float_bits(float value) {
 #define RESOURCE_BUILDER_HANDLER(name, type, get, statements) \
     static void h_##name(CPU* c, u64 entry) {                 \
         (void)entry;                                         \
-        pm_lock(&objs_lock);                                 \
+        objs_lock_take();                                 \
         type* b = get(c->x[0]);                              \
         statements;                                          \
         pm_unlock(&objs_lock);                               \
@@ -1581,7 +1598,7 @@ RESOURCE_BUILDER_HANDLER(texture_view_set_target, NvnTextureView, texture_view,
 
 static void h_texture_builder_set_packaged_texture_layout(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (native_guest_readable(c->x[1], sizeof(uint32_t)))
         texture_builder(c->x[0])->tile = nvn_texture_packaged_tile(gr32(c->x[1]));
     else
@@ -1656,7 +1673,7 @@ static const NvnSampler* sampler_getter_record(CPU* c, const char* name, NvnObjK
 #define SAMPLER_OUT2(name, kind, first, second)                                     \
     static void h_##name(CPU* c, u64 entry) {                                       \
         (void)entry;                                                               \
-        pm_lock(&objs_lock);                                                       \
+        objs_lock_take();                                                       \
         const NvnSampler* b = sampler_getter_record(c, #name, kind, 2);            \
         if (b) { gw32(c->x[1], (u32)(first)); gw32(c->x[2], (u32)(second)); }       \
         pm_unlock(&objs_lock);                                                     \
@@ -1664,7 +1681,7 @@ static const NvnSampler* sampler_getter_record(CPU* c, const char* name, NvnObjK
 #define SAMPLER_OUT3(name, kind, first, second, third)                              \
     static void h_##name(CPU* c, u64 entry) {                                       \
         (void)entry;                                                               \
-        pm_lock(&objs_lock);                                                       \
+        objs_lock_take();                                                       \
         const NvnSampler* b = sampler_getter_record(c, #name, kind, 3);            \
         if (b) { gw32(c->x[1], (u32)(first)); gw32(c->x[2], (u32)(second));         \
                  gw32(c->x[3], (u32)(third)); }                                    \
@@ -1683,7 +1700,7 @@ SAMPLER_OUT3(sampler_get_wrap_mode, NVN_OBJ_SAMPLER, b->wrap[0], b->wrap[1], b->
 #undef SAMPLER_OUT3
 
 static void sampler_get_border_color(CPU* c, const char* name, NvnObjKind kind) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (!native_guest_writable(c->x[1], 4 * sizeof(uint32_t))) {
         LOG("nvn-native: %s unwritable output\n", name);
         pm_unlock(&objs_lock);
@@ -1711,7 +1728,7 @@ static void h_sampler_get_border_color(CPU* c, u64 entry) {
 #define SAMPLER_OBJECT_GET_SCALAR(name, expression)                                 \
     static void h_##name(CPU* c, u64 entry) {                                       \
         (void)entry;                                                               \
-        pm_lock(&objs_lock);                                                       \
+        objs_lock_take();                                                       \
         const NvnSampler* s = known_record(c->x[0], NVN_OBJ_SAMPLER);              \
         if (!s) LOG("nvn-native: " #name " unknown sampler=%llx\n", (unsigned long long)c->x[0]); \
         c->x[0] = s ? (expression) : 0;                                            \
@@ -1720,7 +1737,7 @@ static void h_sampler_get_border_color(CPU* c, u64 entry) {
 #define SAMPLER_OBJECT_GET_FLOAT(name, field)                                       \
     static void h_##name(CPU* c, u64 entry) {                                       \
         (void)entry;                                                               \
-        pm_lock(&objs_lock);                                                       \
+        objs_lock_take();                                                       \
         const NvnSampler* s = known_record(c->x[0], NVN_OBJ_SAMPLER);              \
         if (!s) LOG("nvn-native: " #name " unknown sampler=%llx\n", (unsigned long long)c->x[0]); \
         SNX_VSET_S(c->v[0], 0, s ? native_float_bits(s->field) : 0);               \
@@ -1741,7 +1758,7 @@ static void h_sampler_get_debug_id(CPU* c, u64 entry) {
 static void h_texture_builder_get_swizzle(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnTextureBuilderGetSwizzle";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (guest_outputs_writable(c, name, 4)) {
         const NvnTextureBuilder* b = texture_builder(c->x[0]);
         for (unsigned i = 0; i < 4; i++) gw32(c->x[1 + i], b->swizzle[i]);
@@ -1750,7 +1767,7 @@ static void h_texture_builder_get_swizzle(CPU* c, u64 entry) {
 }
 static void h_texture_builder_get_raw_storage_class(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureBuilder* b = texture_builder(c->x[0]);
     c->x[0] = nvn_texture_raw_storage_class(b->flags, b->format);
     pm_unlock(&objs_lock);
@@ -1758,7 +1775,7 @@ static void h_texture_builder_get_raw_storage_class(CPU* c, u64 entry) {
 static void h_texture_builder_get_packaged_texture_layout(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnTextureBuilderGetPackagedTextureLayout";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (native_guest_writable(c->x[1], sizeof(uint32_t))) {
         const NvnTextureBuilder* b = texture_builder(c->x[0]);
         uint32_t layout = 0;
@@ -1773,7 +1790,7 @@ static void h_texture_builder_get_packaged_texture_layout(CPU* c, u64 entry) {
 
 static void h_texture_builder_get_storage_class(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureBuilder* b = known_record(c->x[0], NVN_OBJ_TEXTURE_BUILDER);
     if (!b)
         LOG("nvn-native: nvnTextureBuilderGetStorageClass unknown builder=%llx\n", (unsigned long long)c->x[0]);
@@ -1782,7 +1799,7 @@ static void h_texture_builder_get_storage_class(CPU* c, u64 entry) {
 }
 static void h_texture_builder_get_zcull_storage_size(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureBuilder* b = known_record(c->x[0], NVN_OBJ_TEXTURE_BUILDER);
     if (!b) {
         LOG("nvn-native: nvnTextureBuilderGetZCullStorageSize unknown builder=%llx\n",
@@ -1803,7 +1820,7 @@ static void h_texture_builder_get_sparse_tile_layout(CPU* c, u64 entry) {
     const u64 dst = c->x[1];
     uint32_t out[4];
     int computed = 0;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureBuilder* b = known_record(c->x[0], NVN_OBJ_TEXTURE_BUILDER);
     if (!b) {
         LOG("nvn-native: %s unknown builder=%llx\n", name, (unsigned long long)c->x[0]);
@@ -1819,7 +1836,7 @@ static void h_texture_builder_get_sparse_tile_layout(CPU* c, u64 entry) {
 
 static void h_sampler_initialize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnSampler b = *sampler_builder(c->x[1]);
     *(NvnSampler*)rec_get(c->x[0], NVN_OBJ_SAMPLER, sizeof b) = b;
     c->x[0] = 1;
@@ -1832,7 +1849,7 @@ static void h_sampler_finalize(CPU* c, u64 entry) {
 }
 static void h_sampler_compare(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnSampler* a = known_record(c->x[0], NVN_OBJ_SAMPLER);
     const NvnSampler* b = known_record(c->x[1], NVN_OBJ_SAMPLER);
     if (!a || !b)
@@ -1994,7 +2011,7 @@ static int program_read_compute_in(const ProgramStageRec* rec, NvnProgramCompute
 /* nvnProgramInitialize(prog, device): the host keeps the device link and writes nothing into the game memory. */
 static void h_program_initialize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     u64 addr = c->x[0], device = c->x[1];
     ProgramRec* r = rec_get(addr, NVN_OBJ_PROGRAM, sizeof *r);
     memset(r, 0, sizeof *r);
@@ -2044,7 +2061,7 @@ static int program_append_xfb_words(u64 header, uint32_t* words, uint32_t max, u
 /* nvnProgramSetShadersExt and nvnProgramSetShaders. All entries must be valid: the host writes the new stage table only
    then, and keeps the old content on a refusal. */
 static void program_set_shaders(CPU* c, const ProgramEntryLayout* layout) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     u64 addr = c->x[0], entries = c->x[2];
     int32_t count = (int32_t)c->x[1];
     ProgramRec* r = known_record(addr, NVN_OBJ_PROGRAM);
@@ -2213,7 +2230,7 @@ static void h_program_set_shaders(CPU* c, u64 entry) {
 /* nvnProgramSetSampleShading(prog, value): the host renders one sample, so the value has no effect. */
 static void h_program_set_sample_shading(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     u64 addr = c->x[0];
     if (known_record(addr, NVN_OBJ_PROGRAM))
         LOG_LIMIT(1, "nvn-native: nvnProgramSetSampleShading is a logged no-op: "
@@ -2236,7 +2253,7 @@ static void h_program_set_subroutine_linkage(CPU* c, u64 entry) {
 /* nvnProgramFinalize(prog): the library does not check the object, and neither does the host. */
 static void h_program_finalize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (known_record(c->x[0], NVN_OBJ_PROGRAM)) nvn_objtab_remove(&objs, c->x[0]);
     pm_unlock(&objs_lock);
 }
@@ -2287,13 +2304,13 @@ static void sampler_pool_register(CPU* c, NvnObjKind source_kind, const char* so
 }
 static void h_sampler_pool_register_sampler(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     sampler_pool_register(c, NVN_OBJ_SAMPLER, "sampler");
     pm_unlock(&objs_lock);
 }
 static void h_sampler_pool_register_sampler_builder(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     sampler_pool_register(c, NVN_OBJ_SAMPLER_BUILDER, "sampler builder");
     pm_unlock(&objs_lock);
 }
@@ -2399,20 +2416,20 @@ static void texture_pool_register(CPU* c, NvnTextureDescriptorMode mode) {
 }
 static void h_texture_pool_register_texture(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     texture_pool_register(c, NVN_TEXTURE_DESCRIPTOR_MODE_TEXTURE);
     pm_unlock(&objs_lock);
 }
 static void h_texture_pool_register_image(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     texture_pool_register(c, NVN_TEXTURE_DESCRIPTOR_MODE_IMAGE);
     pm_unlock(&objs_lock);
 }
 #define TEXTURE_GETTER(name, value) \
     static void h_texture_get_##name(CPU* c, u64 entry) { \
         (void)entry; \
-        pm_lock(&objs_lock); \
+        objs_lock_take(); \
         TextureRec* t = known_record(c->x[0], NVN_OBJ_TEXTURE); \
         if (!t) LOG("nvn-native: texture getter " #name " unknown texture=%llx\n", (unsigned long long)c->x[0]); \
         c->x[0] = t ? (value) : 0; \
@@ -2440,7 +2457,7 @@ static void h_texture_get_debug_id(CPU* c, u64 entry) {
 }
 static void h_texture_get_raw_storage_class(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const TextureRec* t = known_record(c->x[0], NVN_OBJ_TEXTURE);
     if (!t) LOG("nvn-native: nvnTextureGetRawStorageClass unknown texture=%llx\n", (unsigned long long)c->x[0]);
     c->x[0] = t ? nvn_texture_raw_storage_class(t->builder.flags, t->builder.format) : 0;
@@ -2448,7 +2465,7 @@ static void h_texture_get_raw_storage_class(CPU* c, u64 entry) {
 }
 static void h_texture_get_storage_class(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const TextureRec* t = known_record(c->x[0], NVN_OBJ_TEXTURE);
     if (!t) LOG("nvn-native: nvnTextureGetStorageClass unknown texture=%llx\n", (unsigned long long)c->x[0]);
     c->x[0] = t ? nvn_texture_storage_class(&t->builder, &nvn_texture_device_words) : 0;
@@ -2456,7 +2473,7 @@ static void h_texture_get_storage_class(CPU* c, u64 entry) {
 }
 static void h_texture_get_zcull_storage_size(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const TextureRec* t = known_record(c->x[0], NVN_OBJ_TEXTURE);
     if (!t) {
         LOG("nvn-native: nvnTextureGetZCullStorageSize unknown texture=%llx\n", (unsigned long long)c->x[0]);
@@ -2476,7 +2493,7 @@ static void h_texture_get_sparse_tile_layout(CPU* c, u64 entry) {
     const u64 dst = c->x[1];
     uint32_t out[4];
     int computed = 0;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const TextureRec* t = known_record(c->x[0], NVN_OBJ_TEXTURE);
     if (!t) {
         LOG("nvn-native: %s unknown texture=%llx\n", name, (unsigned long long)c->x[0]);
@@ -2492,7 +2509,7 @@ static void h_texture_get_sparse_tile_layout(CPU* c, u64 entry) {
 static void h_texture_get_view_offset(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnTextureGetViewOffset";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const TextureRec* t = known_record(c->x[0], NVN_OBJ_TEXTURE);
     if (!t) {
         LOG("nvn-native: %s unknown texture=%llx\n", name, (unsigned long long)c->x[0]);
@@ -2519,7 +2536,7 @@ static void h_texture_get_view_offset(CPU* c, u64 entry) {
 static void h_texture_get_swizzle(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnTextureGetSwizzle";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (guest_outputs_writable(c, name, 4)) {
         const TextureRec* t = known_record(c->x[0], NVN_OBJ_TEXTURE);
         if (!t)
@@ -2531,7 +2548,7 @@ static void h_texture_get_swizzle(CPU* c, u64 entry) {
 }
 static void h_texture_compare(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const TextureRec* a = known_record(c->x[0], NVN_OBJ_TEXTURE);
     const TextureRec* b = known_record(c->x[1], NVN_OBJ_TEXTURE);
     if (!a || !b)
@@ -2542,7 +2559,7 @@ static void h_texture_compare(CPU* c, u64 entry) {
 }
 static void h_texture_view_compare(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureView* a = known_record(c->x[0], NVN_OBJ_TEXTURE_VIEW);
     const NvnTextureView* b = known_record(c->x[1], NVN_OBJ_TEXTURE_VIEW);
     if (!a || !b)
@@ -2570,7 +2587,7 @@ static int texture_view_getter(CPU* c, const char* name, unsigned outputs, const
 static void h_texture_view_get_levels(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnTextureViewGetLevels";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureView* v = NULL;
     if (texture_view_getter(c, name, 2, &v)) {
         gw32(c->x[1], v->base_level);
@@ -2584,7 +2601,7 @@ static void h_texture_view_get_levels(CPU* c, u64 entry) {
 static void h_texture_view_get_layers(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnTextureViewGetLayers";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureView* v = NULL;
     if (texture_view_getter(c, name, 2, &v)) {
         gw32(c->x[1], v->base_layer);
@@ -2598,7 +2615,7 @@ static void h_texture_view_get_layers(CPU* c, u64 entry) {
 static void h_texture_view_get_format(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnTextureViewGetFormat";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureView* v = NULL;
     if (texture_view_getter(c, name, 1, &v)) {
         gw32(c->x[1], v->format);
@@ -2611,7 +2628,7 @@ static void h_texture_view_get_format(CPU* c, u64 entry) {
 static void h_texture_view_get_swizzle(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnTextureViewGetSwizzle";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureView* v = NULL;
     if (texture_view_getter(c, name, 4, &v)) {
         for (unsigned i = 0; i < 4; i++) gw32(c->x[1 + i], v->swizzle[i]);
@@ -2624,7 +2641,7 @@ static void h_texture_view_get_swizzle(CPU* c, u64 entry) {
 static void h_texture_view_get_depth_stencil_mode(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnTextureViewGetDepthStencilMode";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureView* v = NULL;
     if (texture_view_getter(c, name, 1, &v)) {
         gw32(c->x[1], v->depth_stencil_mode);
@@ -2637,7 +2654,7 @@ static void h_texture_view_get_depth_stencil_mode(CPU* c, u64 entry) {
 static void h_texture_view_get_target(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnTextureViewGetTarget";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnTextureView* v = NULL;
     if (texture_view_getter(c, name, 1, &v)) {
         gw32(c->x[1], v->target);
@@ -2695,7 +2712,7 @@ static int texture_initialize(TextureRec* t, const NvnTextureBuilder* b) {
 }
 static void h_texture_initialize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnTextureBuilder b = *texture_builder(c->x[1]);
     TextureRec* t = rec_get(c->x[0], NVN_OBJ_TEXTURE, sizeof *t);
     memset(t, 0, sizeof *t);
@@ -2713,7 +2730,7 @@ static void h_texture_finalize(CPU* c, u64 entry) {
 }
 /* The library flushes or invalidates the pool cache and moves no data; the host write tracking already covers the pool. */
 static void texture_cache_noop(CPU* c, const char* name) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (!known_record(c->x[0], NVN_OBJ_TEXTURE))
         LOG("nvn-native: %s unknown texture=%llx\n", name, (unsigned long long)c->x[0]);
     else
@@ -2966,7 +2983,7 @@ static void texture_write_slice(const TextureWriteCall* call, uint32_t index, in
 }
 static void texture_transfer(CPU* c, const char* operation, int to_texture, uint32_t row_stride,
                              uint32_t image_stride) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     TextureWriteCall call;
     if (texture_write_check(c, &call, operation, to_texture, row_stride, image_stride))
         for (uint32_t i = 0; i < call.layer_count; i++) texture_write_slice(&call, i, to_texture);
@@ -3041,7 +3058,7 @@ static void command_buffer_release(CommandBufferRec* cb) {
 }
 static void h_command_buffer_initialize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* old = known_record(c->x[0], NVN_OBJ_COMMAND_BUFFER);
     if (old) command_buffer_release(old); /* initialized again without Finalize */
     CommandBufferRec* cb = rec_get(c->x[0], NVN_OBJ_COMMAND_BUFFER, sizeof *cb);
@@ -3052,7 +3069,7 @@ static void h_command_buffer_initialize(CPU* c, u64 entry) {
 }
 static void h_command_buffer_finalize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = known_record(c->x[0], NVN_OBJ_COMMAND_BUFFER);
     if (cb) {
         command_buffer_release(cb);
@@ -3062,14 +3079,14 @@ static void h_command_buffer_finalize(CPU* c, u64 entry) {
 }
 static void h_command_buffer_set_memory_callback(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], "nvnCommandBufferSetMemoryCallback");
     if (cb) cb->callback = c->x[1]; /* stored, never called: the host has no command memory to fill */
     pm_unlock(&objs_lock);
 }
 static void h_command_buffer_set_memory_callback_data(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], "nvnCommandBufferSetMemoryCallbackData");
     if (cb) cb->callback_data = c->x[1];
     pm_unlock(&objs_lock);
@@ -3079,7 +3096,7 @@ static void h_command_buffer_set_memory_callback_data(CPU* c, u64 entry) {
 #define COMMAND_GETTER_HANDLER(handler, operation, expression)                                     \
     static void h_command_buffer_##handler(CPU* c, u64 entry) {                                    \
         (void)entry;                                                                               \
-        pm_lock(&objs_lock);                                                                       \
+        objs_lock_take();                                                                       \
         const CommandBufferRec* cb = command_buffer(c->x[0], operation);                           \
         c->x[0] = cb ? (expression) : 0;                                                           \
         pm_unlock(&objs_lock);                                                                     \
@@ -3093,7 +3110,7 @@ COMMAND_GETTER_HANDLER(get_control_memory_size, "nvnCommandBufferGetControlMemor
 #undef COMMAND_GETTER_HANDLER
 static void h_command_buffer_add_command_memory(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], "nvnCommandBufferAddCommandMemory");
     if (cb) {
         cb->command_pool = c->x[1];
@@ -3105,7 +3122,7 @@ static void h_command_buffer_add_command_memory(CPU* c, u64 entry) {
 }
 static void h_command_buffer_add_control_memory(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], "nvnCommandBufferAddControlMemory");
     if (cb) {
         cb->control_begin = c->x[1];
@@ -3119,21 +3136,21 @@ static void h_command_buffer_add_control_memory(CPU* c, u64 entry) {
    means the tight stride; patch 2 of U3 reads the fields for the texture copies. */
 static void h_command_buffer_set_copy_row_stride(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], "nvnCommandBufferSetCopyRowStride");
     if (cb) cb->copy_row_stride = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_command_buffer_set_copy_image_stride(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], "nvnCommandBufferSetCopyImageStride");
     if (cb) cb->copy_image_stride = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_command_buffer_get_copy_row_stride(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const CommandBufferRec* cb = known_record(c->x[0], NVN_OBJ_COMMAND_BUFFER);
     if (!cb) COMMAND_LOG("nvn-native: nvnCommandBufferGetCopyRowStride unknown command buffer=%llx\n",
                          (unsigned long long)c->x[0]);
@@ -3142,7 +3159,7 @@ static void h_command_buffer_get_copy_row_stride(CPU* c, u64 entry) {
 }
 static void h_command_buffer_get_copy_image_stride(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const CommandBufferRec* cb = known_record(c->x[0], NVN_OBJ_COMMAND_BUFFER);
     if (!cb) COMMAND_LOG("nvn-native: nvnCommandBufferGetCopyImageStride unknown command buffer=%llx\n",
                          (unsigned long long)c->x[0]);
@@ -3151,7 +3168,7 @@ static void h_command_buffer_get_copy_image_stride(CPU* c, u64 entry) {
 }
 static void h_command_buffer_begin_recording(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], "nvnCommandBufferBeginRecording");
     if (cb) {
         if (cb->recording) {
@@ -3176,7 +3193,7 @@ static int command_buffer_own(CommandBufferRec* cb, uint64_t handle) {
 }
 static void h_command_buffer_end_recording(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], "nvnCommandBufferEndRecording");
     uint64_t handle = 0;
     if (cb && cb->recording) {
@@ -3232,7 +3249,7 @@ static void command_state_record(CommandBufferRec* cb, u64 addr, const char* ope
 #define COMMAND_REFUSE_HANDLER(handler, operation, reason)                                      \
     static void h_command_buffer_##handler(CPU* c, u64 entry) {                                 \
         (void)entry;                                                                            \
-        pm_lock(&objs_lock);                                                                    \
+        objs_lock_take();                                                                    \
         if (command_buffer(c->x[0], operation)) command_refused(c, operation, reason);          \
         pm_unlock(&objs_lock);                                                                  \
     }
@@ -3268,7 +3285,7 @@ COMMAND_REFUSE_HANDLER(set_shader_scratch_memory, "nvnCommandBufferSetShaderScra
 #define COMMAND_REFUSE_VALUE_HANDLER(handler, operation, reason)                                   \
     static void h_command_buffer_##handler(CPU* c, u64 entry) {                                    \
         (void)entry;                                                                               \
-        pm_lock(&objs_lock);                                                                       \
+        objs_lock_take();                                                                       \
         CommandBufferRec* cb = command_buffer(c->x[0], operation);                                 \
         if (cb) command_refused(c, operation, reason);                                             \
         c->x[0] = 0;                                                                               \
@@ -3291,7 +3308,7 @@ COMMAND_REFUSE_VALUE_HANDLER(get_control_memory_free, "nvnCommandBufferGetContro
 #define COMMAND_NO_OP_HANDLER(handler, operation, reason)                                      \
     static void h_command_buffer_##handler(CPU* c, u64 entry) {                                \
         (void)entry;                                                                            \
-        pm_lock(&objs_lock);                                                                    \
+        objs_lock_take();                                                                    \
         if (command_buffer(c->x[0], operation))                                                 \
             LOG_LIMIT(1, "nvn-native: %s is a logged no-op: %s\n", operation, reason);          \
         pm_unlock(&objs_lock);                                                                  \
@@ -3329,7 +3346,7 @@ COMMAND_NO_OP_HANDLER(pop_debug_group_id, "nvnCommandBufferPopDebugGroupId", DEB
 static void h_command_buffer_bind_coverage_modulation_table(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindCoverageModulationTable";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (command_buffer(c->x[0], name)) {
         if (c->x[1])
             command_refused(c, name, "the host has no coverage modulation, and the identity table is not verified");
@@ -3341,7 +3358,7 @@ static void h_command_buffer_bind_coverage_modulation_table(CPU* c, u64 entry) {
 #define COMMAND_POOL_HANDLER(name, operation, kind, code)                                                   \
     static void h_command_buffer_##name(CPU* c, u64 entry) {                                                \
         (void)entry;                                                                                        \
-        pm_lock(&objs_lock);                                                                                \
+        objs_lock_take();                                                                                \
         CommandBufferRec* cb = command_buffer(c->x[0], operation);                                          \
         NvnOpPool op = {c->x[1], 0, 0};                                                                     \
         if (!cb) {                                                                                          \
@@ -3377,7 +3394,7 @@ static int command_target(u64 texture, u64 view, NvnOpTarget* out, CommandBuffer
 static void h_command_buffer_set_render_targets(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetRenderTargets";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     u64 textures = c->x[2], views = c->x[3];
     u32 count = (u32)c->x[1];
@@ -3419,7 +3436,7 @@ static void command_scissor(CommandBufferRec* cb, u64 addr, const char* operatio
 static void h_command_buffer_set_viewports(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetViewports";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     u32 first = (u32)c->x[1], count = (u32)c->x[2];
     if (cb && (int32_t)count > 0) {
@@ -3442,7 +3459,7 @@ static void h_command_buffer_set_viewports(CPU* c, u64 entry) {
 static void h_command_buffer_set_scissors(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetScissors";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     u32 first = (u32)c->x[1], count = (u32)c->x[2];
     if (cb && (int32_t)count > 0) {
@@ -3464,7 +3481,7 @@ static void h_command_buffer_set_scissors(CPU* c, u64 entry) {
 static void h_command_buffer_set_viewport(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetViewport";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb)
         command_viewport(cb, c->x[0], name, 0, (float)(int32_t)c->x[1], (float)(int32_t)c->x[2],
@@ -3475,7 +3492,7 @@ static void h_command_buffer_set_viewport(CPU* c, u64 entry) {
 static void h_command_buffer_set_scissor(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetScissor";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb)
         command_scissor(cb, c->x[0], name, 0, (int32_t)c->x[1], (int32_t)c->x[2], (int32_t)c->x[3],
@@ -3508,7 +3525,7 @@ static int command_bind_range_ok(CommandBufferRec* cb, const char* operation, ui
 static void h_command_buffer_bind_texture(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindTexture";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpBindTexture op = {.stage = (u32)c->x[1], .slot = (u32)c->x[2], .handle = c->x[3], .plural = 0};
     if (!cb) {
@@ -3525,7 +3542,7 @@ static void h_command_buffer_bind_texture(CPU* c, u64 entry) {
 static void h_command_buffer_bind_textures(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindTextures";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     uint32_t stage = (u32)c->x[1], first = (u32)c->x[2];
     int32_t count = (int32_t)c->x[3];
@@ -3577,7 +3594,7 @@ static void command_bind_buffers_full(CommandBufferRec* cb, u64 addr, const char
 static void h_command_buffer_bind_uniform_buffer(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindUniformBuffer";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) command_bind_buffer(cb, c->x[0], name, NVN_BIND_UNIFORM, (u32)c->x[1], (u32)c->x[2],
                                 NVN_UNIFORM_SLOT_MAX, c->x[3], (uint32_t)c->x[4], 0);
@@ -3586,7 +3603,7 @@ static void h_command_buffer_bind_uniform_buffer(CPU* c, u64 entry) {
 static void h_command_buffer_bind_storage_buffer(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindStorageBuffer";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) command_bind_buffer(cb, c->x[0], name, NVN_BIND_STORAGE, (u32)c->x[1], (u32)c->x[2],
                                 NVN_STORAGE_SLOT_MAX, c->x[3], (uint32_t)c->x[4], 0);
@@ -3595,7 +3612,7 @@ static void h_command_buffer_bind_storage_buffer(CPU* c, u64 entry) {
 static void h_command_buffer_bind_vertex_buffer(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindVertexBuffer";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) command_bind_buffer(cb, c->x[0], name, NVN_BIND_VERTEX, 0, (u32)c->x[1], NVN_VERTEX_SLOT_MAX,
                                 c->x[2], c->x[3], 0);
@@ -3604,7 +3621,7 @@ static void h_command_buffer_bind_vertex_buffer(CPU* c, u64 entry) {
 static void h_command_buffer_bind_transform_feedback_buffer(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindTransformFeedbackBuffer";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) command_bind_buffer(cb, c->x[0], name, NVN_BIND_TRANSFORM_FEEDBACK, 0, (u32)c->x[1], NVN_XFB_SLOT_MAX,
                                 c->x[2], c->x[3], 0);
@@ -3613,7 +3630,7 @@ static void h_command_buffer_bind_transform_feedback_buffer(CPU* c, u64 entry) {
 static void h_command_buffer_bind_uniform_buffers(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindUniformBuffers";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     int32_t count = (int32_t)c->x[3];
     if (cb && count > 0)
@@ -3624,7 +3641,7 @@ static void h_command_buffer_bind_uniform_buffers(CPU* c, u64 entry) {
 static void h_command_buffer_bind_storage_buffers(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindStorageBuffers";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     int32_t count = (int32_t)c->x[3];
     if (cb && count > 0)
@@ -3635,7 +3652,7 @@ static void h_command_buffer_bind_storage_buffers(CPU* c, u64 entry) {
 static void h_command_buffer_bind_vertex_buffers(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindVertexBuffers";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     int32_t count = (int32_t)c->x[2];
     if (cb && count > 0)
@@ -3646,7 +3663,7 @@ static void h_command_buffer_bind_vertex_buffers(CPU* c, u64 entry) {
 static void h_command_buffer_bind_transform_feedback_buffers(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindTransformFeedbackBuffers";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     int32_t count = (int32_t)c->x[2];
     if (cb && count > 0)
@@ -3686,7 +3703,7 @@ static void command_bind_state(CommandBufferRec* cb, u64 addr, u64 state_addr, c
 #define BIND_STATE_HANDLER(name, operation, kind)                        \
     static void h_command_buffer_bind_##name(CPU* c, u64 entry) {        \
         (void)entry;                                                     \
-        pm_lock(&objs_lock);                                             \
+        objs_lock_take();                                             \
         CommandBufferRec* cb = command_buffer(c->x[0], operation);       \
         if (cb) command_bind_state(cb, c->x[0], c->x[1], operation, kind); \
         pm_unlock(&objs_lock);                                           \
@@ -3702,7 +3719,7 @@ BIND_STATE_HANDLER(channel_mask_state, "nvnCommandBufferBindChannelMaskState", N
 #define STATE_INSERT_HANDLER(name, kind, mask, shift)          \
     static void h_##name(CPU* c, u64 entry) {                  \
         (void)entry;                                           \
-        pm_lock(&objs_lock);                                   \
+        objs_lock_take();                                   \
         uint32_t* w = state_words(c->x[0], kind);              \
         w[0] = nvn_state_insert(w[0], mask, shift, (u32)c->x[1]); \
         pm_unlock(&objs_lock);                                 \
@@ -3724,7 +3741,7 @@ STATE_INSERT_HANDLER(multisample_state_set_coverage_to_color_output, NVN_STATE_M
 #define STATE_FLAG_HANDLER(name, kind, bit)                    \
     static void h_##name(CPU* c, u64 entry) {                  \
         (void)entry;                                           \
-        pm_lock(&objs_lock);                                   \
+        objs_lock_take();                                   \
         uint32_t* w = state_words(c->x[0], kind);              \
         w[0] = nvn_state_set_flag(w[0], bit, (u32)c->x[1]);    \
         pm_unlock(&objs_lock);                                 \
@@ -3742,77 +3759,77 @@ STATE_FLAG_HANDLER(multisample_state_set_coverage_to_color_enable, NVN_STATE_MUL
 
 static void h_blend_state_set_blend_func(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = state_words(c->x[0], NVN_STATE_BLEND);
     w[1] = nvn_blend_state_set_blend_func(w[1], (u32)c->x[1], (u32)c->x[2], (u32)c->x[3], (u32)c->x[4]);
     pm_unlock(&objs_lock);
 }
 static void h_blend_state_set_blend_equation(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = state_words(c->x[0], NVN_STATE_BLEND);
     w[0] = nvn_blend_state_set_blend_equation(w[0], (u32)c->x[1], (u32)c->x[2]);
     pm_unlock(&objs_lock);
 }
 static void h_blend_state_get_advanced_mode(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_BLEND);
     c->x[0] = nvn_blend_state_get_advanced_mode(w[0]);
     pm_unlock(&objs_lock);
 }
 static void h_blend_state_get_advanced_overlap(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_BLEND);
     c->x[0] = nvn_blend_state_get_advanced_overlap(w[0]);
     pm_unlock(&objs_lock);
 }
 static void h_blend_state_get_advanced_premultiplied_src(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_BLEND);
     c->x[0] = nvn_blend_state_get_advanced_premultiplied_src(w[0]);
     pm_unlock(&objs_lock);
 }
 static void h_blend_state_get_advanced_normalized_dst(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_BLEND);
     c->x[0] = nvn_blend_state_get_advanced_normalized_dst(w[0]);
     pm_unlock(&objs_lock);
 }
 static void h_blend_state_set_advanced_mode(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = state_words(c->x[0], NVN_STATE_BLEND);
     w[0] = nvn_blend_state_set_advanced_mode(w[0], (u32)c->x[1]);
     pm_unlock(&objs_lock);
 }
 static void h_blend_state_set_advanced_overlap(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = state_words(c->x[0], NVN_STATE_BLEND);
     w[0] = nvn_blend_state_set_advanced_overlap(w[0], (u32)c->x[1]);
     pm_unlock(&objs_lock);
 }
 static void h_blend_state_set_advanced_premultiplied_src(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = state_words(c->x[0], NVN_STATE_BLEND);
     w[0] = nvn_blend_state_set_advanced_premultiplied_src(w[0], (u32)c->x[1]);
     pm_unlock(&objs_lock);
 }
 static void h_blend_state_set_advanced_normalized_dst(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = state_words(c->x[0], NVN_STATE_BLEND);
     w[0] = nvn_blend_state_set_advanced_normalized_dst(w[0], (u32)c->x[1]);
     pm_unlock(&objs_lock);
 }
 static void h_channel_mask_state_set_channel_mask(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = state_words(c->x[0], NVN_STATE_CHANNEL_MASK);
     w[0] = nvn_channel_mask_state_set_channel_mask(w[0], (u32)c->x[1], (u32)c->x[2], (u32)c->x[3],
                                                    (u32)c->x[4], (u32)c->x[5]);
@@ -3820,21 +3837,21 @@ static void h_channel_mask_state_set_channel_mask(CPU* c, u64 entry) {
 }
 static void h_color_state_set_blend_enable(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = state_words(c->x[0], NVN_STATE_COLOR);
     w[0] = nvn_color_state_set_blend_enable(w[0], (u32)c->x[1], (u32)c->x[2]);
     pm_unlock(&objs_lock);
 }
 static void h_depth_stencil_state_set_stencil_func(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = state_words(c->x[0], NVN_STATE_DEPTH_STENCIL);
     w[1] = nvn_depth_stencil_state_set_stencil_func(w[1], (u32)c->x[1], (u32)c->x[2]);
     pm_unlock(&objs_lock);
 }
 static void h_depth_stencil_state_set_stencil_op(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = state_words(c->x[0], NVN_STATE_DEPTH_STENCIL);
     w[1] = nvn_depth_stencil_state_set_stencil_op(w[1], (u32)c->x[1], (u32)c->x[2], (u32)c->x[3], (u32)c->x[4]);
     pm_unlock(&objs_lock);
@@ -3843,7 +3860,7 @@ static void h_depth_stencil_state_set_stencil_op(CPU* c, u64 entry) {
 #define STATE_DEFAULTS_HANDLER(name, kind, defaults) \
     static void h_##name(CPU* c, u64 entry) {         \
         (void)entry;                                  \
-        pm_lock(&objs_lock);                          \
+        objs_lock_take();                          \
         defaults(state_words(c->x[0], kind));         \
         pm_unlock(&objs_lock);                        \
     }
@@ -3858,7 +3875,7 @@ STATE_DEFAULTS_HANDLER(polygon_state_set_defaults, NVN_STATE_POLYGON, nvn_polygo
 #define STATE_GET_HANDLER(name, kind, value)      \
     static void h_##name(CPU* c, u64 entry) {     \
         (void)entry;                              \
-        pm_lock(&objs_lock);                      \
+        objs_lock_take();                      \
         const uint32_t* w = state_words(c->x[0], kind); \
         c->x[0] = (value);                        \
         pm_unlock(&objs_lock);                    \
@@ -3894,14 +3911,14 @@ STATE_GET_HANDLER(polygon_state_get_front_face, NVN_STATE_POLYGON, nvn_polygon_s
 
 static void h_multisample_state_get_sample_locations_enable(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_MULTISAMPLE);
     c->x[0] = nvn_multisample_state_get_sample_locations_enable(w[0]);
     pm_unlock(&objs_lock);
 }
 static void h_multisample_state_get_sample_locations_grid_enable(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_MULTISAMPLE);
     c->x[0] = nvn_multisample_state_get_sample_locations_grid_enable(w[0]);
     pm_unlock(&objs_lock);
@@ -3909,7 +3926,7 @@ static void h_multisample_state_get_sample_locations_grid_enable(CPU* c, u64 ent
 static void h_multisample_state_get_sample_locations_grid(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnMultisampleStateGetSampleLocationsGrid";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (guest_outputs_writable(c, name, 2)) {
         const uint32_t* w = state_words(c->x[0], NVN_STATE_MULTISAMPLE);
         uint32_t x = 0, y = 0;
@@ -3925,7 +3942,7 @@ static void h_multisample_state_set_sample_locations(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnMultisampleStateSetSampleLocations";
     const uint32_t count = (u32)c->x[2];
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t index = (u32)c->x[1];
     if (!count) {
         pm_unlock(&objs_lock);
@@ -3955,7 +3972,7 @@ static void h_multisample_state_set_sample_locations(CPU* c, u64 entry) {
 static void h_blend_state_get_blend_func(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnBlendStateGetBlendFunc";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (!native_guest_writable(c->x[1], sizeof(uint32_t)) || !native_guest_writable(c->x[2], sizeof(uint32_t)) ||
         !native_guest_writable(c->x[3], sizeof(uint32_t)) || !native_guest_writable(c->x[4], sizeof(uint32_t))) {
         LOG("nvn-native: %s unwritable output\n", name);
@@ -3971,7 +3988,7 @@ static void h_blend_state_get_blend_func(CPU* c, u64 entry) {
 static void h_channel_mask_state_get_channel_mask(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnChannelMaskStateGetChannelMask";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (!native_guest_writable(c->x[2], 1) || !native_guest_writable(c->x[3], 1) ||
         !native_guest_writable(c->x[4], 1) || !native_guest_writable(c->x[5], 1)) {
         LOG("nvn-native: %s unwritable output\n", name);
@@ -3986,28 +4003,28 @@ static void h_channel_mask_state_get_channel_mask(CPU* c, u64 entry) {
 }
 static void h_color_state_get_logic_op(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_COLOR);
     c->x[0] = nvn_color_state_get_logic_op(w[0]);
     pm_unlock(&objs_lock);
 }
 static void h_depth_stencil_state_get_stencil_test_enable(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_DEPTH_STENCIL);
     c->x[0] = nvn_depth_stencil_state_get_stencil_test_enable(w[0]);
     pm_unlock(&objs_lock);
 }
 static void h_depth_stencil_state_get_stencil_func(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_DEPTH_STENCIL);
     c->x[0] = nvn_depth_stencil_state_get_stencil_func(w[1], (u32)c->x[1]);
     pm_unlock(&objs_lock);
 }
 static void h_polygon_state_get_polygon_mode(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_POLYGON);
     c->x[0] = nvn_polygon_state_get_polygon_mode(w[0]);
     pm_unlock(&objs_lock);
@@ -4015,7 +4032,7 @@ static void h_polygon_state_get_polygon_mode(CPU* c, u64 entry) {
 static void h_blend_state_get_blend_equation(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnBlendStateGetBlendEquation";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (!native_guest_writable(c->x[1], sizeof(uint32_t)) || !native_guest_writable(c->x[2], sizeof(uint32_t))) {
         LOG("nvn-native: %s unwritable output\n", name);
         pm_unlock(&objs_lock);
@@ -4031,7 +4048,7 @@ static void h_blend_state_get_blend_equation(CPU* c, u64 entry) {
 static void h_depth_stencil_state_get_stencil_op(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnDepthStencilStateGetStencilOp";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (!native_guest_writable(c->x[2], sizeof(uint32_t)) || !native_guest_writable(c->x[3], sizeof(uint32_t)) ||
         !native_guest_writable(c->x[4], sizeof(uint32_t))) {
         LOG("nvn-native: %s unwritable output\n", name);
@@ -4046,7 +4063,7 @@ static void h_depth_stencil_state_get_stencil_op(CPU* c, u64 entry) {
 }
 static void h_polygon_state_get_polygon_offset_enables(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = state_words(c->x[0], NVN_STATE_POLYGON);
     c->x[0] = nvn_polygon_state_get_polygon_offset_enables(w[0]);
     pm_unlock(&objs_lock);
@@ -4061,27 +4078,27 @@ static uint32_t* vertex_stream_words(u64 addr) {
 }
 static void h_vertex_attrib_state_set_defaults(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     vertex_attrib_words(c->x[0])[0] = 0;
     pm_unlock(&objs_lock);
 }
 static void h_vertex_attrib_state_set_format(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = vertex_attrib_words(c->x[0]);
     w[0] = nvn_vertex_attrib_state_set_format(w[0], (u32)c->x[1], (u32)c->x[2]);
     pm_unlock(&objs_lock);
 }
 static void h_vertex_attrib_state_set_stream_index(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = vertex_attrib_words(c->x[0]);
     w[0] = nvn_vertex_attrib_state_set_stream_index(w[0], (u32)c->x[1]);
     pm_unlock(&objs_lock);
 }
 static void h_vertex_stream_state_set_defaults(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t* w = vertex_stream_words(c->x[0]);
     w[0] = 0;
     w[1] = 0;
@@ -4089,26 +4106,26 @@ static void h_vertex_stream_state_set_defaults(CPU* c, u64 entry) {
 }
 static void h_vertex_stream_state_set_stride(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     vertex_stream_words(c->x[0])[0] = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_vertex_stream_state_set_divisor(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     vertex_stream_words(c->x[0])[1] = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_vertex_stream_state_get_stride(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = vertex_stream_words(c->x[0]);
     c->x[0] = w[0];
     pm_unlock(&objs_lock);
 }
 static void h_vertex_stream_state_get_divisor(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const uint32_t* w = vertex_stream_words(c->x[0]);
     c->x[0] = w[1];
     pm_unlock(&objs_lock);
@@ -4120,7 +4137,7 @@ static void h_vertex_attrib_state_get_format(CPU* c, u64 entry) {
         LOG_LIMIT(8, "nvn-native: nvnVertexAttribStateGetFormat unwritable output\n");
         return;
     }
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t format;
     uint64_t offset;
     nvn_vertex_attrib_state_get_format(vertex_attrib_words(c->x[0])[0], &format, &offset);
@@ -4130,7 +4147,7 @@ static void h_vertex_attrib_state_get_format(CPU* c, u64 entry) {
 }
 static void h_vertex_attrib_state_get_stream_index(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     c->x[0] = nvn_vertex_attrib_state_get_stream_index(vertex_attrib_words(c->x[0])[0]);
     pm_unlock(&objs_lock);
 }
@@ -4143,7 +4160,7 @@ static void command_draw(CommandBufferRec* cb, u64 addr, const char* operation, 
 static void h_command_buffer_draw_arrays(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferDrawArrays";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpDraw op = {.kind = NVN_DRAW_ARRAYS, .mode = (u32)c->x[1], .first = (u32)c->x[2],
                     .count = (u32)c->x[3], .instances = 1};
@@ -4153,7 +4170,7 @@ static void h_command_buffer_draw_arrays(CPU* c, u64 entry) {
 static void h_command_buffer_draw_arrays_instanced(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferDrawArraysInstanced";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpDraw op = {.kind = NVN_DRAW_ARRAYS_INSTANCED, .mode = (u32)c->x[1], .first = (u32)c->x[2],
                     .count = (u32)c->x[3], .base_instance = (u32)c->x[4], .instances = (u32)c->x[5]};
@@ -4163,7 +4180,7 @@ static void h_command_buffer_draw_arrays_instanced(CPU* c, u64 entry) {
 static void h_command_buffer_draw_elements(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferDrawElements";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpDraw op = {.kind = NVN_DRAW_ELEMENTS, .mode = (u32)c->x[1], .type = (u32)c->x[2],
                     .count = (u32)c->x[3], .address = c->x[4], .instances = 1};
@@ -4173,7 +4190,7 @@ static void h_command_buffer_draw_elements(CPU* c, u64 entry) {
 static void h_command_buffer_draw_elements_base_vertex(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferDrawElementsBaseVertex";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpDraw op = {.kind = NVN_DRAW_ELEMENTS_BASE_VERTEX, .mode = (u32)c->x[1], .type = (u32)c->x[2],
                     .count = (u32)c->x[3], .address = c->x[4], .base_vertex = (u32)c->x[5], .instances = 1};
@@ -4183,7 +4200,7 @@ static void h_command_buffer_draw_elements_base_vertex(CPU* c, u64 entry) {
 static void h_command_buffer_draw_elements_instanced(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferDrawElementsInstanced";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpDraw op = {.kind = NVN_DRAW_ELEMENTS_INSTANCED, .mode = (u32)c->x[1], .type = (u32)c->x[2],
                     .count = (u32)c->x[3], .address = c->x[4], .base_vertex = (u32)c->x[5],
@@ -4194,7 +4211,7 @@ static void h_command_buffer_draw_elements_instanced(CPU* c, u64 entry) {
 static void h_command_buffer_dispatch_compute(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferDispatchCompute";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpDispatch op = {(u32)c->x[1], (u32)c->x[2], (u32)c->x[3], 0};
     if (cb) command_record(cb, c->x[0], name, NVN_OP_DISPATCH, &op, sizeof op);
@@ -4204,7 +4221,7 @@ static void h_command_buffer_dispatch_compute(CPU* c, u64 entry) {
 static void h_command_buffer_bind_program(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindProgram";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpBindProgram op = {.program = c->x[1], .stage_mask = (u32)c->x[2]};
     if (cb && op.program && op.stage_mask) {
@@ -4233,7 +4250,7 @@ static void command_raster(CommandBufferRec* cb, u64 addr, const char* operation
 #define COMMAND_RASTER_HANDLER(name, operation, which, w0, w1, w2)                    \
     static void h_command_buffer_##name(CPU* c, u64 entry) {                           \
         (void)entry;                                                                   \
-        pm_lock(&objs_lock);                                                           \
+        objs_lock_take();                                                           \
         CommandBufferRec* cb = command_buffer(c->x[0], operation);                     \
         if (cb) command_raster(cb, c->x[0], operation, which, (w0), (w1), (w2));       \
         pm_unlock(&objs_lock);                                                         \
@@ -4293,7 +4310,7 @@ static void command_bind_vertex_stream(CommandBufferRec* cb, u64 addr, const cha
 static void h_command_buffer_bind_vertex_attrib_state(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindVertexAttribState";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) command_bind_vertex_attrib(cb, c->x[0], name, (u32)c->x[1], c->x[2]);
     pm_unlock(&objs_lock);
@@ -4301,7 +4318,7 @@ static void h_command_buffer_bind_vertex_attrib_state(CPU* c, u64 entry) {
 static void h_command_buffer_bind_vertex_stream_state(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindVertexStreamState";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) command_bind_vertex_stream(cb, c->x[0], name, (u32)c->x[1], c->x[2]);
     pm_unlock(&objs_lock);
@@ -4315,7 +4332,7 @@ static void command_depth_range(CommandBufferRec* cb, u64 addr, const char* oper
 static void h_command_buffer_set_depth_ranges(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetDepthRanges";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     u32 first = (u32)c->x[1], count = (u32)c->x[2];
     if (cb && (int32_t)count > 0) {
@@ -4335,7 +4352,7 @@ static void h_command_buffer_set_depth_ranges(CPU* c, u64 entry) {
 static void h_command_buffer_set_depth_range(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetDepthRange";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) {
         u32 depth_mode = device_rec(cb->device)->depth_mode;
@@ -4346,7 +4363,7 @@ static void h_command_buffer_set_depth_range(CPU* c, u64 entry) {
 
 /* ClearColor, ClearColori and ClearColorui are one library body: the float, int and uint words go out unchanged. */
 static void command_clear_color(CPU* c, const char* name) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) {
         NvnOpClearColor op = {(u32)c->x[1], (u32)c->x[3], {0}};
@@ -4373,7 +4390,7 @@ static void h_command_buffer_clear_colorui(CPU* c, u64 entry) {
 }
 static void h_command_buffer_barrier(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], "nvnCommandBufferBarrier");
     NvnOpBarrier op = {(u32)c->x[1], 0};
     if (cb) command_record(cb, c->x[0], "nvnCommandBufferBarrier", NVN_OP_BARRIER, &op, sizeof op);
@@ -4383,7 +4400,7 @@ static void h_command_buffer_barrier(CPU* c, u64 entry) {
 #define COMMAND_STENCIL_HANDLER(name, operation, kind)                                              \
     static void h_command_buffer_##name(CPU* c, u64 entry) {                                        \
         (void)entry;                                                                                \
-        pm_lock(&objs_lock);                                                                        \
+        objs_lock_take();                                                                        \
         CommandBufferRec* cb = command_buffer(c->x[0], operation);                                  \
         NvnOpStencil op = {(u32)(kind), (u32)c->x[1], (u32)c->x[2], 0};                             \
         if (cb) command_record(cb, c->x[0], operation, NVN_OP_SET_STENCIL, &op, sizeof op);         \
@@ -4395,7 +4412,7 @@ COMMAND_STENCIL_HANDLER(set_stencil_mask, "nvnCommandBufferSetStencilMask", NVN_
 static void h_command_buffer_set_blend_color(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetBlendColor";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) {
         NvnOpBlendColor op;
@@ -4411,7 +4428,7 @@ static void h_command_buffer_set_blend_color(CPU* c, u64 entry) {
 static void h_command_buffer_set_alpha_ref(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetAlphaRef";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpAlphaRef op = {SNX_VS(c->v[0], 0), 0};
     if (cb) command_record(cb, c->x[0], name, NVN_OP_SET_ALPHA_REF, &op, sizeof op);
@@ -4420,7 +4437,7 @@ static void h_command_buffer_set_alpha_ref(CPU* c, u64 entry) {
 static void h_command_buffer_call_commands(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferCallCommands";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     u32 count = (u32)c->x[1];
     if (cb && (int32_t)count > 0) {
@@ -4457,7 +4474,7 @@ static void command_copy_commands(CommandBufferRec* cb, const NvnOpList* src, co
 static void h_command_buffer_copy_commands(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferCopyCommands";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     u32 count = (u32)c->x[1];
     if (cb && (int32_t)count > 0) {
@@ -4483,7 +4500,7 @@ static void h_command_buffer_copy_commands(CPU* c, u64 entry) {
 static void h_command_buffer_copy_buffer_to_buffer(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferCopyBufferToBuffer";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpCopyBuffer op = {c->x[1], c->x[2], c->x[3]};
     if (cb) command_record(cb, c->x[0], name, NVN_OP_COPY_BUFFER, &op, sizeof op);
@@ -4492,7 +4509,7 @@ static void h_command_buffer_copy_buffer_to_buffer(CPU* c, u64 entry) {
 static void h_command_buffer_clear_buffer(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferClearBuffer";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpClearBuffer op = {c->x[1], c->x[2], (u32)c->x[3], 0};
     if (cb) command_record(cb, c->x[0], name, NVN_OP_CLEAR_BUFFER, &op, sizeof op);
@@ -4502,7 +4519,7 @@ static void h_command_buffer_clear_buffer(CPU* c, u64 entry) {
 static void h_command_buffer_clear_depth_stencil(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferClearDepthStencil";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpClearDepthStencil op = {SNX_VS(c->v[0], 0), (u32)c->x[1], (u32)c->x[2], (u32)c->x[3]};
     if (cb) command_record(cb, c->x[0], name, NVN_OP_CLEAR_DEPTH_STENCIL, &op, sizeof op);
@@ -4510,7 +4527,7 @@ static void h_command_buffer_clear_depth_stencil(CPU* c, u64 entry) {
 }
 /* The three ClearTexture calls share these steps; kind says how the color words are read. */
 static void command_clear_texture(CPU* c, const char* operation, uint32_t kind) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], operation);
     NvnOpClearTexture op = {.kind = kind, .mask = (uint32_t)c->x[5]};
     if (!cb) {
@@ -4543,7 +4560,7 @@ static void h_command_buffer_clear_textureui(CPU* c, u64 entry) {
 static void h_command_buffer_copy_texture_to_texture(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferCopyTextureToTexture";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpCopyTexture op = {0};
     if (!cb) {
@@ -4581,7 +4598,7 @@ static void copy_region_fault(void* ctx, const char* what, uint64_t value) {
 /* CopyBufferToTexture and CopyTextureToBuffer share the record. The region and the copy strides are read at call
    time; the words are built at replay. A zero height writes no copy in the library, so no op is recorded. */
 static void command_copy_buffer_texture(CPU* c, const char* operation, int to_texture) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], operation);
     NvnOpCopyBufferTexture op = {0};
     op.to_texture = to_texture ? 1u : 0u;
@@ -4644,7 +4661,7 @@ static void h_command_buffer_copy_texture_to_buffer(CPU* c, u64 entry) {
 }
 /* Downsample and the tiled forms share the record. The view forms take the views; the plain forms pass NULL. */
 static void command_downsample(CPU* c, const char* operation, int tiled, int has_views) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], operation);
     NvnOpDownsample op = {0};
     op.tiled = tiled ? 1u : 0u;
@@ -4681,7 +4698,7 @@ static void h_command_buffer_tiled_downsample_texture_view(CPU* c, u64 entry) {
 static void h_command_buffer_report_counter(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferReportCounter";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpReportCounter op = {(uint32_t)c->x[1], 0, c->x[2]};
     if (cb) {
@@ -4696,7 +4713,7 @@ static void h_command_buffer_report_counter(CPU* c, u64 entry) {
 static void h_command_buffer_report_value(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferReportValue";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpReportValue op = {(uint32_t)c->x[1], 0, c->x[2]};
     if (cb) command_record(cb, c->x[0], name, NVN_OP_REPORT_VALUE, &op, sizeof op);
@@ -4705,7 +4722,7 @@ static void h_command_buffer_report_value(CPU* c, u64 entry) {
 static void h_command_buffer_signal_event(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSignalEvent";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     /* (cb, event, mode, location, flags, value): the library reads location in w3, flags in w4, value in w5. */
     NvnOpSignalEvent op = {c->x[1], 0, (uint32_t)c->x[2], (uint32_t)c->x[5], (uint32_t)c->x[3]};
@@ -4720,7 +4737,7 @@ static void h_command_buffer_signal_event(CPU* c, u64 entry) {
 static void h_command_buffer_wait_event(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferWaitEvent";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpWaitEvent op = {c->x[1], 0, (uint32_t)c->x[2], (uint32_t)c->x[3], 0};
     if (!cb) {
@@ -4734,7 +4751,7 @@ static void h_command_buffer_wait_event(CPU* c, u64 entry) {
 static void h_command_buffer_fence_sync(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferFenceSync";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpFenceSync op = {c->x[1], 0, (uint32_t)c->x[2], (uint32_t)c->x[3] & NVN_QUEUE_FENCE_FLUSH_FOR_CPU};
     if (!cb) {
@@ -4755,7 +4772,7 @@ static void h_command_buffer_fence_sync(CPU* c, u64 entry) {
 static void h_command_buffer_wait_sync(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferWaitSync";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpWaitSync op = {c->x[1], 0, 0};
     if (!cb) {
@@ -4770,7 +4787,7 @@ static void h_command_buffer_wait_sync(CPU* c, u64 entry) {
    compression, so the contents are already resolved and the host adds no barrier. */
 static void h_command_buffer_resolve_depth_buffer(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (command_buffer(c->x[0], "nvnCommandBufferResolveDepthBuffer"))
         LOG_LIMIT(1, "nvn-native: ResolveDepthBuffer: host depth images have no compression, no-op\n");
     pm_unlock(&objs_lock);
@@ -4778,7 +4795,7 @@ static void h_command_buffer_resolve_depth_buffer(CPU* c, u64 entry) {
 /* The library method 0x3DE makes the target contents undefined. Keeping the contents is one allowed result. */
 static void h_command_buffer_discard_color(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (command_buffer(c->x[0], "nvnCommandBufferDiscardColor"))
         LOG_LIMIT(1, "nvn-native: nvnCommandBufferDiscardColor index=%u is a no-op (the contents become undefined)\n",
                   (u32)c->x[1] & 7u);
@@ -4786,7 +4803,7 @@ static void h_command_buffer_discard_color(CPU* c, u64 entry) {
 }
 static void h_command_buffer_discard_depth_stencil(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (command_buffer(c->x[0], "nvnCommandBufferDiscardDepthStencil"))
         LOG_LIMIT(1, "nvn-native: nvnCommandBufferDiscardDepthStencil is a no-op (the contents become undefined)\n");
     pm_unlock(&objs_lock);
@@ -4796,7 +4813,7 @@ static void h_command_buffer_discard_depth_stencil(CPU* c, u64 entry) {
 static void h_command_buffer_update_uniform_buffer(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferUpdateUniformBuffer";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (!cb) {
         pm_unlock(&objs_lock);
@@ -4831,7 +4848,7 @@ static void h_command_buffer_update_uniform_buffer(CPU* c, u64 entry) {
 }
 /* Begin and End record the control address. The words are built at replay (nvn_xfb_words). */
 static void command_xfb(CPU* c, const char* name, NvnXfbKind kind) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpTransformFeedback op = {(uint32_t)kind, 0, c->x[1]};
     if (cb) command_record(cb, c->x[0], name, NVN_OP_TRANSFORM_FEEDBACK, &op, sizeof op);
@@ -4853,7 +4870,7 @@ static void h_command_buffer_resume_transform_feedback(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferResumeTransformFeedback";
     if (c->x[1]) {
-        pm_lock(&objs_lock);
+        objs_lock_take();
         if (command_buffer(c->x[0], name))
             command_refused(c, name, "it reads the byte counts that the GPU writes");
         pm_unlock(&objs_lock);
@@ -4867,13 +4884,13 @@ static void h_command_buffer_set_patch_size(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetPatchSize";
     uint32_t patches = (uint32_t)c->x[1];
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) command_state_record(cb, c->x[0], name, NVN_STATE_PATCH_SIZE, &patches, 1);
     pm_unlock(&objs_lock);
 }
 static void command_set_tessellation_levels(CPU* c, const char* name, NvnStateKind kind, uint32_t count) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) {
         if (!native_guest_readable(c->x[1], (u64)count * sizeof(uint32_t)))
@@ -4900,7 +4917,7 @@ static void h_command_buffer_set_primitive_restart(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetPrimitiveRestart";
     uint32_t words[2] = {(uint32_t)c->x[1], (uint32_t)c->x[2]};
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) command_state_record(cb, c->x[0], name, NVN_STATE_PRIMITIVE_RESTART, words, 2);
     pm_unlock(&objs_lock);
@@ -4909,7 +4926,7 @@ static void h_command_buffer_set_render_enable(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetRenderEnable";
     uint32_t words[NVN_RENDER_ENABLE_STATE_WORDS] = {NVN_RENDER_ENABLE_FORM_VALUE, (uint32_t)c->x[1], 0, 0};
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) command_state_record(cb, c->x[0], name, NVN_STATE_RENDER_ENABLE, words, NVN_RENDER_ENABLE_STATE_WORDS);
     pm_unlock(&objs_lock);
@@ -4919,7 +4936,7 @@ static void h_command_buffer_set_render_enable_conditional(CPU* c, u64 entry) {
     static const char* const name = "nvnCommandBufferSetRenderEnableConditional";
     uint32_t condition = (uint32_t)c->x[1];
     uint64_t sync = c->x[2];
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) {
         if (condition >= NVN_RENDER_ENABLE_CONDITION_COUNT) {
@@ -4937,7 +4954,7 @@ static void h_command_buffer_set_viewport_swizzles(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetViewportSwizzles";
     int32_t count = (int32_t)c->x[2];
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) {
         if (count < 0) {
@@ -4967,7 +4984,7 @@ static void h_command_buffer_set_viewport_swizzles(CPU* c, u64 entry) {
 static void h_command_buffer_set_conservative_raster_enable(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferSetConservativeRasterEnable";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (command_buffer(c->x[0], name)) {
         if ((c->x[1] & 0xFFu) != 0)
             command_refused(c, name, "the host has no conservative rasterization");
@@ -4983,7 +5000,7 @@ static void h_command_buffer_set_conservative_raster_dilate(CPU* c, u64 entry) {
     uint32_t bits = SNX_VS(c->v[0], 0);
     float dilate;
     memcpy(&dilate, &bits, sizeof dilate);
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (command_buffer(c->x[0], name)) {
         if (nvn_conservative_raster_dilate_level(dilate) != 0)
             command_refused(c, name, "the host has no conservative rasterization");
@@ -4996,7 +5013,7 @@ static void h_command_buffer_set_conservative_raster_dilate(CPU* c, u64 entry) {
 static void h_command_buffer_reset_counter(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferResetCounter";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     NvnOpResetCounter op = {(uint32_t)c->x[1], 0};
     uint32_t word;
@@ -5034,7 +5051,7 @@ static void command_bind_image(CommandBufferRec* cb, u64 addr, const char* opera
 static void h_command_buffer_bind_image(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindImage";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb) command_bind_image(cb, c->x[0], name, (uint32_t)c->x[1], (uint32_t)c->x[2], 1, 0, &c->x[3], 0);
     pm_unlock(&objs_lock);
@@ -5042,7 +5059,7 @@ static void h_command_buffer_bind_image(CPU* c, u64 entry) {
 static void h_command_buffer_bind_images(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnCommandBufferBindImages";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     CommandBufferRec* cb = command_buffer(c->x[0], name);
     if (cb)
         command_bind_image(cb, c->x[0], name, (uint32_t)c->x[1], (uint32_t)c->x[2], (int32_t)c->x[3], c->x[4], NULL,
@@ -5069,7 +5086,7 @@ static uint32_t replay_host_read_register(void* ctx, uint32_t m) {
 }
 static const NvnOpList* replay_host_find_list(void* ctx, uint64_t handle) {
     (void)ctx;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnOpList* list = nvn_list_find(&lists, handle);
     pm_unlock(&objs_lock);
     return list;
@@ -5394,7 +5411,7 @@ static uint8_t dispatch_scratch_ready, dispatch_scratch_failed;
 
 /* Allocates the arena at the first dispatch. It takes objs_lock for the shared state of the arena. */
 static int dispatch_scratch_get(uint64_t* gpu) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (!dispatch_scratch_ready && !dispatch_scratch_failed) {
         uint64_t cpu = kmem_alloc(NVN_DISPATCH_SCRATCH_BYTES, MS_STATIC, PERM_RW);
         uint64_t address = nvn_gpu_va_alloc(NVN_DISPATCH_SCRATCH_BYTES, NVN_POOL_PAGE_SIZE);
@@ -5605,7 +5622,7 @@ static int replay_host_descriptor_pool(void* ctx, NvnOpCode op, const NvnOpPool*
     (void)ctx;
     NvnObjKind kind = op == NVN_OP_SET_TEXTURE_POOL ? NVN_OBJ_TEXTURE_POOL : NVN_OBJ_SAMPLER_POOL;
     int ok = 0;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const DescriptorPoolRec* descriptors = nvn_objtab_valid(&objs, pool->pool, pool->generation)
                                                ? known_record(pool->pool, kind) : NULL;
     const MemoryPoolRec* memory = descriptors ? known_record(descriptors->memory_pool, NVN_OBJ_MEMORY_POOL) : NULL;
@@ -5659,7 +5676,7 @@ static int replay_host_targets(const NvnOpRenderTargets* op, NvnTexture textures
                                NvnRtColor* depth) {
     int ok = 1;
     *depth = (NvnRtColor){0};
-    pm_lock(&objs_lock);
+    objs_lock_take();
     for (uint32_t i = 0; ok && i < op->count; i++) {
         const NvnOpTarget* target = &op->color[i];
         color[i] = (NvnRtColor){0};
@@ -5752,7 +5769,7 @@ static u64 replay_event_word(u64 event, uint32_t generation, const char* operati
 /* SignalEvent: the host writes the CPU word. The location only names a stage in the library; the replay is serial. */
 static int replay_host_signal_event(NvnNativeReplayHost* host, const NvnOpSignalEvent* op) {
     (void)host;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const u64 word = replay_event_word(op->event, op->generation, "nvnCommandBufferSignalEvent");
     if (word) {
         uint32_t* at = (uint32_t*)GP(word);
@@ -5765,7 +5782,7 @@ static int replay_host_signal_event(NvnNativeReplayHost* host, const NvnOpSignal
 
 static int replay_host_wait_event(NvnNativeReplayHost* host, const NvnOpWaitEvent* op) {
     (void)host;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const u64 word = replay_event_word(op->event, op->generation, "nvnCommandBufferWaitEvent");
     if (word) {
         const uint32_t value = __atomic_load_n((const uint32_t*)GP(word), __ATOMIC_ACQUIRE);
@@ -5825,7 +5842,7 @@ static int replay_host_clear_texture(NvnNativeReplayHost* host, const NvnOpClear
     }
     NvnTexture texture = {0};
     int found = 0;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const TextureRec* t = op->target.texture &&
                           nvn_objtab_valid(&objs, op->target.texture, op->target.generation)
                               ? known_record(op->target.texture, NVN_OBJ_TEXTURE) : NULL;
@@ -5855,7 +5872,7 @@ static int replay_host_clear_texture(NvnNativeReplayHost* host, const NvnOpClear
 static int replay_host_copy_texture(NvnNativeReplayHost* host, const NvnOpCopyTexture* op) {
     NvnTexture src = {0}, dst = {0};
     int found = 0;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const TextureRec* s = op->src.texture &&
                           nvn_objtab_valid(&objs, op->src.texture, op->src.generation)
                               ? known_record(op->src.texture, NVN_OBJ_TEXTURE) : NULL;
@@ -5891,7 +5908,7 @@ static int replay_host_copy_texture(NvnNativeReplayHost* host, const NvnOpCopyTe
 static int replay_host_copy_buffer_texture(NvnNativeReplayHost* host, const NvnOpCopyBufferTexture* op) {
     NvnTexture texture = {0};
     int found = 0;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const TextureRec* t = op->target.texture &&
                           nvn_objtab_valid(&objs, op->target.texture, op->target.generation)
                               ? known_record(op->target.texture, NVN_OBJ_TEXTURE) : NULL;
@@ -5947,7 +5964,7 @@ static int replay_host_copy_buffer_texture(NvnNativeReplayHost* host, const NvnO
 static int replay_host_downsample(NvnNativeReplayHost* host, const NvnOpDownsample* op) {
     NvnTexture src = {0}, dst = {0};
     int found = 0;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const TextureRec* s = op->src.texture &&
                           nvn_objtab_valid(&objs, op->src.texture, op->src.generation)
                               ? known_record(op->src.texture, NVN_OBJ_TEXTURE) : NULL;
@@ -6075,7 +6092,7 @@ void nvn_native_replay_env(NvnNativeReplayHost* host, int window_origin_flip, Nv
 /* G4: window and sync state stays in host records; guest object bytes stay untouched. */
 #define WINDOW_BUILDER_HANDLER(name, call) \
     static void h_##name(CPU* c, u64 entry) { \
-        (void)entry; pm_lock(&objs_lock); \
+        (void)entry; objs_lock_take(); \
         NvnWindowBuilder* b = rec_get(c->x[0], NVN_OBJ_WINDOW_BUILDER, sizeof *b); \
         call; pm_unlock(&objs_lock); \
     }
@@ -6091,7 +6108,7 @@ WINDOW_BUILDER_HANDLER(window_builder_set_num_active_textures,
 #define WINDOW_BUILDER_GETTER(name, expression)                                 \
     static void h_##name(CPU* c, u64 entry) {                                   \
         (void)entry;                                                           \
-        pm_lock(&objs_lock);                                                   \
+        objs_lock_take();                                                   \
         NvnWindowBuilder* b = rec_get(c->x[0], NVN_OBJ_WINDOW_BUILDER, sizeof *b); \
         c->x[0] = (expression);                                                \
         pm_unlock(&objs_lock);                                                 \
@@ -6105,7 +6122,7 @@ WINDOW_BUILDER_GETTER(window_builder_get_present_interval, nvn_window_builder_pr
 
 static void h_window_builder_get_texture(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnWindowBuilder* b = rec_get(c->x[0], NVN_OBJ_WINDOW_BUILDER, sizeof *b);
     const int32_t index = (int32_t)c->x[1];
     uint64_t at = 0;
@@ -6125,7 +6142,7 @@ static void h_window_builder_get_texture(CPU* c, u64 entry) {
 
 static void h_window_initialize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnWindowBuilder* b = known_record(c->x[1], NVN_OBJ_WINDOW_BUILDER);
     if (!b) {
         LOG("nvn-native: window initialize failed: unknown builder (%llx)\n", (unsigned long long)c->x[1]);
@@ -6165,7 +6182,7 @@ static void h_window_initialize(CPU* c, u64 entry) {
 /* The library frees the image syncs and the native window; the host owns none of them and removes only its record. */
 static void h_window_finalize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (known_record(c->x[0], NVN_OBJ_WINDOW))
         nvn_objtab_remove(&objs, c->x[0]);
     else
@@ -6173,14 +6190,14 @@ static void h_window_finalize(CPU* c, u64 entry) {
     pm_unlock(&objs_lock);
 }
 static void h_window_set_present_interval(CPU* c, u64 entry) {
-    (void)entry; pm_lock(&objs_lock);
+    (void)entry; objs_lock_take();
     WindowRec* w = known_record(c->x[0], NVN_OBJ_WINDOW);
     if (!w) LOG("nvn-native: nvnWindowSetPresentInterval unknown window=%llx\n", (unsigned long long)c->x[0]);
     else w->interval = (u32)c->x[1];
     pm_unlock(&objs_lock);
 }
 static void h_window_set_crop(CPU* c, u64 entry) {
-    (void)entry; pm_lock(&objs_lock);
+    (void)entry; objs_lock_take();
     WindowRec* w = known_record(c->x[0], NVN_OBJ_WINDOW);
     if (!w) { LOG("nvn-native: nvnWindowSetCrop unknown window=%llx\n", (unsigned long long)c->x[0]); pm_unlock(&objs_lock); return; }
     TextureRec* t = known_record(w->textures[0], NVN_OBJ_TEXTURE);
@@ -6194,7 +6211,7 @@ static void h_window_set_crop(CPU* c, u64 entry) {
     pm_unlock(&objs_lock);
 }
 static void h_window_set_num_active_textures(CPU* c, u64 entry) {
-    (void)entry; pm_lock(&objs_lock);
+    (void)entry; objs_lock_take();
     WindowRec* w = known_record(c->x[0], NVN_OBJ_WINDOW);
     if (!w) LOG("nvn-native: nvnWindowSetNumActiveTextures unknown window=%llx\n", (unsigned long long)c->x[0]);
     else w->active_textures = nvn_window_active_textures((u32)c->x[1]);
@@ -6203,7 +6220,7 @@ static void h_window_set_num_active_textures(CPU* c, u64 entry) {
 #define WINDOW_GETTER(name, expression)                                         \
     static void h_##name(CPU* c, u64 entry) {                                   \
         (void)entry;                                                           \
-        pm_lock(&objs_lock);                                                   \
+        objs_lock_take();                                                   \
         const WindowRec* w = known_record(c->x[0], NVN_OBJ_WINDOW);            \
         if (!w) LOG("nvn-native: " #name " unknown window=%llx\n", (unsigned long long)c->x[0]); \
         c->x[0] = w ? (expression) : 0;                                        \
@@ -6218,7 +6235,7 @@ WINDOW_GETTER(window_get_present_interval, w->interval)
 static void h_window_get_crop(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnWindowGetCrop";
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (guest_outputs_writable(c, name, 4)) {
         const WindowRec* w = known_record(c->x[0], NVN_OBJ_WINDOW);
         if (!w)
@@ -6233,7 +6250,7 @@ static void h_window_get_crop(CPU* c, u64 entry) {
     pm_unlock(&objs_lock);
 }
 static void h_sync_initialize(CPU* c, u64 entry) {
-    (void)entry; pm_lock(&objs_lock);
+    (void)entry; objs_lock_take();
     SyncRec* s = rec_get(c->x[0], NVN_OBJ_SYNC, sizeof *s);
     s->device = c->x[1];
     s->state = NVN_SYNC_UNSIGNALED;
@@ -6244,7 +6261,7 @@ static void h_sync_initialize(CPU* c, u64 entry) {
 }
 static void h_sync_finalize(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (known_record(c->x[0], NVN_OBJ_SYNC)) nvn_objtab_remove(&objs, c->x[0]);
     pm_unlock(&objs_lock);
 }
@@ -6270,6 +6287,15 @@ static void h_sync_create_gl_sync(CPU* c, u64 entry) {
 
 enum { NVN_ACQUIRE_OK = 0, NVN_ACQUIRE_FAILED = 1 };
 /* Ends a failed acquire: the operation, the reason, the addresses and the result. objs_lock is held. */
+/* The time this thread's handler waited for the GPU or the present pace. native_call leaves it out of the nvn_measure
+   guest time: on the old path the same waits run in the game's library or in vi.c, not in gpu_submit
+   (nvn-design.md, "Stage 5 measure plan"). */
+static _Thread_local u64 t_handler_wait_ns;
+static u64 handler_wait_start(void) { return g_settings.nvn_measure ? plat_ns() : 0; }
+static void handler_wait_end(u64 start_ns) {
+    if (g_settings.nvn_measure) t_handler_wait_ns += plat_ns() - start_ns;
+}
+
 static void window_acquire_failed(CPU* c, const char* operation, u64 queue_addr, u64 window_addr, u64 sync_addr,
                                   u64 index_addr, const char* reason) {
     LOG("nvn-native: %s failed: %s (queue=%llx window=%llx sync=%llx index=%llx)\n", operation, reason,
@@ -6285,7 +6311,7 @@ static void window_acquire_texture(CPU* c, u64 queue_addr, u64 window_addr, u64 
                                    const char* operation) {
     const int has_queue = queue_addr != 0;
     const int has_sync = !has_queue; /* a window acquire needs its sync, a queue acquire has none */
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const int queue_ok = !has_queue || known_record(queue_addr, NVN_OBJ_QUEUE) != NULL;
     WindowRec* window = known_record(window_addr, NVN_OBJ_WINDOW);
     SyncRec* sync = has_sync ? known_record(sync_addr, NVN_OBJ_SYNC) : NULL;
@@ -6298,8 +6324,10 @@ static void window_acquire_texture(CPU* c, u64 queue_addr, u64 window_addr, u64 
     }
     uint32_t interval = window->interval;
     pm_unlock(&objs_lock);
+    const u64 pace_start = handler_wait_start(); /* the old path paces in vi.c's dequeue, outside gpu_submit */
     present_pace(interval);
-    pm_lock(&objs_lock);
+    handler_wait_end(pace_start);
+    objs_lock_take();
     window = known_record(window_addr, NVN_OBJ_WINDOW);
     sync = has_sync ? known_record(sync_addr, NVN_OBJ_SYNC) : NULL;
     reason = nvn_window_acquire_refusal(1, 1, window != NULL, !has_sync || sync != NULL,
@@ -6312,7 +6340,9 @@ static void window_acquire_texture(CPU* c, u64 queue_addr, u64 window_addr, u64 
     int32_t index = nvn_window_pick_image(window->states, window->texture_count, window->last_index);
     /* A PRESENTED image comes back when its frame job finishes. */
     while (index < 0 && nvn_window_has_presented(window->states, window->texture_count)) {
+        const u64 wait_start = handler_wait_start();
         kthread_wait(&frame_done_cv, &objs_lock, -1);
+        handler_wait_end(wait_start);
         window = known_record(window_addr, NVN_OBJ_WINDOW);
         sync = has_sync ? known_record(sync_addr, NVN_OBJ_SYNC) : NULL;
         reason = nvn_window_acquire_refusal(1, 1, window != NULL, !has_sync || sync != NULL,
@@ -6357,7 +6387,7 @@ static void h_sync_wait(CPU* c, u64 entry) {
     (void)entry;
     const u64 sync_addr = c->x[0];
     const NvnWaitDeadline limit = nvn_wait_deadline(c->x[1], plat_ns());
-    pm_lock(&objs_lock);
+    objs_lock_take();
     SyncRec* sync = known_record(sync_addr, NVN_OBJ_SYNC);
     if (!sync) {
         LOG("nvn-native: nvnSyncWait unknown sync=%llx\n", (unsigned long long)sync_addr);
@@ -6386,13 +6416,17 @@ static void h_sync_wait(CPU* c, u64 entry) {
             result = NVN_SYNC_WAIT_TIMEOUT;
             break;
         }
+        const u64 wait_start = handler_wait_start();
         if (action == NVN_SYNC_ACTION_WAIT_FRAME) {
             kthread_wait(&frame_done_cv, &objs_lock, left);
+            handler_wait_end(wait_start);
         } else {
             const uint32_t id = sync->syncpoint, value = sync->value;
             pm_unlock(&objs_lock);
             syncpt_wait(id, value, left);
-            pm_lock(&objs_lock);
+            /* End the wait first: objs_lock_take counts a blocked take as lock time. */
+            handler_wait_end(wait_start);
+            objs_lock_take();
         }
         waited = 1;
         sync = known_record(sync_addr, NVN_OBJ_SYNC);
@@ -6449,7 +6483,7 @@ static void frame_begin(void) {
 }
 static void frame_read_parts(const FrameJob* job, FrameParts* parts) {
     *parts = (FrameParts){0};
-    pm_lock(&objs_lock);
+    objs_lock_take();
     NvnObj* wo = nvn_objtab_valid(&objs, job->window, job->window_generation) ? nvn_objtab_find(&objs, job->window) : NULL;
     WindowRec* window = wo && wo->kind == NVN_OBJ_WINDOW ? wo->data : NULL;
     if (window) {
@@ -6507,7 +6541,7 @@ static void frame_replay_lists(const FrameJob* job, NvnReplayStats* stats, uint6
     NvnReplayEnv env;
     nvn_native_replay_env(&host, job->window_origin_flip, &env);
     for (uint32_t i = 0; i < job->frame.handle_count; i++) {
-        pm_lock(&objs_lock);
+        objs_lock_take();
         const NvnOpList* list = nvn_list_find(&lists, job->frame.handles[i]);
         pm_unlock(&objs_lock);
         if (!list) {
@@ -6533,7 +6567,7 @@ int nvn_native_selftest_replay(GpuChannel* ch, uint64_t handle, int window_origi
     host->clip_limit = NVN_REPLAY_CLIP_LIMIT;
     NvnReplayEnv env;
     nvn_native_replay_env(host, window_origin_flip, &env);
-    pm_lock(&objs_lock);
+    objs_lock_take();
     const NvnOpList* list = nvn_list_find(&lists, handle);
     pm_unlock(&objs_lock);
     if (!list) {
@@ -6574,7 +6608,7 @@ static int frame_show(const FrameJob* job, const FrameParts* parts) {
     return 1;
 }
 static void frame_finish(FrameJob* job) {
-    pm_lock(&objs_lock);
+    objs_lock_take();
     if (job->kind == NVN_FRAME_PRESENT) {
         NvnObj* wo = nvn_objtab_valid(&objs, job->window, job->window_generation)
                          ? nvn_objtab_find(&objs, job->window) : NULL;
@@ -6614,7 +6648,7 @@ static void frame_line(const FrameJob* job, const NvnReplayStats* stats, int sho
     }
     char causes[256];
     replay_causes_take(causes, sizeof causes);
-    pm_lock(&objs_lock);
+    objs_lock_take();
     uint32_t submitted = frame_submitted_lists, skipped = frame_skipped_lists, acquires = frame_acquires;
     uint32_t unmet_event_waits = frame_unmet_event_waits;
     uint32_t live = nvn_list_live(&lists);
@@ -6677,6 +6711,8 @@ static void frame_run(void* arg) {
     FrameJob* job = arg;
     static uint32_t frame_jobs, flush_jobs; /* only the GPU thread runs the frame jobs */
     const int flush = job->kind == NVN_FRAME_FLUSH;
+    const int measure = g_settings.nvn_measure;
+    u64 measure_t0 = measure ? plat_ns() : 0;
     frame_begin();
     FrameParts parts = {0};
     if (!flush) {
@@ -6690,6 +6726,7 @@ static void frame_run(void* arg) {
     uint32_t dispatch_refusals = 0;
     frame_replay_lists(job, &stats, &dispatches, &dispatch_refusals);
     frame_end(job);
+    if (measure) nvn_measure_native_gpu(plat_ns() - measure_t0);
     int shown = flush ? 0 : frame_show(job, &parts);
     uint32_t list_count = job->frame.handle_count;
     uint32_t fences = job->frame.token_count;
@@ -6830,7 +6867,7 @@ static void h_queue_submit_commands(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnQueueSubmitCommands";
     FrameJob* job = NULL;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     QueueRec* q = queue_rec(c->x[0], name);
     int32_t count = (int32_t)c->x[1];
     if (!q || count <= 0) {
@@ -6890,7 +6927,7 @@ static void h_queue_fence_sync(CPU* c, u64 entry) {
     static const char* const name = "nvnQueueFenceSync";
     const uint32_t flags = (uint32_t)c->x[3];
     FrameJob* job = NULL;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     QueueRec* q = queue_rec(c->x[0], name);
     if (!q) {
         pm_unlock(&objs_lock);
@@ -6945,7 +6982,7 @@ static void h_queue_wait_sync(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnQueueWaitSync";
     const u64 sync_addr = c->x[1];
-    pm_lock(&objs_lock);
+    objs_lock_take();
     QueueRec* q = queue_rec(c->x[0], name);
     const SyncRec* sync = q ? known_record(sync_addr, NVN_OBJ_SYNC) : NULL;
     const int cross = sync && q && sync->state == NVN_SYNC_PENDING && sync->syncpoint != q->channel_id;
@@ -6973,7 +7010,7 @@ static void h_queue_flush(CPU* c, u64 entry) {
     (void)entry;
     static const char* const name = "nvnQueueFlush";
     FrameJob* job = NULL;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     QueueRec* q = queue_rec(c->x[0], name);
     if (q && !nvn_frame_is_empty(&q->pending)) {
         const FrameTarget target = {.kind = NVN_FRAME_FLUSH};
@@ -6990,7 +7027,7 @@ static void h_queue_finish(CPU* c, u64 entry) {
     FrameJob* job = NULL;
     uint32_t id = 0, value = 0;
     int wait = 0;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     QueueRec* q = queue_rec(c->x[0], name);
     if (q && !nvn_frame_is_empty(&q->pending)) {
         const FrameTarget target = {.kind = NVN_FRAME_FLUSH};
@@ -7003,7 +7040,11 @@ static void h_queue_finish(CPU* c, u64 entry) {
     }
     if (job) gpu_call(frame_run, job, NULL, 0);
     pm_unlock(&objs_lock);
-    if (wait) syncpt_wait(id, value, -1);
+    if (wait) {
+        const u64 wait_start = handler_wait_start();
+        syncpt_wait(id, value, -1);
+        handler_wait_end(wait_start);
+    }
 }
 /* QueueFinalize would destroy the queue and its channel; the host keeps the record to the process end. */
 static void h_queue_finalize(CPU* c, u64 entry) {
@@ -7015,7 +7056,7 @@ static void h_queue_finalize(CPU* c, u64 entry) {
    every usage getter refuses with 0 instead of an invented number. */
 static void h_queue_get_error(CPU* c, u64 entry) {
     (void)entry;
-    pm_lock(&objs_lock);
+    objs_lock_take();
     (void)queue_rec(c->x[0], "nvnQueueGetError");
     c->x[0] = 0; /* the host has no channel error notification, and x1 is not written */
     pm_unlock(&objs_lock);
@@ -7024,7 +7065,7 @@ static void h_queue_get_error(CPU* c, u64 entry) {
 #define QUEUE_USAGE_REFUSE_HANDLER(handler, operation)                                             \
     static void h_queue_##handler(CPU* c, u64 entry) {                                             \
         (void)entry;                                                                               \
-        pm_lock(&objs_lock);                                                                       \
+        objs_lock_take();                                                                       \
         if (queue_rec(c->x[0], operation))                                                         \
             LOG_LIMIT(QUEUE_LOG_LIMIT, "nvn-native: %s refused: %s\n", operation, QUEUE_USAGE_REFUSAL); \
         c->x[0] = 0;                                                                               \
@@ -7043,7 +7084,7 @@ static void h_queue_present_texture(CPU* c, u64 entry) {
     static const char* const name = "nvnQueuePresentTexture";
     const u64 queue_addr = c->x[0], window_addr = c->x[1];
     int32_t index = (int32_t)c->x[2];
-    pm_lock(&objs_lock);
+    objs_lock_take();
     QueueRec* q = known_record(queue_addr, NVN_OBJ_QUEUE);
     NvnObj* wo = nvn_objtab_find(&objs, window_addr);
     WindowRec* window = wo && wo->kind == NVN_OBJ_WINDOW ? wo->data : NULL;
@@ -7604,11 +7645,13 @@ static const NativeProc native_procs[] = {
 
 typedef struct {
     u64 addr, calls;
+    u64 wall_ns, lock_ns, gpu_wait_ns, measure_calls; /* the nvn_measure time of the handler, added by native_call */
     GuestFn handler;
     int missing; /* the handler is the missing-function handler */
     char name[128];
 } NativeSlot;
 #define NATIVE_SLOTS 1024 /* the game resolves 523 addresses */
+#define NVN_MEASURE_TOP_HANDLERS 25u /* the handler lines of the nvn measure report */
 static NativeSlot slots[NATIVE_SLOTS];
 static u32 nslots;
 /* Registration takes the lock and publishes a slot (addr, release ordering) once it is filled in. Calls read the slots
@@ -7729,7 +7772,22 @@ static void native_call(CPU* c, u64 entry) {
     NativeSlot* s = slot_find(entry);
     if (!s) fatal("nvn-native: a host handler runs for an address it never registered (%llx)\n", (unsigned long long)entry);
     u64 lr = c->x[30];
+    const int measure = g_settings.nvn_measure;
+    u64 measure_t0 = measure ? plat_ns() : 0;
+    t_handler_wait_ns = 0;
+    if (measure) t_handler_lock_ns = 0;
     s->handler(c, entry);
+    if (measure) {
+        const u64 wall_ns = plat_ns() - measure_t0;
+        const u64 lock_ns = t_handler_lock_ns;
+        const u64 gpu_ns = t_handler_wait_ns;
+        nvn_measure_native_guest(wall_ns - gpu_ns - lock_ns);
+        nvn_measure_native_lock(lock_ns);
+        __atomic_fetch_add(&s->wall_ns, wall_ns, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&s->lock_ns, lock_ns, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&s->gpu_wait_ns, gpu_ns, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&s->measure_calls, 1, __ATOMIC_RELAXED);
+    }
     c->pc = lr;
 }
 
@@ -7866,6 +7924,36 @@ GuestFn nvn_native_handler(const char* name) {
     return missing ? NULL : h;
 }
 
+/* The nvn_measure lines for the handlers, under slots_lock: the NVN_MEASURE_TOP_HANDLERS with the largest wall time,
+   then the totals of all the slots. */
+static void report_measure(void) {
+    u64 walls[NATIVE_SLOTS];
+    u32 top[NVN_MEASURE_TOP_HANDLERS];
+    u64 total_calls = 0, total_wall = 0, total_lock = 0, total_gpu = 0;
+    for (u32 i = 0; i < NATIVE_SLOTS; i++) walls[i] = __atomic_load_n(&slots[i].wall_ns, __ATOMIC_RELAXED);
+    const u32 ntop = nvn_measure_top(walls, NATIVE_SLOTS, top, NVN_MEASURE_TOP_HANDLERS);
+    for (u32 i = 0; i < NATIVE_SLOTS; i++) {
+        total_calls += __atomic_load_n(&slots[i].measure_calls, __ATOMIC_RELAXED);
+        total_wall += walls[i];
+        total_lock += __atomic_load_n(&slots[i].lock_ns, __ATOMIC_RELAXED);
+        total_gpu += __atomic_load_n(&slots[i].gpu_wait_ns, __ATOMIC_RELAXED);
+    }
+    for (u32 n = 0; n < ntop; n++) {
+        const NativeSlot* s = &slots[top[n]];
+        const u64 calls = __atomic_load_n(&s->measure_calls, __ATOMIC_RELAXED);
+        const u64 wall_ns = walls[top[n]];
+        if (!calls) continue;
+        LOG("nvn-measure: handler %s calls=%llu wall_ms=%.3f us_per_call=%.3f lock_ms=%.3f wait_ms=%.3f\n",
+            s->name, (unsigned long long)calls, (double)wall_ns / 1000000.0,
+            (double)wall_ns / (double)calls / 1000.0,
+            (double)__atomic_load_n(&s->lock_ns, __ATOMIC_RELAXED) / 1000000.0,
+            (double)__atomic_load_n(&s->gpu_wait_ns, __ATOMIC_RELAXED) / 1000000.0);
+    }
+    LOG("nvn-measure: handlers total calls=%llu wall_ms=%.3f lock_ms=%.3f wait_ms=%.3f\n",
+        (unsigned long long)total_calls, (double)total_wall / 1000000.0, (double)total_lock / 1000000.0,
+        (double)total_gpu / 1000000.0);
+}
+
 void nvn_native_report(void) {
     if (!active) return;
     pm_lock(&slots_lock);
@@ -7880,5 +7968,6 @@ void nvn_native_report(void) {
         LOG("nvn-native: missing %s %llu\n", slots[i].name, (unsigned long long)calls);
     }
     LOG("nvn-native: %u resolved addresses, %u without a handler, %u of them called\n", nslots, missing, called);
+    if (g_settings.nvn_measure) report_measure();
     pm_unlock(&slots_lock);
 }

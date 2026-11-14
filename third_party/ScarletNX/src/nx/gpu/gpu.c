@@ -30,6 +30,7 @@
 #include "common/utilities/common.h"
 #include "common/utilities/endian.h"
 #include "nx/gpu/gpu.h"
+#include "nx/gpu/nvn_measure.h"
 #include "nx/gpu/nvn_trace.h"
 #include "nx/memory/own.h"
 #include "nx/gpu/maxwell/engines_int.h"
@@ -908,7 +909,10 @@ static int run_pass(i64* wake) {
             SNX_ZONE_VALUE(z, it->chan);
             SNX_ZONE_TEXT(z, "channel %u", it->chan);
             if (g_renderer->stream_run) g_renderer->stream_run(1);
+            const int measure = g_settings.nvn_measure;
+            u64 measure_t0 = measure ? plat_ns() : 0;
             done = run_job(it);
+            if (measure) nvn_measure_old_gpu(plat_ns() - measure_t0);
             if (g_renderer->stream_run) g_renderer->stream_run(0);
             SNX_ZONE_END(z);
         }
@@ -1242,6 +1246,8 @@ void gpu_submit(const void* entries, u32 n, u32 channel, u32 incs, u32 wait_id, 
     GpuScan* s;
     GpuChannel* ch;
     int idle, stale;
+    const int measure = g_settings.nvn_measure;
+    u64 measure_t0 = measure ? plat_ns() : 0;
     if (channel >= GPU_CHANNELS)
         fatal("gpu: a submission on channel %u, past the %u the GPU has\n", channel, GPU_CHANNELS);
     pm_lock(&g_submit_lk);
@@ -1277,6 +1283,7 @@ void gpu_submit(const void* entries, u32 n, u32 channel, u32 incs, u32 wait_id, 
     pm_unlock(&g_qlk);
     g_gpu_submits++;
     pm_unlock(&g_submit_lk);
+    if (measure) nvn_measure_old_guest(plat_ns() - measure_t0);
 }
 GpuChannel* gpu_channel_open(u32 channel) {
     GpuChannel* ch;
