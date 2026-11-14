@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the NXAevora contributors */
 /* The pure part of the draw record (gpu/draw_record.c): the signature of one recorded call, the frame's two fold
-   hashes, the text of a draw, and the signature table. No global state, no I/O, no guest memory. */
+   hashes, the text of a draw, the signature table and the shader hash cache. No global state, no I/O, no guest
+   memory. */
 #ifndef SNX_GPU_DRAW_RECORD_SIG_H
 #define SNX_GPU_DRAW_RECORD_SIG_H
 #include "common/cpu/aarch64/cpu.h"
@@ -67,5 +68,34 @@ void drawrec_table_init(DrawRecTable* t, DrawRecEntry* entries, u32 size);
 /* Stores sig with text, or counts one more of it. 1 when it is in the table, 0 when the table is full (dropped). */
 int drawrec_table_insert(DrawRecTable* t, u64 sig, const char* text);
 const DrawRecEntry* drawrec_table_find(const DrawRecTable* t, u64 sig);
+
+/* One program's hash, kept by its GPU address and kind. checked is the present count of its last memory check. */
+typedef struct DrawRecShaderEntry {
+    u64 gva;
+    u64 hash;
+    u64 gw;      /* gpu_mem_generation() before the code was read */
+    u64 checked; /* rec_frame.frames of the last check */
+    u32 len;     /* guest bytes of the code that the hash covered */
+    u32 wseen;   /* vk_ww_now() before the code was read */
+    u8 used;
+    u8 compute; /* a compute program's key space is separate from a graphics program's */
+} DrawRecShaderEntry;
+
+typedef struct DrawRecShaderCache {
+    DrawRecShaderEntry* entries;
+    u32 size; /* a power of two */
+} DrawRecShaderCache;
+
+/* Makes the caller's array the cache and clears it. size must be a power of two. */
+void drawrec_shader_cache_init(DrawRecShaderCache* c, DrawRecShaderEntry* entries, u32 size);
+/* The entry of gva and kind, NULL when the cache has none. */
+DrawRecShaderEntry* drawrec_shader_cache_find(DrawRecShaderCache* c, u64 gva, int compute);
+/* Stores a program's hash and its baselines. NULL when every slot is taken. */
+DrawRecShaderEntry* drawrec_shader_cache_insert(DrawRecShaderCache* c, u64 gva, int compute, u64 hash, u32 len,
+                                                u64 gw, u32 wseen, u64 frame);
+/* Forgets every program: another one may be at its address now. */
+void drawrec_shader_cache_clear(DrawRecShaderCache* c);
+/* 1 when the entry needs a memory check for this present: it was not checked yet for it. */
+int drawrec_shader_entry_due(const DrawRecShaderEntry* e, u64 frames);
 
 #endif

@@ -31,13 +31,8 @@
 #define DRAWREC_SHADER_CACHE 4096u
 /* presents between two writes of the signature file */
 #define DRAWREC_TABLE_WRITE_FRAMES 600u
-
-typedef struct {
-    u64 gva;
-    u64 hash;
-    u8 used;
-    u8 compute; /* a compute program's key space is separate from a graphics program's */
-} RecShaderEntry;
+/* renderer.h's method_barrier kind that invalidates the shader instruction cache (engines.c:30, compute.c:20) */
+#define DRAWREC_BARRIER_SHADER_INSTRUCTIONS 5
 
 static const Renderer* rec_next; /* the backend the wrappers forward to */
 static Renderer rec_renderer;    /* the copy that g_renderer points at */
@@ -51,8 +46,11 @@ static char rec_sigs_tmp[sizeof g_exedir + sizeof g_exename + 72];
 static FILE* rec_frames_file;
 
 static DrawRecTable rec_table;
-static RecShaderEntry rec_shader_cache[DRAWREC_SHADER_CACHE];
+static DrawRecShaderCache rec_shader_cache; /* the programs' hashes, by GPU address and kind */
+static DrawRecShaderEntry rec_shader_entries[DRAWREC_SHADER_CACHE];
 static u64 rec_shader_uncached; /* programs hashed when the shader cache was full */
+static u64 rec_shader_rehashed; /* cached programs hashed again to a new hash */
+static u64 rec_shader_rehashed_logged; /* rehashed at the last log line */
 
 static struct {
     u64 counts[DRAWREC_KIND_COUNT];
@@ -73,18 +71,18 @@ static void rec_turn_off(const char* path, const char* why) {
 }
 
 /* The hash of the program at gva, read as the backend reads code (gmem_read_code: zeros past the last mapped page, as
-   a program can end next to an unmapped one). rec_lock guards the buffer. Lock order: rec_lock, then g_xlate_lock
-   and the guest memory hooks. */
-static u64 rec_hash_code(u64 gva) {
+   a program can end next to an unmapped one). len is the guest bytes of its code. rec_lock guards the buffer. Lock
+   order: rec_lock, then g_xlate_lock and the guest memory hooks. */
+static u64 rec_hash_code(u64 gva, u32* len) {
     static u8 code[DRAWREC_SHADER_WINDOW];
-    u32 len = 0;
     gmem_read_code(gva, code, DRAWREC_SHADER_WINDOW);
-    return vk_shader_hash(code, DRAWREC_SHADER_WINDOW, &len, NULL);
+    return vk_shader_hash(code, DRAWREC_SHADER_WINDOW, len, NULL);
 }
 
 /* Copies the compute program at gva as cs_read_code does (vk/compute.c:764): zeros in the NVN header's place, then
-   the code, bounded by a valid header 0x100 bytes before it. rec_lock guards the buffer. */
-static void rec_read_compute_code(u64 gva, u8* dst) {
+   the code, bounded by a valid header 0x100 bytes before it. Returns the bytes of code it read. rec_lock guards
+   the buffer. */
+static u32 rec_read_compute_code(u64 gva, u8* dst) {
     u32 size = DRAWREC_COMPUTE_WINDOW;
     if (gva >= DRAWREC_COMPUTE_HEADER_OFF) {
         const u8* header = gmem_ptr_untracked(gva - DRAWREC_COMPUTE_HEADER_OFF, 8);
@@ -97,39 +95,57 @@ static void rec_read_compute_code(u64 gva, u8* dst) {
     }
     memset(dst, 0, DRAWREC_COMPUTE_PREFIX + DRAWREC_COMPUTE_WINDOW);
     gmem_read_code(gva, dst + DRAWREC_COMPUTE_PREFIX, size);
+    return size;
 }
 
-/* The hash of the compute program at gva, over the window that cs_pipe hashes (vk/compute.c:642). rec_lock guards
-   the buffer. */
-static u64 rec_hash_compute(u64 gva) {
+/* The hash of the compute program at gva, over the window that cs_pipe hashes (vk/compute.c:642). len is the guest
+   bytes of its code, the buffer's zero prefix left out. rec_lock guards the buffer. */
+static u64 rec_hash_compute(u64 gva, u32* len) {
     static u8 code[DRAWREC_COMPUTE_PREFIX + DRAWREC_COMPUTE_WINDOW];
-    u32 len = 0;
-    rec_read_compute_code(gva, code);
-    return vk_shader_hash(code, DRAWREC_COMPUTE_PREFIX + DRAWREC_COMPUTE_WINDOW, &len, NULL);
+    u32 size = rec_read_compute_code(gva, code), hashed = 0;
+    u64 h = vk_shader_hash(code, DRAWREC_COMPUTE_PREFIX + DRAWREC_COMPUTE_WINDOW, &hashed, NULL);
+    *len = hashed > DRAWREC_COMPUTE_PREFIX ? hashed - DRAWREC_COMPUTE_PREFIX : size;
+    return h;
 }
 
-/* the program's hash, from the cache when it has it. Called with rec_lock held: a miss reads guest memory. */
+/* The backend's check of a program (vk/pipeline.c:399): 1 when no write on either side touched its code since the
+   baselines. vk_written_since's -1 (no tracking or no host pointer) counts as a change. Called with rec_lock held. */
+static int rec_shader_unchanged(u64 gva, u32 len, u64 gw, u32 wseen) {
+    if (!len) return 0;
+    if (gpu_mem_dirty_since(gw, gva, len)) return 0;
+    return vk_written_since(gmem_ptr(gva, len), len, wseen) == 0;
+}
+
+/* The program's hash, from the cache when it has it. Called with rec_lock held: a check or a miss reads guest memory.
+   An entry is checked at most once for each present. */
 static u64 rec_shader_hash(u64 gva, int compute) {
-    u32 mask = DRAWREC_SHADER_CACHE - 1, at = (u32)(((gva >> 8) ^ (gva >> 20) ^ (gva >> 32)) & mask), probe;
-    u32 free_at = mask + 1;
-    u64 h;
-    for (probe = 0; probe < DRAWREC_SHADER_CACHE; probe++) {
-        RecShaderEntry* e = &rec_shader_cache[(at + probe) & mask];
-        if (e->used && e->gva == gva && e->compute == compute) return e->hash;
-        if (!e->used) {
-            free_at = (at + probe) & mask;
-            break;
+    DrawRecShaderEntry* e = drawrec_shader_cache_find(&rec_shader_cache, gva, compute);
+    u64 gw, h;
+    u32 wseen, len;
+    if (e) {
+        if (!drawrec_shader_entry_due(e, rec_frame.frames)) return e->hash;
+        wseen = vk_ww_now();
+        gw = gpu_mem_generation();
+        if (rec_shader_unchanged(gva, e->len, e->gw, e->wseen)) {
+            e->checked = rec_frame.frames;
+            e->gw = gw;
+            e->wseen = wseen;
+            return e->hash;
         }
-    }
-    h = compute ? rec_hash_compute(gva) : rec_hash_code(gva);
-    if (free_at > mask) {
-        rec_shader_uncached++;
+        h = compute ? rec_hash_compute(gva, &len) : rec_hash_code(gva, &len);
+        if (h != e->hash) rec_shader_rehashed++;
+        e->hash = h;
+        e->len = len;
+        e->gw = gw;
+        e->wseen = wseen;
+        e->checked = rec_frame.frames;
         return h;
     }
-    rec_shader_cache[free_at].used = 1;
-    rec_shader_cache[free_at].gva = gva;
-    rec_shader_cache[free_at].hash = h;
-    rec_shader_cache[free_at].compute = (u8)compute;
+    wseen = vk_ww_now();
+    gw = gpu_mem_generation();
+    h = compute ? rec_hash_compute(gva, &len) : rec_hash_code(gva, &len);
+    if (!drawrec_shader_cache_insert(&rec_shader_cache, gva, compute, h, len, gw, wseen, rec_frame.frames))
+        rec_shader_uncached++;
     return h;
 }
 
@@ -162,7 +178,7 @@ typedef struct {
 /* writes the signature file through a temporary file and a rename. The record turns off when a write fails. */
 static void rec_write_sigs(void) {
     RecSnapEntry* snap = NULL;
-    u64 frames, dropped, uncached;
+    u64 frames, dropped, uncached, rehashed;
     u32 used = 0, i, n = 0;
     char why[256] = "";
     int ok = 1;
@@ -172,6 +188,7 @@ static void rec_write_sigs(void) {
     frames = rec_frame.frames;
     dropped = rec_table.dropped;
     uncached = rec_shader_uncached;
+    rehashed = rec_shader_rehashed;
     used = rec_table.used;
     if (used) {
         snap = malloc((size_t)used * sizeof *snap);
@@ -218,6 +235,10 @@ static void rec_write_sigs(void) {
         ok = 0;
     }
     if (!ok) remove(rec_sigs_tmp);
+    if (ok && rehashed != rec_shader_rehashed_logged) {
+        LOG("draw record: %llu shader programs hashed again with a new hash\n", (unsigned long long)rehashed);
+        rec_shader_rehashed_logged = rehashed;
+    }
     free(snap);
     pm_unlock(&rec_sig_lock);
     if (!ok) rec_turn_off(rec_sigs_path, why);
@@ -382,6 +403,22 @@ static void rec_present(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout, u32 b
     rec_next->present_buffer(cpu_addr, w, h, pitch, layout, bhl, fmt, crop, transform);
 }
 
+static void rec_method_barrier(int kind) {
+    rec_next->method_barrier(kind);
+    if (kind != DRAWREC_BARRIER_SHADER_INSTRUCTIONS) return;
+    /* the backend dropped its address shortcuts: another program may be at every cached address now */
+    pm_lock(&rec_lock);
+    drawrec_shader_cache_clear(&rec_shader_cache);
+    pm_unlock(&rec_lock);
+}
+
+static void rec_reset(void) {
+    rec_next->reset();
+    pm_lock(&rec_lock);
+    drawrec_shader_cache_clear(&rec_shader_cache);
+    pm_unlock(&rec_lock);
+}
+
 void draw_record_init(void) {
     DrawRecEntry* entries;
     if (!g_settings.nvn_draw_record || !g_renderer) return;
@@ -391,6 +428,7 @@ void draw_record_init(void) {
         return;
     }
     drawrec_table_init(&rec_table, entries, DRAWREC_TABLE_SIZE);
+    drawrec_shader_cache_init(&rec_shader_cache, rec_shader_entries, DRAWREC_SHADER_CACHE);
     snprintf(rec_frames_path, sizeof rec_frames_path, "%s%s.drawrec%u.frames.txt", g_exedir, g_exename,
              (unsigned)g_settings.nvn_native);
     snprintf(rec_sigs_path, sizeof rec_sigs_path, "%s%s.drawrec%u.sigs.txt", g_exedir, g_exename,
@@ -415,6 +453,8 @@ void draw_record_init(void) {
     if (rec_next->blit_mem) rec_renderer.blit_mem = rec_blit_mem;
     if (rec_next->dispatch) rec_renderer.dispatch = rec_dispatch;
     if (rec_next->present_buffer) rec_renderer.present_buffer = rec_present;
+    if (rec_next->method_barrier) rec_renderer.method_barrier = rec_method_barrier;
+    if (rec_next->reset) rec_renderer.reset = rec_reset;
     __atomic_store_n(&rec_on, 1, __ATOMIC_RELAXED);
     g_renderer = &rec_renderer;
     LOG("draw record: on, %s and %s\n", rec_frames_path, rec_sigs_path);

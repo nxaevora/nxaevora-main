@@ -326,3 +326,53 @@ const DrawRecEntry* drawrec_table_find(const DrawRecTable* t, u64 sig) {
     }
     return NULL;
 }
+
+/* the probe start of a program: its address words through a shift and xor, keyed by its kind at the entry */
+static u32 shader_cache_slot(const DrawRecShaderCache* c, u64 gva) {
+    return (u32)(((gva >> 8) ^ (gva >> 20) ^ (gva >> 32)) & (c->size - 1));
+}
+
+void drawrec_shader_cache_init(DrawRecShaderCache* c, DrawRecShaderEntry* entries, u32 size) {
+    c->entries = entries;
+    c->size = size;
+    if (entries) memset(entries, 0, (size_t)size * sizeof *entries);
+}
+
+DrawRecShaderEntry* drawrec_shader_cache_find(DrawRecShaderCache* c, u64 gva, int compute) {
+    u32 first, probe;
+    if (!c || !c->entries || !c->size) return NULL;
+    first = shader_cache_slot(c, gva);
+    for (probe = 0; probe < c->size; probe++) {
+        DrawRecShaderEntry* e = &c->entries[(first + probe) & (c->size - 1)];
+        if (!e->used) return NULL;
+        if (e->gva == gva && e->compute == compute) return e;
+    }
+    return NULL;
+}
+
+DrawRecShaderEntry* drawrec_shader_cache_insert(DrawRecShaderCache* c, u64 gva, int compute, u64 hash, u32 len,
+                                                u64 gw, u32 wseen, u64 frame) {
+    u32 first, probe;
+    if (!c || !c->entries || !c->size) return NULL;
+    first = shader_cache_slot(c, gva);
+    for (probe = 0; probe < c->size; probe++) {
+        DrawRecShaderEntry* e = &c->entries[(first + probe) & (c->size - 1)];
+        if (e->used) continue;
+        e->used = 1;
+        e->gva = gva;
+        e->compute = (u8)compute;
+        e->hash = hash;
+        e->len = len;
+        e->gw = gw;
+        e->wseen = wseen;
+        e->checked = frame;
+        return e;
+    }
+    return NULL;
+}
+
+void drawrec_shader_cache_clear(DrawRecShaderCache* c) {
+    if (c && c->entries) memset(c->entries, 0, (size_t)c->size * sizeof *c->entries);
+}
+
+int drawrec_shader_entry_due(const DrawRecShaderEntry* e, u64 frames) { return e->checked != frames; }

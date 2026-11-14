@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the NXAevora contributors */
 /* The pure part of the draw record (gpu/draw_record_sig.c): each kind's signature from the register file, the leaving
-   out of the address words, the frame's two hashes, the text's limit and the signature table. */
+   out of the address words, the frame's two hashes, the text's limit, the signature table and the shader hash
+   cache. */
 #include "nx/gpu/draw_record_sig.h"
 #include "nx/gpu/maxwell/kepler_compute_regs.h"
 #include "nx/gpu/maxwell/maxwell_3d_regs.h"
@@ -450,6 +451,59 @@ static void test_text(void) {
     CHECK(small[0] == 'x');
 }
 
+static void test_shader_cache(void) {
+    DrawRecShaderEntry entries[4];
+    DrawRecShaderCache c;
+    DrawRecShaderEntry* e;
+    drawrec_shader_cache_init(&c, entries, 4);
+    CHECK(drawrec_shader_cache_find(&c, 0x1000, 0) == NULL);
+    e = drawrec_shader_cache_insert(&c, 0x1000, 0, 0xAA, 88, 1, 2, 1);
+    CHECK(e != NULL && e->hash == 0xAA && e->len == 88 && e->gw == 1 && e->wseen == 2 && e->checked == 1);
+
+    /* a compute program at the same address is another entry */
+    e = drawrec_shader_cache_insert(&c, 0x1000, 1, 0xBB, 96, 3, 4, 1);
+    CHECK(e != NULL);
+    e = drawrec_shader_cache_find(&c, 0x1000, 0);
+    CHECK(e != NULL && e->hash == 0xAA);
+    e = drawrec_shader_cache_find(&c, 0x1000, 1);
+    CHECK(e != NULL && e->hash == 0xBB);
+    CHECK(drawrec_shader_cache_find(&c, 0x1004, 0) == NULL);
+
+    /* two addresses with the same probe start are both found */
+    drawrec_shader_cache_clear(&c);
+    CHECK(drawrec_shader_cache_insert(&c, 0x1000, 0, 0x11, 88, 1, 2, 1) != NULL);
+    CHECK(drawrec_shader_cache_insert(&c, 0x2000, 0, 0x22, 88, 1, 2, 1) != NULL);
+    e = drawrec_shader_cache_find(&c, 0x2000, 0);
+    CHECK(e != NULL && e->hash == 0x22);
+    e = drawrec_shader_cache_find(&c, 0x1000, 0);
+    CHECK(e != NULL && e->hash == 0x11);
+
+    /* the fifth program has no room in a cache of four */
+    drawrec_shader_cache_clear(&c);
+    CHECK(drawrec_shader_cache_insert(&c, 0x0000, 0, 1, 88, 1, 2, 1) != NULL);
+    CHECK(drawrec_shader_cache_insert(&c, 0x0100, 0, 2, 88, 1, 2, 1) != NULL);
+    CHECK(drawrec_shader_cache_insert(&c, 0x0200, 0, 3, 88, 1, 2, 1) != NULL);
+    CHECK(drawrec_shader_cache_insert(&c, 0x0300, 0, 4, 88, 1, 2, 1) != NULL);
+    CHECK(drawrec_shader_cache_insert(&c, 0x0400, 0, 5, 88, 1, 2, 1) == NULL);
+    CHECK(drawrec_shader_cache_find(&c, 0x0400, 0) == NULL);
+
+    /* clear forgets every program and makes the cache usable again */
+    drawrec_shader_cache_clear(&c);
+    CHECK(drawrec_shader_cache_find(&c, 0x0000, 0) == NULL);
+    CHECK(drawrec_shader_cache_find(&c, 0x0300, 0) == NULL);
+    CHECK(drawrec_shader_cache_insert(&c, 0x0400, 0, 5, 88, 1, 2, 1) != NULL);
+    e = drawrec_shader_cache_find(&c, 0x0400, 0);
+    CHECK(e != NULL && e->hash == 5);
+}
+
+static void test_shader_entry_due(void) {
+    DrawRecShaderEntry e;
+    memset(&e, 0, sizeof e);
+    e.checked = 7;
+    CHECK(drawrec_shader_entry_due(&e, 8) == 1);
+    CHECK(drawrec_shader_entry_due(&e, 7) == 0);
+}
+
 int main(void) {
     test_draw_signature();
     test_draw_target_words();
@@ -467,6 +521,8 @@ int main(void) {
     test_frame_hashes();
     test_table();
     test_text();
+    test_shader_cache();
+    test_shader_entry_due();
     if (failures) {
         printf("%d failure(s)\n", failures);
         return 1;
