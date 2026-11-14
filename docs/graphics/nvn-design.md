@@ -1260,3 +1260,18 @@ Each handler holds `objs_lock` for the whole call. The `GPU` thread takes it for
 `frame_replay_lists`, per op in the `replay_host_*` callbacks, and in `frame_read_parts`, `frame_finish` and `frame_line`.
 To find which of them makes the handlers wait, `nvn_measure=1` now records the holder at each blocked take (the
 `nvn-measure: lock` and `holder` lines). The result of a run and the split design follow here.
+
+Run of 2026-11-14 (`3eac584` code, update program, field and a battle, 193 s, clean exit):
+
+- Game threads: 5.76 million blocked takes of 35.75 million handler calls (16%), 11612 ms of wait. 11611 ms of it was
+  held by a handler on another game thread, 1.3 ms by the `GPU` thread. 12 threads ran a handler.
+- `GPU` thread: 1259 blocked takes, 135 ms, nearly all held by a handler. The `GPU` thread is not the cause.
+- A blocked take waits about 2 us on average, longer than the hold of the most called handlers (0.7 to 1.4 us). So the
+  cost is many short collisions of the game's recording threads, not a few long holds.
+- The 10 largest holders (8.7 s of the 11.6 s): `nvnCommandBufferCallCommands` (2715 ms), `AddControlMemory` (1259 ms),
+  `AddCommandMemory` (1182 ms), `BindBlendState` (757 ms), `nvnBufferMap` (708 ms), `SetStencilRef` (600 ms),
+  `SetRenderTargets` (455 ms), `BindProgram` (342 ms), `EndRecording` (334 ms), `nvnMemoryPoolInitialize` (308 ms,
+  494 us per call). All but `nvnBufferMap` and `nvnMemoryPoolInitialize` are command buffer handlers.
+
+Conclusion: the game records different command buffers on many threads at the same time, and the one global lock makes
+them run one after the other. A split must let the handlers of different command buffers run at the same time.
