@@ -1865,22 +1865,8 @@ static void* known_record(u64 addr, NvnObjKind kind) {
 #define PROGRAM_HEADER_CB_OFFSET 0x700u
 #define PROGRAM_HEADER_CODE_OFFSET 0x708u
 #define PROGRAM_HEADER_VALUE_OFFSET 0x70Cu
-#define PROGRAM_COMPUTE_6F8_OFFSET 0x6F8u
-#define PROGRAM_COMPUTE_6FC_OFFSET 0x6FCu
-#define PROGRAM_COMPUTE_710_OFFSET 0x710u
-#define PROGRAM_COMPUTE_718_OFFSET 0x718u
-#define PROGRAM_COMPUTE_71C_OFFSET 0x71Cu
-#define PROGRAM_COMPUTE_720_OFFSET 0x720u
-#define PROGRAM_COMPUTE_724_OFFSET 0x724u
-#define PROGRAM_COMPUTE_728_OFFSET 0x728u
-#define PROGRAM_COMPUTE_72C_OFFSET 0x72Cu
-#define PROGRAM_COMPUTE_730_OFFSET 0x730u
-#define PROGRAM_COMPUTE_734_OFFSET 0x734u
-#define PROGRAM_COMPUTE_750_OFFSET 0x750u
-#define PROGRAM_COMPUTE_754_OFFSET 0x754u
-#define PROGRAM_COMPUTE_FLAG_769_OFFSET 0x769u
-#define PROGRAM_COMPUTE_FLAG_76A_OFFSET 0x76Au
-#define PROGRAM_COMPUTE_FLAG_76B_OFFSET 0x76Bu
+#define PROGRAM_HEADER_LAYOUT_OFFSET 0x8u
+#define PROGRAM_COMPUTE_HEADER_COPY_BYTES 0x834u /* 0x833 rounded up to a word */
 #define PROGRAM_FRAGMENT_G148_OFFSET 0x718u
 #define PROGRAM_FRAGMENT_G150_OFFSET 0x719u
 #define PROGRAM_FRAGMENT_G158_OFFSET 0x71Au
@@ -1973,51 +1959,36 @@ static int program_read_stage_in(const ProgramStageRec* rec, NvnProgramStageIn* 
 static uint8_t program_guest_byte(u64 addr) { return (uint8_t)(gr32(addr) & 0xffu); }
 
 /* Caller holds objs_lock. program_read_stage_in checked that the header is readable. */
+/* The library stores these nine fragment bytes as 0 or 1 (d837c64). */
 static void program_read_fragment_in(u64 header, NvnProgramFragmentIn* out) {
-    out->g148 = program_guest_byte(header + PROGRAM_FRAGMENT_G148_OFFSET);
-    out->g150 = program_guest_byte(header + PROGRAM_FRAGMENT_G150_OFFSET);
-    out->g158 = program_guest_byte(header + PROGRAM_FRAGMENT_G158_OFFSET);
-    out->g160 = program_guest_byte(header + PROGRAM_FRAGMENT_G160_OFFSET);
-    out->g168 = program_guest_byte(header + PROGRAM_FRAGMENT_G168_OFFSET);
-    out->g170 = program_guest_byte(header + PROGRAM_FRAGMENT_G170_OFFSET);
-    out->g178 = program_guest_byte(header + PROGRAM_FRAGMENT_G178_OFFSET);
-    out->g180 = program_guest_byte(header + PROGRAM_FRAGMENT_G180_OFFSET);
-    out->g188 = program_guest_byte(header + PROGRAM_FRAGMENT_G188_OFFSET);
+    out->g148 = program_guest_byte(header + PROGRAM_FRAGMENT_G148_OFFSET) != 0 ? 1u : 0u;
+    out->g150 = program_guest_byte(header + PROGRAM_FRAGMENT_G150_OFFSET) != 0 ? 1u : 0u;
+    out->g158 = program_guest_byte(header + PROGRAM_FRAGMENT_G158_OFFSET) != 0 ? 1u : 0u;
+    out->g160 = program_guest_byte(header + PROGRAM_FRAGMENT_G160_OFFSET) != 0 ? 1u : 0u;
+    out->g168 = program_guest_byte(header + PROGRAM_FRAGMENT_G168_OFFSET) != 0 ? 1u : 0u;
+    out->g170 = program_guest_byte(header + PROGRAM_FRAGMENT_G170_OFFSET) != 0 ? 1u : 0u;
+    out->g178 = program_guest_byte(header + PROGRAM_FRAGMENT_G178_OFFSET) != 0 ? 1u : 0u;
+    out->g180 = program_guest_byte(header + PROGRAM_FRAGMENT_G180_OFFSET) != 0 ? 1u : 0u;
+    out->g188 = program_guest_byte(header + PROGRAM_FRAGMENT_G188_OFFSET) != 0 ? 1u : 0u;
     out->g190 = gr32(header + PROGRAM_FRAGMENT_G190_OFFSET);
     out->g198 = gr32(header + PROGRAM_FRAGMENT_G198_OFFSET);
     for (uint32_t i = 0; i < PROGRAM_FRAGMENT_G1A0_WORDS; i++)
         out->g1a0[i] = gr32(header + PROGRAM_FRAGMENT_G1A0_OFFSET + (u64)i * 4u);
 }
 
-/* Caller holds objs_lock. Reads the compute words. The flags word is three bytes, each its bit 0; the upper bits are
-   0 because the library leaves the rest of the word as stack content. */
+/* Caller holds objs_lock. Copies the compute header to a host buffer and reads the words at the library offsets, so
+   that only the bytes of the layout are touched. */
 static int program_read_compute_in(const ProgramStageRec* rec, NvnProgramComputeIn* out) {
-    if (!native_guest_readable(rec->header, PROGRAM_BUILD_HEADER_BYTES)) return 0;
-    uint32_t d = (uint32_t)rec->entry_word;
-    out->code_offset = (uint32_t)(gr32(rec->header + PROGRAM_HEADER_CODE_OFFSET) + d);
-    out->cb_offset = (uint32_t)(gr32(rec->header + PROGRAM_HEADER_CB_OFFSET) + d);
-    out->h6fc = gr32(rec->header + PROGRAM_COMPUTE_6FC_OFFSET);
-    out->h710 = gr32(rec->header + PROGRAM_COMPUTE_710_OFFSET);
-    out->h70c = gr32(rec->header + PROGRAM_HEADER_VALUE_OFFSET);
-    out->h718 = gr32(rec->header + PROGRAM_COMPUTE_718_OFFSET);
-    out->h71c = gr32(rec->header + PROGRAM_COMPUTE_71C_OFFSET);
-    out->h720 = gr32(rec->header + PROGRAM_COMPUTE_720_OFFSET);
-    out->h724 = gr32(rec->header + PROGRAM_COMPUTE_724_OFFSET);
-    out->h728 = gr32(rec->header + PROGRAM_COMPUTE_728_OFFSET);
-    out->h72c = gr32(rec->header + PROGRAM_COMPUTE_72C_OFFSET);
-    out->h730 = gr32(rec->header + PROGRAM_COMPUTE_730_OFFSET);
-    out->h734 = gr32(rec->header + PROGRAM_COMPUTE_734_OFFSET);
-    out->h6f8 = gr32(rec->header + PROGRAM_COMPUTE_6F8_OFFSET);
-    out->h750_low = gr32(rec->header + PROGRAM_COMPUTE_750_OFFSET);
-    out->h750_high = gr32(rec->header + PROGRAM_COMPUTE_754_OFFSET);
-    out->flags = 0;
-    if (program_guest_byte(rec->header + PROGRAM_COMPUTE_FLAG_769_OFFSET) & 1u)
-        out->flags |= NVN_PROGRAM_COMPUTE_FLAG_0;
-    if (program_guest_byte(rec->header + PROGRAM_COMPUTE_FLAG_76A_OFFSET) & 1u)
-        out->flags |= NVN_PROGRAM_COMPUTE_FLAG_1;
-    if (program_guest_byte(rec->header + PROGRAM_COMPUTE_FLAG_76B_OFFSET) & 1u)
-        out->flags |= NVN_PROGRAM_COMPUTE_FLAG_2;
-    return 1;
+    const uint32_t layout = gr32(rec->header + PROGRAM_HEADER_LAYOUT_OFFSET);
+    const uint32_t bytes = nvn_program_compute_header_bytes(layout);
+    const uint32_t copy_bytes = (bytes + 3u) & ~3u; /* the last gr32 reads a whole word */
+    if (!bytes || !native_guest_readable(rec->header, copy_bytes)) return 0;
+    uint8_t header[PROGRAM_COMPUTE_HEADER_COPY_BYTES];
+    for (uint32_t at = 0; at < copy_bytes; at += 4u) {
+        uint32_t word = gr32(rec->header + at);
+        memcpy(header + at, &word, sizeof word);
+    }
+    return nvn_program_compute_in_from_header(header, bytes, (uint32_t)rec->entry_word, out);
 }
 
 /* nvnProgramInitialize(prog, device): the host keeps the device link and writes nothing into the game memory. */

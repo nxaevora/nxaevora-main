@@ -812,7 +812,7 @@ int nvn_program_unsupported_stage(uint32_t stage_mask);
 uint32_t nvn_bind_program_words(uint32_t program_mask, const uint32_t* program_words, uint32_t program_word_count,
                                 uint32_t* out_words);
 
-/* The flag bits of the compute word 16: bit n is (byte at h+0x769+n) & 1, the upper bits are 0. */
+/* The flag bits of the compute word 16: bit n is (byte at h+0x830+n) & 1, only for layout 13 and above. */
 #define NVN_PROGRAM_COMPUTE_FLAG_0 0x1u
 #define NVN_PROGRAM_COMPUTE_FLAG_1 0x2u
 #define NVN_PROGRAM_COMPUTE_FLAG_2 0x4u
@@ -825,14 +825,23 @@ typedef struct {
 
 /* The stage 5 (compute) words. The builder copies them unchanged: they are raw offsets, not region addresses. */
 typedef struct {
-    uint32_t code_offset; /* word 0: h+0x708 + d, u32 wrap */
-    uint32_t cb_offset;   /* word 1: h+0x700 + d, u32 wrap */
-    uint32_t h6fc, h710, h70c;
-    uint32_t h718, h71c, h720, h724, h728, h72c, h730, h734; /* words 5 to 12 */
-    uint32_t h6f8;            /* word 13 */
-    uint32_t h750_low;        /* word 14 */
-    uint32_t h750_high;       /* word 15 */
-    uint32_t flags;           /* word 16: bits 0 to 2, see the flag constants */
+    uint32_t code_offset;  /* word 0: h+0x708 + d, u32 wrap */
+    uint32_t cb_offset;    /* word 1: h+0x700 + d, u32 wrap */
+    uint32_t h6fc;         /* word 2: h+0x6fc */
+    uint32_t h710;         /* word 3: h+0x710 */
+    uint32_t h70c;         /* word 4: h+0x70c */
+    uint32_t block_x;      /* word 5: h+0x748 */
+    uint32_t block_y;      /* word 6: h+0x74c */
+    uint32_t block_z;      /* word 7: h+0x750 */
+    uint32_t shared_bytes; /* word 8: h+0x754 */
+    uint32_t local_pos;    /* word 9: h+0x758 */
+    uint32_t local_neg;    /* word 10: h+0x75c */
+    uint32_t local_crs;    /* word 11: h+0x760 */
+    uint32_t barriers;     /* word 12: h+0x764 */
+    uint32_t h6f8;         /* word 13: h+0x6f8 */
+    uint32_t h778_low;     /* word 14: low u32 of h+0x778 */
+    uint32_t h778_high;    /* word 15: high u32 of h+0x778 */
+    uint32_t flags;        /* word 16: bits 0 to 2, see the flag constants */
 } NvnProgramComputeIn;
 
 /* The stage 5 (compute) dispatch inputs and outputs that the host builds: the launch description (QMD) and the
@@ -911,6 +920,12 @@ int nvn_program_build_words(const NvnProgramComputeIn* compute, const NvnProgram
 /* Reverses program_build_compute: fills *out from an 18-word compute block. Returns 0 when count is not 18 or an
    argument is null. Pure. */
 int nvn_program_compute_from_words(const uint32_t* words, uint32_t count, NvnProgramComputeIn* out);
+/* The header bytes that a compute stage reads, by layout: 0x833 for 13 to 16, 0x780 for 5 to 12, else 0. */
+uint32_t nvn_program_compute_header_bytes(uint32_t layout);
+/* Reads the compute words from a host copy of the header at h. Returns 0 (out unchanged) on a null argument, a
+   layout outside 5 to 16, or a byte count below nvn_program_compute_header_bytes(layout). Pure. */
+int nvn_program_compute_in_from_header(const uint8_t* header, uint32_t bytes, uint32_t entry_word,
+                                       NvnProgramComputeIn* out);
 
 /* Builds the transform feedback block that the library appends after the graphics words, from the 0x612-byte blob
    at vertex header + 0xDC. Returns 1 with *count = 0 when the blob is disabled, and 1 with the words when it is
