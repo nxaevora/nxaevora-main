@@ -40,3 +40,37 @@ double nvn_measure_ms(uint64_t ns, uint64_t presents) {
     if (presents == 0) return 0.0;
     return (double)ns / (double)presents / 1000000.0;
 }
+
+/* 1 when key i may follow the last picked pair: a smaller key, or an equal key at a larger index. */
+static int top_candidate(const uint64_t* keys, uint32_t i, int have_last, uint64_t last_key, uint32_t last_index) {
+    if (!keys[i]) return 0;
+    if (!have_last) return 1;
+    return keys[i] < last_key || (keys[i] == last_key && i > last_index);
+}
+
+uint32_t nvn_measure_top(const uint64_t* keys, uint32_t count, uint32_t* out_index, uint32_t k) {
+    uint32_t written = 0;
+    uint64_t last_key = 0;
+    uint32_t last_index = 0;
+    int have_last = 0;
+    if (!keys || !out_index) return 0;
+    while (written < k) {
+        uint64_t best_key = 0;
+        uint32_t best_index = 0;
+        int found = 0;
+        for (uint32_t i = 0; i < count; i++) {
+            if (!top_candidate(keys, i, have_last, last_key, last_index)) continue;
+            if (!found || keys[i] > best_key) {
+                best_key = keys[i];
+                best_index = i;
+                found = 1;
+            }
+        }
+        if (!found) break;
+        out_index[written++] = best_index;
+        last_key = best_key;
+        last_index = best_index;
+        have_last = 1;
+    }
+    return written;
+}

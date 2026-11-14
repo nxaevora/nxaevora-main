@@ -7,7 +7,7 @@
 #include "snx_settings.h"
 #include <stdio.h>
 
-static uint64_t old_guest_ns, old_gpu_ns, native_guest_ns, native_gpu_ns;
+static uint64_t old_guest_ns, old_gpu_ns, native_guest_ns, native_gpu_ns, native_lock_ns;
 
 /* The present window. nvn_measure_present runs under vk_lock, so only one thread uses these. */
 static uint32_t frame_us[NVN_MEASURE_WINDOW];
@@ -20,6 +20,7 @@ void nvn_measure_old_guest(uint64_t ns) { __atomic_fetch_add(&old_guest_ns, ns, 
 void nvn_measure_old_gpu(uint64_t ns) { __atomic_fetch_add(&old_gpu_ns, ns, __ATOMIC_RELAXED); }
 void nvn_measure_native_guest(uint64_t ns) { __atomic_fetch_add(&native_guest_ns, ns, __ATOMIC_RELAXED); }
 void nvn_measure_native_gpu(uint64_t ns) { __atomic_fetch_add(&native_gpu_ns, ns, __ATOMIC_RELAXED); }
+void nvn_measure_native_lock(uint64_t ns) { __atomic_fetch_add(&native_lock_ns, ns, __ATOMIC_RELAXED); }
 
 /* Takes a counter's window and starts its next window. */
 static uint64_t counter_take(uint64_t* counter) { return __atomic_exchange_n(counter, 0, __ATOMIC_RELAXED); }
@@ -30,6 +31,7 @@ static void counters_clear(void) {
     counter_take(&old_gpu_ns);
     counter_take(&native_guest_ns);
     counter_take(&native_gpu_ns);
+    counter_take(&native_lock_ns);
 }
 
 static void window_restart(uint64_t now_ns) {
@@ -42,21 +44,21 @@ static void window_restart(uint64_t now_ns) {
 
 /* One line for a full window: the mean CPU time of each side per frame, the frame time spread and the draws. The
    counters of the other path are read and cleared too, so a value there shows a fault. */
-static void window_log(uint64_t guest_ns, uint64_t gpu_ns, uint64_t other_ns) {
+static void window_log(uint64_t guest_ns, uint64_t gpu_ns, uint64_t lock_ns, uint64_t other_ns) {
     NvnMeasureFrameStats stats;
     char other[32] = "";
     nvn_measure_frame_stats(frame_us, frame_count, &stats);
     if (other_ns) snprintf(other, sizeof other, " other_ns=%llu", (unsigned long long)other_ns);
-    LOG("nvn-measure: path=%s presents=%u guest_ms=%.3f gpu_ms=%.3f frame_ms median=%.3f p99=%.3f max=%.3f "
-        "draws=%llu skipped=%llu%s\n",
+    LOG("nvn-measure: path=%s presents=%u guest_ms=%.3f gpu_ms=%.3f lock_ms=%.3f frame_ms median=%.3f p99=%.3f "
+        "max=%.3f draws=%llu skipped=%llu%s\n",
         g_settings.nvn_native ? "native" : "old", frame_count, nvn_measure_ms(guest_ns, frame_count),
-        nvn_measure_ms(gpu_ns, frame_count), (double)stats.median_us / 1000.0, (double)stats.p99_us / 1000.0,
-        (double)stats.max_us / 1000.0, (unsigned long long)(g_vk_drawn - window_drawn),
-        (unsigned long long)(g_vk_skipped - window_skipped), other);
+        nvn_measure_ms(gpu_ns, frame_count), nvn_measure_ms(lock_ns, frame_count), (double)stats.median_us / 1000.0,
+        (double)stats.p99_us / 1000.0, (double)stats.max_us / 1000.0,
+        (unsigned long long)(g_vk_drawn - window_drawn), (unsigned long long)(g_vk_skipped - window_skipped), other);
 }
 
 void nvn_measure_present(uint64_t now_ns) {
-    uint64_t guest_ns, gpu_ns, other_ns;
+    uint64_t guest_ns, gpu_ns, lock_ns, other_ns;
     if (!g_settings.nvn_measure) return;
     if (!have_last_present) {
         window_restart(now_ns);
@@ -72,12 +74,14 @@ void nvn_measure_present(uint64_t now_ns) {
     if (g_settings.nvn_native) {
         guest_ns = counter_take(&native_guest_ns);
         gpu_ns = counter_take(&native_gpu_ns);
+        lock_ns = counter_take(&native_lock_ns);
         other_ns = counter_take(&old_guest_ns) + counter_take(&old_gpu_ns);
     } else {
         guest_ns = counter_take(&old_guest_ns);
         gpu_ns = counter_take(&old_gpu_ns);
-        other_ns = counter_take(&native_guest_ns) + counter_take(&native_gpu_ns);
+        lock_ns = 0;
+        other_ns = counter_take(&native_guest_ns) + counter_take(&native_gpu_ns) + counter_take(&native_lock_ns);
     }
-    window_log(guest_ns, gpu_ns, other_ns);
+    window_log(guest_ns, gpu_ns, lock_ns, other_ns);
     window_restart(now_ns);
 }

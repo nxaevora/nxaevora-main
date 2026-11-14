@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the NXAevora contributors */
 /* The pure part of the nvn measure (gpu/nvn_measure_calc.c): the nearest-rank median and 99th percentile, the
-   maximum, the unchanged input, and the mean milliseconds. */
+   maximum, the unchanged input, the mean milliseconds and the indexes of the largest keys. */
 #include "nx/gpu/nvn_measure_calc.h"
 #include <stdio.h>
 
@@ -64,12 +64,69 @@ static void test_ms(void) {
     CHECK(nvn_measure_ms(3000000000u, 2) == 1500.0);
 }
 
+/* count 0, k 0, and keys that are all 0: no index is written. */
+static void test_top_empty(void) {
+    const uint64_t keys[] = {5, 6};
+    const uint64_t zeros[] = {0, 0, 0};
+    uint32_t out[4];
+    CHECK(nvn_measure_top(keys, 0, out, 4) == 0);
+    CHECK(nvn_measure_top(keys, 2, out, 0) == 0);
+    CHECK(nvn_measure_top(zeros, 3, out, 3) == 0);
+}
+
+/* k is larger than the count of keys above 0: only those keys are written. */
+static void test_top_fewer_than_k(void) {
+    const uint64_t keys[] = {0, 7, 0, 4};
+    uint32_t out[5];
+    CHECK(nvn_measure_top(keys, 4, out, 5) == 2);
+    CHECK(out[0] == 1);
+    CHECK(out[1] == 3);
+}
+
+/* Equal keys keep index order. */
+static void test_top_equal_keys(void) {
+    const uint64_t keys[] = {7, 7, 7, 7};
+    uint32_t out[4];
+    CHECK(nvn_measure_top(keys, 4, out, 3) == 3);
+    CHECK(out[0] == 0);
+    CHECK(out[1] == 1);
+    CHECK(out[2] == 2);
+}
+
+/* The largest key is the last entry. */
+static void test_top_last_is_largest(void) {
+    const uint64_t keys[] = {1, 2, 3, 9};
+    uint32_t out[4];
+    CHECK(nvn_measure_top(keys, 4, out, 4) == 4);
+    CHECK(out[0] == 3);
+    CHECK(out[1] == 2);
+    CHECK(out[2] == 1);
+    CHECK(out[3] == 0);
+}
+
+/* A mixed case, and keys stays unchanged. */
+static void test_top_does_not_change_keys(void) {
+    const uint64_t keys[] = {3, 9, 9, 5, 1};
+    const uint64_t before[] = {3, 9, 9, 5, 1};
+    uint32_t out[3];
+    CHECK(nvn_measure_top(keys, 5, out, 3) == 3);
+    CHECK(out[0] == 1);
+    CHECK(out[1] == 2);
+    CHECK(out[2] == 3);
+    for (uint32_t i = 0; i < 5; i++) CHECK(keys[i] == before[i]);
+}
+
 int main(void) {
     test_empty();
     test_one();
     test_window();
     test_unsorted_input();
     test_ms();
+    test_top_empty();
+    test_top_fewer_than_k();
+    test_top_equal_keys();
+    test_top_last_is_largest();
+    test_top_does_not_change_keys();
     if (failures) {
         printf("%d failure(s)\n", failures);
         return 1;

@@ -11,6 +11,7 @@ void nvn_measure_old_guest(uint64_t ns);
 void nvn_measure_old_gpu(uint64_t ns);
 void nvn_measure_native_guest(uint64_t ns);
 void nvn_measure_native_gpu(uint64_t ns);
+void nvn_measure_native_lock(uint64_t ns);
 
 /* One present at now_ns (plat_ns). Runs under vk_lock, so its window state needs no lock. It returns at once when
    nvn_measure is off. */
