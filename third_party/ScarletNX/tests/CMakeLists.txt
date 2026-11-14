@@ -371,6 +371,10 @@ if(UNIX)
     add_test(NAME data_dir COMMAND snx-test-data-dir)
     add_test(NAME runtime_deploy COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_SOURCE_DIR}/deploy.cmake")
 endif()
+# host.c's shared mode of PMutex: a shared take excludes only exclusive takes, and an exclusive take excludes shared ones
+add_executable(snx-test-host-shared-lock host_shared_lock.c "${PROJECT_SOURCE_DIR}/src/common/filesystem/host.c")
+snx_test_target(snx-test-host-shared-lock 11)
+add_test(NAME host_shared_lock COMMAND snx-test-host-shared-lock)
 # snx_os_error: the system's reason a message names, Windows' GetLastError where its calls leave errno
 add_executable(snx-test-os-error os_error.c)
 snx_test_target(snx-test-os-error 99)

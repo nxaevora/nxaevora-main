@@ -202,6 +202,16 @@ int pm_trylock(PMutex* m) {
     if (c && pm_named_admit(c)) g_pm_tracy->try_lock(c->l, 1);
     return got;
 }
+/* The shared calls do not report to the profiler: its lockable context has exclusive events only, and two shared
+   holders at once would give a wrong pane. So they read neither g_pm_tracy_on, pm_named nor pm_named_admit. */
+void pm_lock_shared(PMutex* m) {
+    if (TryAcquireSRWLockShared(&m->l)) return;
+    pm_wait_note(m, __builtin_return_address(0), 0);
+    AcquireSRWLockShared(&m->l);
+    pm_wait_note(NULL, NULL, 0);
+}
+void pm_unlock_shared(PMutex* m) { ReleaseSRWLockShared(&m->l); }
+int pm_trylock_shared(PMutex* m) { return TryAcquireSRWLockShared(&m->l) != 0; }
 
 /* paths are UTF-8 everywhere else. A path that isn't valid UTF-8 names nothing: NULL, rather than a path with
    replacement characters that could name another file. Freed with free */
@@ -325,6 +335,17 @@ int pm_trylock(PMutex* m) {
     if (c && pm_named_admit(c)) g_pm_tracy->try_lock(c->l, 1);
     return got;
 }
+/* The shared calls do not report to the profiler: its lockable context has exclusive events only, and two shared
+   holders at once would give a wrong pane. So they read neither g_pm_tracy_on, pm_named nor pm_named_admit.
+   Here a shared take is a normal take, without parallel readers, until the Linux work. */
+void pm_lock_shared(PMutex* m) {
+    if (pthread_mutex_trylock(&m->l) == 0) return;
+    pm_wait_note(m, __builtin_return_address(0), 0);
+    pthread_mutex_lock(&m->l);
+    pm_wait_note(NULL, NULL, 0);
+}
+void pm_unlock_shared(PMutex* m) { pthread_mutex_unlock(&m->l); }
+int pm_trylock_shared(PMutex* m) { return pthread_mutex_trylock(&m->l) == 0; }
 
 int plat_mkdir(const char* path) { return mkdir(path, 0777) ? -1 : 0; }
 

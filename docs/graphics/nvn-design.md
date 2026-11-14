@@ -1297,7 +1297,9 @@ Decisions:
 
 1. `host.h` gets `pm_lock_shared`, `pm_unlock_shared` and `pm_trylock_shared` for a `PMutex`: the `SRWLOCK` shared calls on
    Windows. On POSIX they take the mutex in the normal way (correct, but no parallel readers) until the Linux work. They
-   note waits and report to the profiler as `pm_lock` does. `PMutex` stays the type, so `kthread_wait` does not change.
+   note waits as `pm_lock` does. They do not report to the profiler (changed in step 1): the Tracy C API has only an
+   exclusive lockable context, so two shared holders at the same time would give a wrong pane. `PMutex` stays the type,
+   so `kthread_wait` does not change.
 2. `lists` gets its own mutex `lists_lock`. Lock order: `objs_lock` (either mode), then `lists_lock`, then `g_qlk`. The
    `GPU` thread takes only `lists_lock` for its list finds. A found list stays alive through the references of its frame,
    as today.

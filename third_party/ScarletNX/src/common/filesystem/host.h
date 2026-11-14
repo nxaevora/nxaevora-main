@@ -37,6 +37,11 @@ void pm_destroy(PMutex* m);
 void pm_lock(PMutex* m);
 void pm_unlock(PMutex* m);
 int pm_trylock(PMutex* m); /* 1 when it took the lock, 0 when another thread holds it */
+/* A shared holder excludes only exclusive holders. Release a shared take only with pm_unlock_shared. The shared
+   mode is not recursive with an exclusive take of the same thread. */
+void pm_lock_shared(PMutex* m);
+void pm_unlock_shared(PMutex* m);
+int pm_trylock_shared(PMutex* m); /* 1 when it took the lock, 0 when an exclusive holder has it */
 /* The profiler's view of the locks, registered while a run has one attached: pm_lock, pm_unlock and pm_trylock
    report the named locks through it, and its pane shows who held which and who waited how long. Nothing registers
    it on a run without the profiler, so a lock unnamed costs a null check. The reporter's context is the raw
