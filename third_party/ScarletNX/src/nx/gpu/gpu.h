@@ -360,6 +360,8 @@ void gpu_kick(void);
 int gpu_hold(int timeout_ms);
 void gpu_release(void);
 extern volatile u64 g_gpu_submits;
+/* 1 on the GPU thread, 0 on every other thread */
+int gpu_on_gpu_thread(void);
 /* the blocking wait the GPU thread is in, for the stall report: what it waits for (a string that lives on) and a number
    that names it, before the wait, and NULL after. Ignored on other threads */
 void gpu_wait_note(const char* what, u64 value);

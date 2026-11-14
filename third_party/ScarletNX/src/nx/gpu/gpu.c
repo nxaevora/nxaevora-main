@@ -993,6 +993,7 @@ void gpu_report_stall(void) {
     }
     if (g_renderer && g_renderer->report_stall) g_renderer->report_stall();
 }
+int gpu_on_gpu_thread(void) { return t_gpu; }
 static void gpu_thread(void* arg) {
     (void)arg;
     t_gpu = 1;

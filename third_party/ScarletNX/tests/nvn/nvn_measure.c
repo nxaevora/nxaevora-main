@@ -116,6 +116,48 @@ static void test_top_does_not_change_keys(void) {
     for (uint32_t i = 0; i < 5; i++) CHECK(keys[i] == before[i]);
 }
 
+/* The holder codes of the nvn measure: a slot count of 4 gives the handler codes 1..4, the GPU code 5 and the other
+   code 6. */
+static void test_holder_unknown(void) {
+    const NvnMeasureHolder holder = nvn_measure_holder_from_code(0, 4);
+    CHECK(holder.holder_class == NVN_MEASURE_HOLDER_UNKNOWN);
+    CHECK(holder.slot == 0);
+}
+
+static void test_holder_first_slot(void) {
+    CHECK(nvn_measure_holder_code(1, 0, 4) == 1);
+    const NvnMeasureHolder holder = nvn_measure_holder_from_code(1, 4);
+    CHECK(holder.holder_class == NVN_MEASURE_HOLDER_HANDLER);
+    CHECK(holder.slot == 0);
+}
+
+static void test_holder_last_slot(void) {
+    CHECK(nvn_measure_holder_code(4, 0, 4) == 4);
+    const NvnMeasureHolder holder = nvn_measure_holder_from_code(4, 4);
+    CHECK(holder.holder_class == NVN_MEASURE_HOLDER_HANDLER);
+    CHECK(holder.slot == 3);
+}
+
+static void test_holder_gpu(void) {
+    CHECK(nvn_measure_holder_code(0, 1, 4) == 5);
+    const NvnMeasureHolder holder = nvn_measure_holder_from_code(5, 4);
+    CHECK(holder.holder_class == NVN_MEASURE_HOLDER_GPU);
+    CHECK(holder.slot == 0);
+}
+
+static void test_holder_other(void) {
+    CHECK(nvn_measure_holder_code(0, 0, 4) == 6);
+    const NvnMeasureHolder holder = nvn_measure_holder_from_code(6, 4);
+    CHECK(holder.holder_class == NVN_MEASURE_HOLDER_OTHER);
+    CHECK(holder.slot == 0);
+}
+
+static void test_holder_too_large(void) {
+    const NvnMeasureHolder holder = nvn_measure_holder_from_code(7, 4);
+    CHECK(holder.holder_class == NVN_MEASURE_HOLDER_UNKNOWN);
+    CHECK(holder.slot == 0);
+}
+
 int main(void) {
     test_empty();
     test_one();
@@ -127,6 +169,12 @@ int main(void) {
     test_top_equal_keys();
     test_top_last_is_largest();
     test_top_does_not_change_keys();
+    test_holder_unknown();
+    test_holder_first_slot();
+    test_holder_last_slot();
+    test_holder_gpu();
+    test_holder_other();
+    test_holder_too_large();
     if (failures) {
         printf("%d failure(s)\n", failures);
         return 1;

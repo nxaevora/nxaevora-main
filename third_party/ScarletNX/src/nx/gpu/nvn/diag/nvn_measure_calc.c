@@ -74,3 +74,21 @@ uint32_t nvn_measure_top(const uint64_t* keys, uint32_t count, uint32_t* out_ind
     }
     return written;
 }
+
+uint32_t nvn_measure_holder_code(uint32_t slot1, int on_gpu_thread, uint32_t slots) {
+    if (slot1 && slot1 <= slots) return slot1;
+    return on_gpu_thread ? slots + 1u : slots + 2u;
+}
+
+NvnMeasureHolder nvn_measure_holder_from_code(uint32_t code, uint32_t slots) {
+    NvnMeasureHolder holder = {NVN_MEASURE_HOLDER_UNKNOWN, 0};
+    if (code == 0) return holder;
+    if (code <= slots) {
+        holder.holder_class = NVN_MEASURE_HOLDER_HANDLER;
+        holder.slot = code - 1u;
+        return holder;
+    }
+    if (code == slots + 1u) holder.holder_class = NVN_MEASURE_HOLDER_GPU;
+    else if (code == slots + 2u) holder.holder_class = NVN_MEASURE_HOLDER_OTHER;
+    return holder;
+}

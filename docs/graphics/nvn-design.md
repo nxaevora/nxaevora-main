@@ -1253,3 +1253,10 @@ Effect and limits: at 30 FPS the native path does not change the frame time. It 
 (about 1 ms a frame in the busy scenes) and the library code on the game threads (at least about 1 ms), but its handlers
 add about 1.5 to 2 ms of work and 2 ms of `objs_lock` wait on the game threads. The lock wait is the largest cost that
 the native path adds.
+
+### Who holds `objs_lock` (measure added 2026-11-14)
+
+Each handler holds `objs_lock` for the whole call. The `GPU` thread takes it for short lookups: once per list in
+`frame_replay_lists`, per op in the `replay_host_*` callbacks, and in `frame_read_parts`, `frame_finish` and `frame_line`.
+To find which of them makes the handlers wait, `nvn_measure=1` now records the holder at each blocked take (the
+`nvn-measure: lock` and `holder` lines). The result of a run and the split design follow here.

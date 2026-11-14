@@ -36,6 +36,14 @@ static PMutex objs_lock = PMUTEX_INIT;
 /* The time this thread's handlers waited for objs_lock, which native_call leaves out of the nvn_measure guest time.
    Only objs_lock_take writes it, and only while nvn_measure is on. */
 static _Thread_local u64 t_handler_lock_ns;
+/* The holder of objs_lock, one code per taker class (nvn_measure_holder_code). A waiter can read the code of the last
+   holder if the lock changed hands between its failed trylock and its read. Only nvn_measure writes it, and an unlock
+   does not clear it. */
+static uint32_t objs_holder;
+/* The slot index + 1 of the handler this thread runs, 0 outside a handler. Only nvn_measure sets it. */
+static _Thread_local uint32_t t_handler_slot;
+static void objs_holder_set(void);
+static void lock_wait_record(uint32_t holder_code, u64 wait_ns);
 
 /* Takes objs_lock for a handler. Under nvn_measure a blocked take adds its wait to t_handler_lock_ns. */
 static void objs_lock_take(void) {
@@ -43,10 +51,17 @@ static void objs_lock_take(void) {
         pm_lock(&objs_lock);
         return;
     }
-    if (pm_trylock(&objs_lock)) return;
+    if (pm_trylock(&objs_lock)) {
+        objs_holder_set();
+        return;
+    }
+    const uint32_t holder_code = __atomic_load_n(&objs_holder, __ATOMIC_RELAXED);
     const u64 start_ns = plat_ns();
     pm_lock(&objs_lock);
-    t_handler_lock_ns += plat_ns() - start_ns;
+    const u64 wait_ns = plat_ns() - start_ns;
+    t_handler_lock_ns += wait_ns;
+    objs_holder_set();
+    lock_wait_record(holder_code, wait_ns);
 }
 /* The frame job tells the guest waits that it freed an image and updated the syncs. */
 static PCond frame_done_cv;
@@ -6343,6 +6358,7 @@ static void window_acquire_texture(CPU* c, u64 queue_addr, u64 window_addr, u64 
         const u64 wait_start = handler_wait_start();
         kthread_wait(&frame_done_cv, &objs_lock, -1);
         handler_wait_end(wait_start);
+        if (g_settings.nvn_measure) objs_holder_set();
         window = known_record(window_addr, NVN_OBJ_WINDOW);
         sync = has_sync ? known_record(sync_addr, NVN_OBJ_SYNC) : NULL;
         reason = nvn_window_acquire_refusal(1, 1, window != NULL, !has_sync || sync != NULL,
@@ -6420,6 +6436,7 @@ static void h_sync_wait(CPU* c, u64 entry) {
         if (action == NVN_SYNC_ACTION_WAIT_FRAME) {
             kthread_wait(&frame_done_cv, &objs_lock, left);
             handler_wait_end(wait_start);
+            if (g_settings.nvn_measure) objs_holder_set();
         } else {
             const uint32_t id = sync->syncpoint, value = sync->value;
             pm_unlock(&objs_lock);
@@ -7646,12 +7663,14 @@ static const NativeProc native_procs[] = {
 typedef struct {
     u64 addr, calls;
     u64 wall_ns, lock_ns, gpu_wait_ns, measure_calls; /* the nvn_measure time of the handler, added by native_call */
+    u64 held_waits, held_wait_ns; /* the blocked takes of other threads while this handler held objs_lock */
     GuestFn handler;
     int missing; /* the handler is the missing-function handler */
     char name[128];
 } NativeSlot;
 #define NATIVE_SLOTS 1024 /* the game resolves 523 addresses */
 #define NVN_MEASURE_TOP_HANDLERS 25u /* the handler lines of the nvn measure report */
+#define NVN_MEASURE_TOP_HOLDERS 10u /* the holder lines of the nvn measure report */
 static NativeSlot slots[NATIVE_SLOTS];
 static u32 nslots;
 /* Registration takes the lock and publishes a slot (addr, release ordering) once it is filled in. Calls read the slots
@@ -7659,6 +7678,31 @@ static u32 nslots;
 static PMutex slots_lock = PMUTEX_INIT;
 static u64 getproc_addr; /* the address of nvnDeviceGetProcAddress, hooked */
 static int active;
+/* The distinct threads that ran a handler under nvn_measure, and 1 when this thread is counted. */
+static _Thread_local int t_handler_counted;
+static uint32_t lock_thread_count;
+enum { LOCK_WAITER_GAME = 0, LOCK_WAITER_GPU, LOCK_WAITER_CLASSES };
+static const char* const lock_waiter_names[LOCK_WAITER_CLASSES] = {"game", "gpu"};
+static uint64_t lock_blocked[LOCK_WAITER_CLASSES][NVN_MEASURE_HOLDER_CLASSES];
+static uint64_t lock_wait_ns[LOCK_WAITER_CLASSES][NVN_MEASURE_HOLDER_CLASSES];
+
+/* Writes the holder code of the lock this thread just took. The caller checks nvn_measure. */
+static void objs_holder_set(void) {
+    __atomic_store_n(&objs_holder, nvn_measure_holder_code(t_handler_slot, gpu_on_gpu_thread(), NATIVE_SLOTS),
+                     __ATOMIC_RELAXED);
+}
+
+/* Adds a blocked take to its pair of waiter class and holder class, and to the holder handler's counters. */
+static void lock_wait_record(uint32_t holder_code, uint64_t wait_ns) {
+    const NvnMeasureHolder holder = nvn_measure_holder_from_code(holder_code, NATIVE_SLOTS);
+    const uint32_t waiter = gpu_on_gpu_thread() ? LOCK_WAITER_GPU : LOCK_WAITER_GAME;
+    __atomic_fetch_add(&lock_blocked[waiter][holder.holder_class], 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&lock_wait_ns[waiter][holder.holder_class], wait_ns, __ATOMIC_RELAXED);
+    if (holder.holder_class != NVN_MEASURE_HOLDER_HANDLER) return;
+    NativeSlot* slot = &slots[holder.slot];
+    __atomic_fetch_add(&slot->held_waits, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&slot->held_wait_ns, wait_ns, __ATOMIC_RELAXED);
+}
 static void getproc_native(CPU* c, u64 entry);
 
 /* The NVN library of the sdk module of update 1.1.1: the one build whose name and address tables the host knows. The
@@ -7774,13 +7818,23 @@ static void native_call(CPU* c, u64 entry) {
     u64 lr = c->x[30];
     const int measure = g_settings.nvn_measure;
     u64 measure_t0 = measure ? plat_ns() : 0;
+    u32 outer_slot = 0;
     t_handler_wait_ns = 0;
-    if (measure) t_handler_lock_ns = 0;
+    if (measure) {
+        t_handler_lock_ns = 0;
+        outer_slot = t_handler_slot;
+        t_handler_slot = (u32)(s - slots) + 1u;
+        if (!t_handler_counted) {
+            t_handler_counted = 1;
+            __atomic_fetch_add(&lock_thread_count, 1, __ATOMIC_RELAXED);
+        }
+    }
     s->handler(c, entry);
     if (measure) {
         const u64 wall_ns = plat_ns() - measure_t0;
         const u64 lock_ns = t_handler_lock_ns;
         const u64 gpu_ns = t_handler_wait_ns;
+        t_handler_slot = outer_slot;
         nvn_measure_native_guest(wall_ns - gpu_ns - lock_ns);
         nvn_measure_native_lock(lock_ns);
         __atomic_fetch_add(&s->wall_ns, wall_ns, __ATOMIC_RELAXED);
@@ -7924,13 +7978,17 @@ GuestFn nvn_native_handler(const char* name) {
     return missing ? NULL : h;
 }
 
-/* The nvn_measure lines for the handlers, under slots_lock: the NVN_MEASURE_TOP_HANDLERS with the largest wall time,
-   then the totals of all the slots. */
+/* The nvn_measure lines for the handlers and the objs_lock waits, under slots_lock: the NVN_MEASURE_TOP_HANDLERS with
+   the largest wall time, the totals of all the slots, the waits of each waiter class by holder class, then the
+   NVN_MEASURE_TOP_HOLDERS handlers that made other threads wait longest. */
 static void report_measure(void) {
-    u64 walls[NATIVE_SLOTS];
-    u32 top[NVN_MEASURE_TOP_HANDLERS];
+    u64 walls[NATIVE_SLOTS], held[NATIVE_SLOTS];
+    u32 top[NVN_MEASURE_TOP_HANDLERS], top_holders[NVN_MEASURE_TOP_HOLDERS];
     u64 total_calls = 0, total_wall = 0, total_lock = 0, total_gpu = 0;
-    for (u32 i = 0; i < NATIVE_SLOTS; i++) walls[i] = __atomic_load_n(&slots[i].wall_ns, __ATOMIC_RELAXED);
+    for (u32 i = 0; i < NATIVE_SLOTS; i++) {
+        walls[i] = __atomic_load_n(&slots[i].wall_ns, __ATOMIC_RELAXED);
+        held[i] = __atomic_load_n(&slots[i].held_wait_ns, __ATOMIC_RELAXED);
+    }
     const u32 ntop = nvn_measure_top(walls, NATIVE_SLOTS, top, NVN_MEASURE_TOP_HANDLERS);
     for (u32 i = 0; i < NATIVE_SLOTS; i++) {
         total_calls += __atomic_load_n(&slots[i].measure_calls, __ATOMIC_RELAXED);
@@ -7952,6 +8010,30 @@ static void report_measure(void) {
     LOG("nvn-measure: handlers total calls=%llu wall_ms=%.3f lock_ms=%.3f wait_ms=%.3f\n",
         (unsigned long long)total_calls, (double)total_wall / 1000000.0, (double)total_lock / 1000000.0,
         (double)total_gpu / 1000000.0);
+    for (u32 w = 0; w < LOCK_WAITER_CLASSES; w++) {
+        u64 blocked = 0, waited = 0;
+        for (u32 h = 0; h < NVN_MEASURE_HOLDER_CLASSES; h++) {
+            blocked += __atomic_load_n(&lock_blocked[w][h], __ATOMIC_RELAXED);
+            waited += __atomic_load_n(&lock_wait_ns[w][h], __ATOMIC_RELAXED);
+        }
+        LOG("nvn-measure: lock waiter=%s blocked=%llu wait_ms=%.3f by_handler_ms=%.3f by_gpu_ms=%.3f "
+            "by_other_ms=%.3f by_unknown_ms=%.3f\n",
+            lock_waiter_names[w], (unsigned long long)blocked, (double)waited / 1000000.0,
+            (double)__atomic_load_n(&lock_wait_ns[w][NVN_MEASURE_HOLDER_HANDLER], __ATOMIC_RELAXED) / 1000000.0,
+            (double)__atomic_load_n(&lock_wait_ns[w][NVN_MEASURE_HOLDER_GPU], __ATOMIC_RELAXED) / 1000000.0,
+            (double)__atomic_load_n(&lock_wait_ns[w][NVN_MEASURE_HOLDER_OTHER], __ATOMIC_RELAXED) / 1000000.0,
+            (double)__atomic_load_n(&lock_wait_ns[w][NVN_MEASURE_HOLDER_UNKNOWN], __ATOMIC_RELAXED) / 1000000.0);
+    }
+    LOG("nvn-measure: lock threads=%u\n", __atomic_load_n(&lock_thread_count, __ATOMIC_RELAXED));
+    const u32 nhold = nvn_measure_top(held, NATIVE_SLOTS, top_holders, NVN_MEASURE_TOP_HOLDERS);
+    for (u32 n = 0; n < nhold; n++) {
+        const NativeSlot* s = &slots[top_holders[n]];
+        const u64 calls = __atomic_load_n(&s->measure_calls, __ATOMIC_RELAXED);
+        const u64 held_waits = __atomic_load_n(&s->held_waits, __ATOMIC_RELAXED);
+        LOG("nvn-measure: holder %s held_waits=%llu held_wait_ms=%.3f calls=%llu us_per_call=%.3f\n", s->name,
+            (unsigned long long)held_waits, (double)held[top_holders[n]] / 1000000.0, (unsigned long long)calls,
+            calls ? (double)walls[top_holders[n]] / (double)calls / 1000.0 : 0.0);
+    }
 }
 
 void nvn_native_report(void) {
