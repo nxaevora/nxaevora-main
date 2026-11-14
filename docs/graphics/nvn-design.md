@@ -1236,3 +1236,20 @@ Update program, Obsidian Fieldlands (still and walk) and a battle in one run of 
   2 ms of it is a wait for `objs_lock`, which each handler holds for the whole call. Not yet checked: which thread holds
   it then (another game thread that calls NVN, or the `GPU` thread). The most called handlers are command buffer state
   calls of 0.4 to 1.4 us each.
+
+### Result (2026-11-14, runs with the pace left out and `profile=1` runs)
+
+- Native guest side: 1.4 to 2.0 ms per frame of handler work, plus 1.9 to 2.3 ms of `objs_lock` wait. Old guest side in
+  `gpu_submit`: 0.01 to 0.02 ms.
+- Old path library: the `profile` samples in the `sdk` module are 7037 on the old path (180 s) and 2285 on the native path
+  (190 s), about 1.3 and 0.4 ms per frame. The sampler counts each thread each millisecond, also a blocked thread, and the
+  file lists only the 200 largest entries, so these are lower bounds. `d901df0` holds most of the difference (5588
+  against 1064).
+- `GPU` side: native 4 to 15% less at the same draw count (13.0 to 13.2 ms against 13.9 to 14.1 ms at about 538000
+  draws in 600 frames).
+- Frame time: the same on both paths at the 30 FPS pace (median 33.0 to 33.4 ms). No skipped draw on either path.
+
+Effect and limits: at 30 FPS the native path does not change the frame time. It removes the decode on the `GPU` thread
+(about 1 ms a frame in the busy scenes) and the library code on the game threads (at least about 1 ms), but its handlers
+add about 1.5 to 2 ms of work and 2 ms of `objs_lock` wait on the game threads. The lock wait is the largest cost that
+the native path adds.
