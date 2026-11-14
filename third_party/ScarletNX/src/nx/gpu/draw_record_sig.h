@@ -69,12 +69,12 @@ void drawrec_table_init(DrawRecTable* t, DrawRecEntry* entries, u32 size);
 int drawrec_table_insert(DrawRecTable* t, u64 sig, const char* text);
 const DrawRecEntry* drawrec_table_find(const DrawRecTable* t, u64 sig);
 
-/* One program's hash, kept by its GPU address and kind. checked is the present count of its last memory check. */
+/* One program's hash, kept by its GPU address and kind. checked is the record epoch of its last memory check. */
 typedef struct DrawRecShaderEntry {
     u64 gva;
     u64 hash;
     u64 gw;      /* gpu_mem_generation() before the code was read */
-    u64 checked; /* rec_frame.frames of the last check */
+    u64 checked; /* rec_epoch of the last check */
     u32 len;     /* guest bytes of the code that the hash covered */
     u32 wseen;   /* vk_ww_now() before the code was read */
     u8 used;
@@ -92,10 +92,10 @@ void drawrec_shader_cache_init(DrawRecShaderCache* c, DrawRecShaderEntry* entrie
 DrawRecShaderEntry* drawrec_shader_cache_find(DrawRecShaderCache* c, u64 gva, int compute);
 /* Stores a program's hash and its baselines. NULL when every slot is taken. */
 DrawRecShaderEntry* drawrec_shader_cache_insert(DrawRecShaderCache* c, u64 gva, int compute, u64 hash, u32 len,
-                                                u64 gw, u32 wseen, u64 frame);
+                                                u64 gw, u32 wseen, u64 epoch);
 /* Forgets every program: another one may be at its address now. */
 void drawrec_shader_cache_clear(DrawRecShaderCache* c);
-/* 1 when the entry needs a memory check for this present: it was not checked yet for it. */
-int drawrec_shader_entry_due(const DrawRecShaderEntry* e, u64 frames);
+/* 1 when the entry needs a memory check in this epoch: it was not checked yet in it. */
+int drawrec_shader_entry_due(const DrawRecShaderEntry* e, u64 epoch);
 
 #endif

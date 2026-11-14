@@ -51,6 +51,9 @@ static DrawRecShaderEntry rec_shader_entries[DRAWREC_SHADER_CACHE];
 static u64 rec_shader_uncached; /* programs hashed when the shader cache was full */
 static u64 rec_shader_rehashed; /* cached programs hashed again to a new hash */
 static u64 rec_shader_rehashed_logged; /* rehashed at the last log line */
+/* counts the renderer's mem_may_have_changed calls, the points where the backend's epoch ends and its shader
+   cache checks the code again (vk/renderer.c, vk/pipeline.c:546) */
+static u64 rec_epoch;
 
 static struct {
     u64 counts[DRAWREC_KIND_COUNT];
@@ -117,17 +120,17 @@ static int rec_shader_unchanged(u64 gva, u32 len, u64 gw, u32 wseen) {
 }
 
 /* The program's hash, from the cache when it has it. Called with rec_lock held: a check or a miss reads guest memory.
-   An entry is checked at most once for each present. */
+   An entry is checked at most once in each epoch, as the backend checks its programs. */
 static u64 rec_shader_hash(u64 gva, int compute) {
     DrawRecShaderEntry* e = drawrec_shader_cache_find(&rec_shader_cache, gva, compute);
-    u64 gw, h;
+    u64 epoch = __atomic_load_n(&rec_epoch, __ATOMIC_RELAXED), gw, h;
     u32 wseen, len;
     if (e) {
-        if (!drawrec_shader_entry_due(e, rec_frame.frames)) return e->hash;
+        if (!drawrec_shader_entry_due(e, epoch)) return e->hash;
         wseen = vk_ww_now();
         gw = gpu_mem_generation();
         if (rec_shader_unchanged(gva, e->len, e->gw, e->wseen)) {
-            e->checked = rec_frame.frames;
+            e->checked = epoch;
             e->gw = gw;
             e->wseen = wseen;
             return e->hash;
@@ -138,13 +141,13 @@ static u64 rec_shader_hash(u64 gva, int compute) {
         e->len = len;
         e->gw = gw;
         e->wseen = wseen;
-        e->checked = rec_frame.frames;
+        e->checked = epoch;
         return h;
     }
     wseen = vk_ww_now();
     gw = gpu_mem_generation();
     h = compute ? rec_hash_compute(gva, &len) : rec_hash_code(gva, &len);
-    if (!drawrec_shader_cache_insert(&rec_shader_cache, gva, compute, h, len, gw, wseen, rec_frame.frames))
+    if (!drawrec_shader_cache_insert(&rec_shader_cache, gva, compute, h, len, gw, wseen, epoch))
         rec_shader_uncached++;
     return h;
 }
@@ -412,6 +415,12 @@ static void rec_method_barrier(int kind) {
     pm_unlock(&rec_lock);
 }
 
+/* The epoch advances after the backend's: a draw after this call sees both new. */
+static void rec_mem_may_have_changed(void) {
+    rec_next->mem_may_have_changed();
+    __atomic_add_fetch(&rec_epoch, 1, __ATOMIC_RELAXED);
+}
+
 static void rec_reset(void) {
     rec_next->reset();
     pm_lock(&rec_lock);
@@ -455,6 +464,7 @@ void draw_record_init(void) {
     if (rec_next->present_buffer) rec_renderer.present_buffer = rec_present;
     if (rec_next->method_barrier) rec_renderer.method_barrier = rec_method_barrier;
     if (rec_next->reset) rec_renderer.reset = rec_reset;
+    if (rec_next->mem_may_have_changed) rec_renderer.mem_may_have_changed = rec_mem_may_have_changed;
     __atomic_store_n(&rec_on, 1, __ATOMIC_RELAXED);
     g_renderer = &rec_renderer;
     LOG("draw record: on, %s and %s\n", rec_frames_path, rec_sigs_path);

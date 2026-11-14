@@ -170,8 +170,8 @@ def shared_rows(entries_a, entries_b, frames_a, frames_b, ratio_limit):
     """The shared signatures and the subset that is off. A ratio above R or below 1/R is off."""
     if frames_a == 0 or frames_b == 0:
         raise ValueError('F is 0, so a rate is undefined')
-    if ratio_limit <= 0:
-        raise ValueError('--ratio must be above 0')
+    if not math.isfinite(ratio_limit) or ratio_limit <= 0:
+        raise ValueError('--ratio must be a finite number above 0')
     by_sig_b = {entry.sig: entry for entry in entries_b}
     rows = []
     for entry_a in entries_a:

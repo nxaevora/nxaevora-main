@@ -1099,9 +1099,11 @@ Checked in the code on 2026-11-14 (analyser report, five claims checked again by
    - present_buffer: w, h, pitch, layout and fmt.
 6. **Shader hash cache.** The hash of a program is kept in a fixed table keyed by its GPU address, so a draw does not walk the
    code again. A full table hashes without a cache and counts the misses. Changed 2026-11-14 (`4b9404d`): the game writes
-   other programs at the same addresses, so the table checks an entry once for each present with the write tracking of the
-   backend (`code_same`, `vk/pipeline.c:399`) and hashes it again when it may have changed. A shader instruction invalidate
-   (`method_barrier` kind 5) and a renderer `reset` clear the table, as the backend drops its address shortcuts there. The
+   other programs at the same addresses, so the table checks an entry once in each epoch of the backend with its write
+   tracking (`code_same`, `vk/pipeline.c:399`) and hashes it again when it may have changed. An epoch ends at each
+   `mem_may_have_changed` of the renderer (a submitted job, the end of a wait, a frame start), not only at a present. A
+   shader instruction invalidate (`method_barrier` kind 5) and a renderer `reset` clear the table, as the backend drops its
+   address shortcuts there. The
    log line `draw record: N shader programs hashed again with a new hash` counts the hashes that the check changed.
 7. **Per frame.** Between two presents the module counts the calls of each kind and adds the signatures into two frame hashes:
    one that depends on the order and one that does not (a sum). At `present_buffer` it appends one line to the frame file
@@ -1160,4 +1162,6 @@ Runs of the update program with `nvn_drawrec=1`. The compare output stays local.
   the native run, of the same kind as the rare clears of the old run. Coverage: 99.5% of the calls of the old run and 99.9% of
   the native run are in shared signatures.
 
-The compare finds no difference between the two paths in the target scenes.
+The compare finds no difference between the two paths in the target scenes, in the values that a signature records
+(decision 5). The blend state, the viewports and the constant buffer bindings are not in a signature, so this result
+does not cover them.

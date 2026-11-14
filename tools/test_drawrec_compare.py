@@ -154,6 +154,11 @@ class SharedTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             compare.shared_rows([sig(0x1, 1, 'draw a')], [sig(0x1, 1, 'draw a')], 0, 10, 2.0)
 
+    def test_bad_ratio(self):
+        for ratio in (0.0, -1.0, float('nan'), float('inf')):
+            with self.subTest(ratio=ratio), self.assertRaises(ValueError):
+                compare.shared_rows([sig(0x1, 1, 'draw a')], [sig(0x1, 1, 'draw a')], 10, 10, ratio)
+
 
 class CoverageTest(unittest.TestCase):
 

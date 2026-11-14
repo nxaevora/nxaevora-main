@@ -351,7 +351,7 @@ DrawRecShaderEntry* drawrec_shader_cache_find(DrawRecShaderCache* c, u64 gva, in
 }
 
 DrawRecShaderEntry* drawrec_shader_cache_insert(DrawRecShaderCache* c, u64 gva, int compute, u64 hash, u32 len,
-                                                u64 gw, u32 wseen, u64 frame) {
+                                                u64 gw, u32 wseen, u64 epoch) {
     u32 first, probe;
     if (!c || !c->entries || !c->size) return NULL;
     first = shader_cache_slot(c, gva);
@@ -365,7 +365,7 @@ DrawRecShaderEntry* drawrec_shader_cache_insert(DrawRecShaderCache* c, u64 gva, 
         e->len = len;
         e->gw = gw;
         e->wseen = wseen;
-        e->checked = frame;
+        e->checked = epoch;
         return e;
     }
     return NULL;
@@ -375,4 +375,4 @@ void drawrec_shader_cache_clear(DrawRecShaderCache* c) {
     if (c && c->entries) memset(c->entries, 0, (size_t)c->size * sizeof *c->entries);
 }
 
-int drawrec_shader_entry_due(const DrawRecShaderEntry* e, u64 frames) { return e->checked != frames; }
+int drawrec_shader_entry_due(const DrawRecShaderEntry* e, u64 epoch) { return e->checked != epoch; }
