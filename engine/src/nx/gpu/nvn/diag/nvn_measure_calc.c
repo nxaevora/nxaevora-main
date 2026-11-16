@@ -41,6 +41,13 @@ double nvn_measure_ms(uint64_t ns, uint64_t presents) {
     return (double)ns / (double)presents / 1000000.0;
 }
 
+uint64_t nvn_measure_rest_ns(uint64_t total, const uint64_t* parts, size_t count) {
+    uint64_t sum = 0;
+    if (!parts || count == 0) return total;
+    for (size_t i = 0; i < count; i++) sum += parts[i];
+    return sum > total ? 0 : total - sum;
+}
+
 /* 1 when key i may follow the last picked pair: a smaller key, or an equal key at a larger index. */
 static int top_candidate(const uint64_t* keys, uint32_t i, int have_last, uint64_t last_key, uint32_t last_index) {
     if (!keys[i]) return 0;

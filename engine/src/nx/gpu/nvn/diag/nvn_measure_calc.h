@@ -5,6 +5,7 @@
    header, no global state, so the host test links it alone. */
 #ifndef SNX_GPU_NVN_MEASURE_CALC_H
 #define SNX_GPU_NVN_MEASURE_CALC_H
+#include <stddef.h>
 #include <stdint.h>
 
 /* the presents of one log window */
@@ -23,6 +24,10 @@ void nvn_measure_frame_stats(const uint32_t* frame_us, uint32_t count, NvnMeasur
 
 /* The mean milliseconds of ns over presents, 0 when presents is 0. */
 double nvn_measure_ms(uint64_t ns, uint64_t presents);
+
+/* The time of total outside the count parts: total minus their sum, 0 when the sum is larger than total (clock
+   jitter) and total when parts is NULL or count is 0. */
+uint64_t nvn_measure_rest_ns(uint64_t total, const uint64_t* parts, size_t count);
 
 /* Writes the indexes of the at most k largest keys with a key above 0 to out_index, largest first, and returns the
    number written. Equal keys keep index order. It allocates nothing and does not change keys. count 0 or k 0 gives

@@ -5507,7 +5507,10 @@ static void replay_bind_send_all(NvnNativeReplayHost* host) {
 static int replay_host_draw(void* ctx, const NvnOpDraw* op) {
     NvnNativeReplayHost* host = ctx;
     if (op->kind >= (uint32_t)NVN_DRAW_KIND_COUNT) return 0;
+    int measure = g_settings.nvn_measure != 0;
+    u64 bind_t0 = measure ? plat_ns() : 0;
     replay_bind_send_all(host);
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_BIND, plat_ns() - bind_t0);
     uint32_t words[NVN_DRAW_WORDS_MAX];
     int uses_constants = 0;
     uint32_t count = nvn_draw_words(op->kind, op->mode, op->type, op->count, op->address, op->first,

@@ -12,10 +12,12 @@
 #include <string.h>
 #include "nx/runtime/options.h"
 #include "nx/gpu/gpu.h"
+#include "nx/gpu/nvn/diag/nvn_measure.h"
 #include "nx/gpu/renderer.h"
 #include "nx/gpu/shader/shader.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/runtime/platform/log.h"
+#include "nx/runtime/platform/plat.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/scale.h"
 #include "nx/gpu/vk/pending_pages.h"
@@ -2505,11 +2507,16 @@ static u64 draw_last_vertex(GpuChannel* ch, int indexed, u32 first, u32 count, u
 
 static void render_draw(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count, u32 base_vertex,
                         u32 base_instance, u32 instances);
+/* The clock of one part of a draw, read only when the measure is on. */
+static inline u64 measure_now(int on) { return on ? plat_ns() : 0; }
 /* a draw as a profiler zone (SNX_TRACY builds), around its many ways out */
 void vk_render_draw(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count, u32 base_vertex, u32 base_instance,
                     u32 instances) {
     SNX_ZONE(z, "draw");
+    int measure = g_settings.nvn_measure != 0;
+    u64 part_t0 = measure_now(measure);
     render_draw(ch, indexed, topology, first, count, base_vertex, base_instance, instances);
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_DRAW, plat_ns() - part_t0);
     SNX_ZONE_END(z);
 }
 static void render_draw(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count, u32 base_vertex,
@@ -2519,6 +2526,8 @@ static void render_draw(GpuChannel* ch, int indexed, u32 topology, u32 first, u3
     int bset_ok, b;
     VkSh *vs, *tcs, *tes, *gs, *between[3];
     VkDescriptorSet bset[3];
+    int measure = g_settings.nvn_measure != 0;
+    u64 part_t0;
     if (!count || !instances) return;
     vk_frame_check();
     if (g_draw.check < 0) {
@@ -2547,6 +2556,7 @@ retry:
     u32 epoch = __atomic_load_n(&g_vk_epoch, __ATOMIC_RELAXED);
     /* kept: the state the last draw made holds for this one, as far as each check below tells. Each part is made
        here when it doesn't (and when SNX_DIRTY_CHECK compares) */
+    part_t0 = measure_now(measure);
     int kept = draw_kept(ch, draw_topo, epoch);
     if (kept && g_draw.check) g_vk_draw_checked++;
     DrawShaders sh;
@@ -2558,6 +2568,7 @@ retry:
                 draw_differs("shaders");
                 g_draw.sh.vs = NULL;
             }
+            if (measure) nvn_measure_part(NVN_MEASURE_PART_SHADER, plat_ns() - part_t0);
             g_vk_skipped++;
             return;
         }
@@ -2567,6 +2578,7 @@ retry:
         }
         sh = made;
     }
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_SHADER, plat_ns() - part_t0);
     topology = sh.topology;
     vs = sh.vs;
     tcs = sh.tcs;
@@ -2581,7 +2593,9 @@ retry:
     VkSh* fs = NULL;
     FsKey fk = {0};
     if (sh.fs0) {
+        part_t0 = measure_now(measure);
         fs_key(ch, sh.fs0, fres, last->si.out_mask, sh.rt_int, sh.rt_sint, &fk);
+        if (measure) nvn_measure_part(NVN_MEASURE_PART_FSKEY, plat_ns() - part_t0);
         if (kept && memcmp(&fk, &g_draw.fkey, sizeof fk)) kept = 0;
         if (kept) fs = g_draw.fs;
         if (!kept || g_draw.check) {
@@ -2603,7 +2617,9 @@ retry:
     Surf* rt[8];
     Surf* zt;
     u32 n;
+    part_t0 = measure_now(measure);
     read_targets(ch, rt, &zt, &n);
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_TARGETS, plat_ns() - part_t0);
     for (u32 i = 0; i < n; i++)
         if (trace_target(rt[i]))
             LOG_LIMIT(64,
@@ -2663,6 +2679,7 @@ retry:
     /* the pipeline key and its vertex bindings: the kept ones when the targets' formats and the empty streams are the
        same too */
     TargetFormats tf;
+    part_t0 = measure_now(measure);
     target_formats(rt, zt, n, &tf);
     if (kept && (memcmp(&tf, &g_draw.tf, sizeof tf) || attributes_empty(r, vs->si.in_mask) != g_draw.plan.empty))
         kept = 0;
@@ -2676,6 +2693,7 @@ retry:
                 draw_differs("pipeline key");
                 g_draw.sh.vs = NULL;
             }
+            if (measure) nvn_measure_part(NVN_MEASURE_PART_SHADER, plat_ns() - part_t0);
             g_vk_skipped++;
             return;
         }
@@ -2686,6 +2704,7 @@ retry:
         k = &made_k;
         pl = &made_pl;
     }
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_SHADER, plat_ns() - part_t0);
     /* each binding's buffer: all of them prefetched first (vk_buf_prefetch), then looked up */
     VkBuffer vbuf[33];
     VkDeviceSize voff[33], vsize[33];
@@ -2695,12 +2714,14 @@ retry:
     } vq[33];
     u32 nvq = 0;
     /* each stream up to the last vertex or instance the draw reads, rather than to its limit */
+    part_t0 = measure_now(measure);
     u64 last_vertex = k->nbind ? draw_last_vertex(ch, indexed, first, count, base_vertex) : ~0ull;
     u64 last_instance = (u64)base_instance + instances - 1;
     for (u32 v = 0; v < k->nbind; v++) {
         if (pl->key[v] == ~0u || pl->key[v] == ~1u) {
             /* the constants: staging that fails skips the draw (it once drew without the attributes) */
             if (!frame_consts(&vbuf[v], &voff[v])) {
+                if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
                 g_vk_skipped++;
                 return;
             }
@@ -2727,6 +2748,7 @@ retry:
         u32 base = pl->key[v] >> 5;
         if (base >= len) {
             if (!frame_consts(&vbuf[v], &voff[v])) {
+                if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
                 g_vk_skipped++;
                 return;
             }
@@ -2747,6 +2769,7 @@ retry:
         if (pl->guest_stride[b]) {
             if (!copy_restrided(vq[q].gva + vq[q].base, vq[q].len - vq[q].base, pl->guest_stride[b], (u32)pl->stride[b],
                                 &vbuf[b], &voff[b], &vsize[b])) {
+                if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
                 g_vk_skipped++;
                 return;
             }
@@ -2754,12 +2777,14 @@ retry:
         }
         /* vertex formats have components of up to 4 bytes, which each attribute's address must be a multiple of */
         if (!vk_buf_get_input(vq[q].gva, vq[q].len, 4, &vbuf[vq[q].b], &voff[vq[q].b])) {
+            if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
             g_vk_skipped++;
             return;
         }
         voff[vq[q].b] += vq[q].base;
         vsize[vq[q].b] = vq[q].len - vq[q].base;
     }
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
     VkPrimitiveTopology topo = topology_vk(topology);
 
     /* descriptor sets (may record uploads and barriers, so before the pass opens) */
@@ -2767,24 +2792,30 @@ retry:
     if (fs) cb_prefetch(ch, 4, fs, 1);
     draw_indices_prefetch(ch, indexed, first, count, 1);
     VkDrawStorage storage;
+    part_t0 = measure_now(measure);
     draw_storage_read(ch, &storage, vs, fs);
     int alias = storage.n[0] || storage.n[1] ? vk_buf_draw_has_alias(&storage) : 0;
     if (alias < 0) {
+        if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
         g_vk_skipped++;
         return;
     }
     if ((storage.n[0] || storage.n[1]) && !vk_buf_draw_prepare(&storage)) {
+        if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
         g_vk_skipped++;
         return;
     }
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
     int zt_ro = 0;
     u32 fb = 0;
     u64 scaled = 0, aspect = 0;
     DrawImages images = {0};
+    part_t0 = measure_now(measure);
     VkDescriptorSet vset = stage_set(ch, 0, vs, rt, zt, n, &zt_ro, NULL, NULL, NULL, NULL, &storage, &images);
     VkDescriptorSet fset =
         fs ? stage_set(ch, 4, fs, rt, zt, n, &zt_ro, &fb, &scaled, &aspect, fres, &storage, &images)
            : VK_NULL_HANDLE;
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_SETS, plat_ns() - part_t0);
     /* the sets of the stages between, at their stage's index (shader_vk_set) */
     between[0] = tcs;
     between[1] = tes;
@@ -2808,6 +2839,7 @@ retry:
     }
     /* indices, up to the end of the index buffer (0x5F4, inclusive). What is made into other indices on the CPU (quads,
        8-bit indices, another restart index) is capped */
+    part_t0 = measure_now(measure);
     VkBuffer ibuf = VK_NULL_HANDLE;
     u64 ioff = 0;
     VkIndexType itype = VK_INDEX_TYPE_UINT32;
@@ -2819,6 +2851,7 @@ retry:
                   first + count - 1, (unsigned long long)avail);
         if (first >= avail) {
             draw_images_discard(&images);
+            if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
             return;
         }
         count = (u32)(avail - first);
@@ -2843,6 +2876,7 @@ retry:
         u32* idx = (u32*)vk_stage((u64)nq * 24 + 4, vk_stage_align(), &ibuf, &ioff);
         if (!idx) {
             draw_images_discard(&images);
+            if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
             return;
         }
         /* guest indices are little-endian, the inline ones host words (already widened), and what the device reads
@@ -2876,6 +2910,7 @@ retry:
             u32* o = (u32*)vk_stage((u64)count * 4, vk_stage_align(), &ibuf, &ioff);
             if (!o) {
                 draw_images_discard(&images);
+                if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
                 return;
             }
             memcpy(o, ch->inline_indices + first, (size_t)count * 4);
@@ -2889,6 +2924,7 @@ retry:
             u16* o = (u16*)vk_stage((u64)count * 2, vk_stage_align(), &ibuf, &ioff);
             if (!o) {
                 draw_images_discard(&images);
+                if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
                 return;
             }
             for (u32 j = 0; j < count; j++) {
@@ -2908,6 +2944,7 @@ retry:
                 u8* o = vk_stage(bytes, vk_stage_align(), &ibuf, &ioff);
                 if (!o) {
                     draw_images_discard(&images);
+                    if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
                     return;
                 }
                 gmem_read(ia + (u64)first * isz, o, bytes);
@@ -2918,11 +2955,13 @@ retry:
                         memset(o + (u64)j * 4, 0xFF, 4);
             } else if (!vk_buf_get_input(ia + (u64)first * isz, bytes, isz, &ibuf, &ioff)) {
                 draw_images_discard(&images);
+                if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
                 return;
             }
             itype = isz == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
         }
     }
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_BUFFERS, plat_ns() - part_t0);
 
     /* the transform feedback buffers (0xE0 + 8 * i: enable, address, size, start offset), from the start offset on as
        Eden's UpdateTransformFeedbackBuffer binds them: a writable copy of guest memory each, which lands there and
@@ -2960,6 +2999,7 @@ retry:
     /* the kept pipeline, or the last draw's when its key is the same (draws in a row mostly are): one comparison of
        the key, where the table hashed all of it each draw. Pipelines and modules live as long as the run, so the
        handle stays good, a stand-in for one still being made too (vk_pipeline_get_deferred) */
+    part_t0 = measure_now(measure);
     VkPipeline pipe;
     if (kept) {
         pipe = g_draw.pipe;
@@ -2975,6 +3015,7 @@ retry:
         pipe = g_draw.pipe;
     else
         pipe = vk_pipeline_get_deferred(k);
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_SHADER, plat_ns() - part_t0);
     if (!pipe) {
         draw_images_discard(&images);
         g_vk_skipped++;
@@ -3025,11 +3066,14 @@ retry:
         rec_CmdPipelineBarrier2(vk_cmd(), &di);
     }
     int zt_undefined = zt && zt->layout == VK_IMAGE_LAYOUT_UNDEFINED;
+    part_t0 = measure_now(measure);
     if (!n && !zt ? !render_begin_empty()
                   : !render_begin(rt, zt, n, zt_ro, r[0x56E] & 1, fb) || !feedback_order(fb, writes)) {
+        if (measure) nvn_measure_part(NVN_MEASURE_PART_TARGETS, plat_ns() - part_t0);
         draw_images_discard(&images);
         return;
     }
+    if (measure) nvn_measure_part(NVN_MEASURE_PART_TARGETS, plat_ns() - part_t0);
     VkCommandBuffer cb = vk_cmd();
     /* only what differs from the previous draw's in this command buffer (g_dyn) */
     int fresh = g_dyn.cb != vk_cb_begun();

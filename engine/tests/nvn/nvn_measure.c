@@ -64,6 +64,19 @@ static void test_ms(void) {
     CHECK(nvn_measure_ms(3000000000u, 2) == 1500.0);
 }
 
+/* The draw time outside its parts: 1000 - (100 + 200 + 300) = 400, and 0 when the sum is over the total (clock
+   jitter) or exactly it. With no part, the total is the rest. */
+static void test_rest(void) {
+    const uint64_t parts[] = {100, 200, 300};
+    const uint64_t over[] = {600, 600};
+    const uint64_t exact[] = {400, 600};
+    CHECK(nvn_measure_rest_ns(1000, parts, 3) == 400);
+    CHECK(nvn_measure_rest_ns(1000, over, 2) == 0);
+    CHECK(nvn_measure_rest_ns(1000, exact, 2) == 0);
+    CHECK(nvn_measure_rest_ns(1000, parts, 0) == 1000);
+    CHECK(nvn_measure_rest_ns(1000, NULL, 2) == 1000);
+}
+
 /* count 0, k 0, and keys that are all 0: no index is written. */
 static void test_top_empty(void) {
     const uint64_t keys[] = {5, 6};
@@ -164,6 +177,7 @@ int main(void) {
     test_window();
     test_unsorted_input();
     test_ms();
+    test_rest();
     test_top_empty();
     test_top_fewer_than_k();
     test_top_equal_keys();

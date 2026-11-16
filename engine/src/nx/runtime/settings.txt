@@ -779,7 +779,9 @@ setting NVN measure
     startup
     words Off|On
     help 1 = logs the CPU time of the guest and GPU sides of both NVN paths each 600 presents (gpu/nvn/diag/nvn_measure.c),
-    help with the frame time median, 99th percentile, maximum and the draw counts. 0 = no measure and no clock read
+    help with the frame time median, 99th percentile, maximum and the draw counts. With 1 the line also has draw_ms=,
+    help shader_ms=, fskey_ms=, targets_ms=, buffers_ms=, sets_ms=, rest_ms= and bind_ms=, the mean host time per frame
+    help of each part of one draw. 0 = no measure and no clock read
 setting NVN native missing
     key nvn_native_missing
     int 0 1
