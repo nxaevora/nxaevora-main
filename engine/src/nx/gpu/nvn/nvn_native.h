@@ -5,6 +5,7 @@
 
 #include "common/cpu/aarch64/cpu.h"
 #include "nx/gpu/gpu.h"
+#include "nx/gpu/nvn/nvn_dirty_bits.h"
 #include "nx/gpu/nvn/nvn_replay.h"
 
 /* nvn_legacy=0: the host answers the NVN functions that the game resolves, and the game's NVN library does not run
@@ -37,15 +38,15 @@ typedef struct {
     uint64_t texture_handle[NVN_BIND_STAGE_MAX + 1u][NVN_BIND_SLOT_MAX];
     uint8_t texture_bound[NVN_BIND_STAGE_MAX + 1u][NVN_BIND_SLOT_MAX];
     uint8_t texture_plural[NVN_BIND_STAGE_MAX + 1u][NVN_BIND_SLOT_MAX];
-    uint8_t texture_dirty[NVN_BIND_STAGE_MAX + 1u][NVN_BIND_SLOT_MAX];
+    uint64_t texture_dirty[NVN_BIND_STAGE_MAX + 1u][NVN_DIRTY_WORDS(NVN_BIND_SLOT_MAX)];
     /* The buffer binds of one frame job, written by the replay and read by the shader and pipeline stage later. */
     NvnBindEntry uniform[NVN_BIND_STAGE_MAX + 1u][NVN_UNIFORM_SLOT_MAX];
     NvnBindEntry storage[NVN_BIND_STAGE_MAX + 1u][NVN_STORAGE_SLOT_MAX];
     NvnBindEntry vertex[NVN_VERTEX_SLOT_MAX];
     NvnBindEntry xfb[NVN_XFB_SLOT_MAX];
-    uint8_t uniform_dirty[NVN_BIND_STAGE_MAX + 1u][NVN_UNIFORM_SLOT_MAX];
-    uint8_t storage_dirty[NVN_BIND_STAGE_MAX + 1u][NVN_STORAGE_SLOT_MAX];
-    uint8_t vertex_dirty[NVN_VERTEX_SLOT_MAX];
+    uint64_t uniform_dirty[NVN_BIND_STAGE_MAX + 1u][NVN_DIRTY_WORDS(NVN_UNIFORM_SLOT_MAX)];
+    uint64_t storage_dirty[NVN_BIND_STAGE_MAX + 1u][NVN_DIRTY_WORDS(NVN_STORAGE_SLOT_MAX)];
+    uint64_t vertex_dirty[NVN_DIRTY_WORDS(NVN_VERTEX_SLOT_MAX)];
     /* The bound state objects of one frame job, written by the replay and read by the pipeline stage later. */
     NvnBoundState state[NVN_STATE_COUNT];
     uint8_t state_dirty[NVN_STATE_COUNT];

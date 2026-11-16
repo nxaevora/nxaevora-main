@@ -5234,7 +5234,7 @@ static int replay_host_bind_texture_store(NvnNativeReplayHost* host, uint32_t st
     host->texture_handle[stage][slot] = handle;
     host->texture_bound[stage][slot] = 1;
     host->texture_plural[stage][slot] = (uint8_t)plural;
-    host->texture_dirty[stage][slot] = NVN_BIND_DIRTY;
+    nvn_dirty_set(host->texture_dirty[stage], NVN_DIRTY_WORDS(NVN_BIND_SLOT_MAX), slot);
     return 1;
 }
 static int replay_host_bind_texture(void* ctx, uint32_t stage, uint32_t slot, uint64_t handle) {
@@ -5261,22 +5261,26 @@ static int replay_host_send_xfb_bind(NvnNativeReplayHost* host, const NvnOpBindB
 static int replay_host_bind_buffer(void* ctx, const NvnOpBindBuffer* op) {
     NvnNativeReplayHost* host = ctx;
     NvnBindEntry* entry;
-    uint8_t* dirty = NULL;
+    uint64_t* dirty = NULL;
+    uint32_t dirty_words = 0;
     switch ((NvnBindKind)op->kind) {
     case NVN_BIND_UNIFORM:
         if (op->stage > NVN_BIND_STAGE_MAX || op->slot >= NVN_UNIFORM_SLOT_MAX) return 0;
         entry = &host->uniform[op->stage][op->slot];
-        dirty = &host->uniform_dirty[op->stage][op->slot];
+        dirty = host->uniform_dirty[op->stage];
+        dirty_words = NVN_DIRTY_WORDS(NVN_UNIFORM_SLOT_MAX);
         break;
     case NVN_BIND_STORAGE:
         if (op->stage > NVN_BIND_STAGE_MAX || op->slot >= NVN_STORAGE_SLOT_MAX) return 0;
         entry = &host->storage[op->stage][op->slot];
-        dirty = &host->storage_dirty[op->stage][op->slot];
+        dirty = host->storage_dirty[op->stage];
+        dirty_words = NVN_DIRTY_WORDS(NVN_STORAGE_SLOT_MAX);
         break;
     case NVN_BIND_VERTEX:
         if (op->slot >= NVN_VERTEX_SLOT_MAX) return 0;
         entry = &host->vertex[op->slot];
-        dirty = &host->vertex_dirty[op->slot];
+        dirty = host->vertex_dirty;
+        dirty_words = NVN_DIRTY_WORDS(NVN_VERTEX_SLOT_MAX);
         break;
     case NVN_BIND_TRANSFORM_FEEDBACK:
         if (op->slot >= NVN_XFB_SLOT_MAX) return 0;
@@ -5289,7 +5293,7 @@ static int replay_host_bind_buffer(void* ctx, const NvnOpBindBuffer* op) {
     entry->size = op->size;
     entry->bound = (uint8_t)nvn_bind_buffer_active((NvnBindKind)op->kind, op->addr, op->size);
     entry->plural = (uint8_t)(op->plural != 0);
-    if (dirty) *dirty = NVN_BIND_DIRTY;
+    if (dirty) nvn_dirty_set(dirty, dirty_words, op->slot);
     if (op->kind == NVN_BIND_TRANSFORM_FEEDBACK) return replay_host_send_xfb_bind(host, op);
     return 1;
 }
@@ -5411,9 +5415,8 @@ static void replay_bind_send_vertex_stream(NvnNativeReplayHost* host) {
 }
 /* Decision 7: only a bound slot is sent. A later size 0 bind disables the slot in the host table but sends nothing. */
 static void replay_bind_send_vertex_buffers(NvnNativeReplayHost* host) {
-    for (uint32_t i = 0; i < NVN_VERTEX_SLOT_MAX; i++) {
-        if (!host->vertex_dirty[i]) continue;
-        host->vertex_dirty[i] = 0;
+    uint32_t i;
+    while (nvn_dirty_take(host->vertex_dirty, NVN_DIRTY_WORDS(NVN_VERTEX_SLOT_MAX), &i)) {
         if (!host->vertex[i].bound) continue;
         uint32_t out[NVN_BIND_VERTEX_BUFFER_WORDS_MAX];
         uint32_t words =
@@ -5425,9 +5428,8 @@ static void replay_bind_send_vertex_buffers(NvnNativeReplayHost* host) {
 /* A size 0 uniform bind is sent too: the builder writes the invalid bind word for it. */
 static void replay_bind_send_uniforms(NvnNativeReplayHost* host) {
     for (uint32_t stage = 0; stage < NVN_BIND_STAGE_COMPUTE; stage++) {
-        for (uint32_t slot = 0; slot < NVN_UNIFORM_SLOT_MAX; slot++) {
-            if (!host->uniform_dirty[stage][slot]) continue;
-            host->uniform_dirty[stage][slot] = 0;
+        uint32_t slot;
+        while (nvn_dirty_take(host->uniform_dirty[stage], NVN_DIRTY_WORDS(NVN_UNIFORM_SLOT_MAX), &slot)) {
             const NvnBindEntry* entry = &host->uniform[stage][slot];
             if (entry->size > UINT32_MAX) {
                 replay_bind_refuse(host, "uniform buffer", (int32_t)stage, (int32_t)slot, (uint32_t)entry->addr);
@@ -5445,9 +5447,8 @@ static void replay_bind_send_uniforms(NvnNativeReplayHost* host) {
    from BindStorageBuffers keeps the plural mode 3 form. */
 static void replay_bind_send_storages(NvnNativeReplayHost* host) {
     for (uint32_t stage = 0; stage < NVN_BIND_STAGE_COMPUTE; stage++) {
-        for (uint32_t slot = 0; slot < NVN_STORAGE_SLOT_MAX; slot++) {
-            if (!host->storage_dirty[stage][slot]) continue;
-            host->storage_dirty[stage][slot] = 0;
+        uint32_t slot;
+        while (nvn_dirty_take(host->storage_dirty[stage], NVN_DIRTY_WORDS(NVN_STORAGE_SLOT_MAX), &slot)) {
             const NvnBindEntry* entry = &host->storage[stage][slot];
             if (entry->size > UINT32_MAX) {
                 replay_bind_refuse(host, "storage buffer", (int32_t)stage, (int32_t)slot, (uint32_t)entry->addr);
@@ -5468,9 +5469,8 @@ static void replay_bind_send_storages(NvnNativeReplayHost* host) {
 }
 static void replay_bind_send_textures(NvnNativeReplayHost* host) {
     for (uint32_t stage = 0; stage < NVN_BIND_STAGE_COMPUTE; stage++) {
-        for (uint32_t slot = 0; slot < NVN_BIND_SLOT_MAX; slot++) {
-            if (!host->texture_dirty[stage][slot]) continue;
-            host->texture_dirty[stage][slot] = 0;
+        uint32_t slot;
+        while (nvn_dirty_take(host->texture_dirty[stage], NVN_DIRTY_WORDS(NVN_BIND_SLOT_MAX), &slot)) {
             uint64_t handle = host->texture_handle[stage][slot];
             uint32_t out[NVN_BIND_TEXTURES_WORDS_MAX];
             uint32_t words = host->texture_plural[stage][slot]
@@ -5612,12 +5612,9 @@ static void replay_dispatch_binds(const NvnNativeReplayHost* host, NvnComputeBin
 
 /* Clears the stage 5 binds that the dispatch sent. */
 static void replay_dispatch_clear_dirty(NvnNativeReplayHost* host) {
-    for (uint32_t slot = 0; slot < NVN_UNIFORM_SLOT_MAX; slot++)
-        host->uniform_dirty[NVN_BIND_STAGE_COMPUTE][slot] = 0;
-    for (uint32_t slot = 0; slot < NVN_STORAGE_SLOT_MAX; slot++)
-        host->storage_dirty[NVN_BIND_STAGE_COMPUTE][slot] = 0;
-    for (uint32_t slot = 0; slot < NVN_BIND_SLOT_MAX; slot++)
-        host->texture_dirty[NVN_BIND_STAGE_COMPUTE][slot] = 0;
+    nvn_dirty_clear(host->uniform_dirty[NVN_BIND_STAGE_COMPUTE], NVN_DIRTY_WORDS(NVN_UNIFORM_SLOT_MAX));
+    nvn_dirty_clear(host->storage_dirty[NVN_BIND_STAGE_COMPUTE], NVN_DIRTY_WORDS(NVN_STORAGE_SLOT_MAX));
+    nvn_dirty_clear(host->texture_dirty[NVN_BIND_STAGE_COMPUTE], NVN_DIRTY_WORDS(NVN_BIND_SLOT_MAX));
 }
 
 static int replay_host_dispatch(void* ctx, const NvnOpDispatch* op) {

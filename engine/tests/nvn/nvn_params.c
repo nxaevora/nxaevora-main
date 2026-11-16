@@ -3,6 +3,7 @@
 /* Device and queue cases use the library results of 2026-11-02. Pool cases check the accepted disassembly table
    and the host GPU address allocation rule. */
 #include "nx/gpu/nvn/nvn_params.h"
+#include "nx/gpu/nvn/nvn_dirty_bits.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -3665,6 +3666,57 @@ static void test_proc_table_check(void) {
     CHECK(nvn_proc_table_check(first_bad, addrs, 5, 0x1000, 0x1014) == 0);
 }
 
+static void test_dirty_bits(void) {
+    /* 128 slots take two words, 32 slots one word and 0 slots none */
+    CHECK(NVN_DIRTY_WORDS(128) == 2);
+    CHECK(NVN_DIRTY_WORDS(32) == 1);
+    CHECK(NVN_DIRTY_WORDS(0) == 0);
+    uint64_t map[2] = {0, 0};
+    uint32_t slot;
+    nvn_dirty_set(map, 2, 3);
+    nvn_dirty_set(map, 2, 64);
+    nvn_dirty_set(map, 2, 127);
+    CHECK(nvn_dirty_take(map, 2, &slot) == 1 && slot == 3);
+    CHECK(nvn_dirty_take(map, 2, &slot) == 1 && slot == 64);
+    CHECK(nvn_dirty_take(map, 2, &slot) == 1 && slot == 127);
+    CHECK(nvn_dirty_take(map, 2, &slot) == 0);
+    CHECK(map[0] == 0 && map[1] == 0);
+    /* a slot at or above 2 * 64 is ignored */
+    map[0] = 0x5;
+    map[1] = 0xa;
+    nvn_dirty_set(map, 2, 128);
+    CHECK(map[0] == 0x5 && map[1] == 0xa);
+    /* the same slot twice gives one take */
+    nvn_dirty_clear(map, 2);
+    nvn_dirty_set(map, 2, 70);
+    nvn_dirty_set(map, 2, 70);
+    CHECK(nvn_dirty_take(map, 2, &slot) == 1 && slot == 70);
+    CHECK(nvn_dirty_take(map, 2, &slot) == 0);
+    /* clear zeroes every word, and an empty take writes nothing */
+    map[0] = UINT64_MAX;
+    map[1] = UINT64_MAX;
+    nvn_dirty_clear(map, 2);
+    CHECK(map[0] == 0 && map[1] == 0);
+    slot = 0xFFFFFFFFu;
+    CHECK(nvn_dirty_take(map, 2, &slot) == 0);
+    CHECK(slot == 0xFFFFFFFFu);
+    /* one word: slot 0 before slot 63 */
+    uint64_t one[1] = {0};
+    nvn_dirty_set(one, 1, 63);
+    nvn_dirty_set(one, 1, 0);
+    CHECK(nvn_dirty_take(one, 1, &slot) == 1 && slot == 0);
+    CHECK(nvn_dirty_take(one, 1, &slot) == 1 && slot == 63);
+    CHECK(nvn_dirty_take(one, 1, &slot) == 0);
+    /* a NULL map or a NULL slot changes nothing */
+    nvn_dirty_set(NULL, 2, 0);
+    nvn_dirty_clear(NULL, 2);
+    slot = 0xFFFFFFFFu;
+    CHECK(nvn_dirty_take(NULL, 2, &slot) == 0);
+    CHECK(slot == 0xFFFFFFFFu);
+    CHECK(nvn_dirty_take(one, 1, NULL) == 0);
+    CHECK(nvn_dirty_take(one, 0, &slot) == 0);
+}
+
 int main(int argc, char** argv) {
     test_compute_qmd_size_limits();
     test_window_params();
@@ -3785,6 +3837,7 @@ int main(int argc, char** argv) {
     test_span_inside();
     test_proc_name_index();
     test_proc_table_check();
+    test_dirty_bits();
     if (failures) {
         printf("%d failures\n", failures);
         return 1;
