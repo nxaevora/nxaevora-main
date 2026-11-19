@@ -227,6 +227,8 @@ void vk_compute_mem_need(u64 a, u64 n) { (void)a, (void)n; }
 void vk_defer_image(VkImage img, VmaAllocation a, VkImageView v1, VkImageView v2) {
     (void)img, (void)a, (void)v1, (void)v2;
 }
+/* SNX_ARCEUS_PASS_GUEST's blit counter (gpu/vk/pass_guest.c): no guest copy is made here */
+void pass_guest_blit(void) {}
 u64 vk_hash(const void* p, u64 size) { /* FNV-1a over the bytes: mem_hash's check below tells contents apart */
     const u8* b = (const u8*)p;
     u64 h = 1469598103934665603ull;

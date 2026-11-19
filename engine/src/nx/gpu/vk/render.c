@@ -18,6 +18,7 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/scale.h"
+#include "nx/gpu/vk/pass_guest.h"
 #include "nx/gpu/vk/pending_pages.h"
 #include "nx/gpu/vk/internal_spv.h"
 #include "nx/runtime/platform/tracy.h"
@@ -1636,6 +1637,26 @@ static VkDescriptorSet stage_set(GpuChannel* ch, int stage, VkSh* s, Surf** rt, 
     SNX_ZONE_END(z);
     return set;
 }
+/* SNX_ARCEUS_PASS_GUEST: the fragment set being written is a reduced pass's, and the textures it read as copies */
+static int g_pg_draw;
+static u32 g_pg_textures;
+/* what a reduced pass samples in place of t, a scaled color target or a crop of one in its format: that region of the
+   target at guest size (vk_rt_guest). Anything else, or a copy that can't be made (counted), stays t */
+static Surf* pass_guest_source(Surf* t) {
+    if (!t || !t->is_rt || t->guest_copy || t->f.depth || t->f.stencil || (t->sw == t->w && t->sh == t->h)) return t;
+    Surf* rt = vk_rt_find(t->gva);
+    if (!rt || rt->member || rt->group || rt->depth3d > 1 || rt->layout == VK_IMAGE_LAYOUT_UNDEFINED ||
+        rt->f.vk != t->f.vk || t->w > rt->w || t->h > rt->h)
+        return t;
+    int why = 0;
+    Surf* g = vk_rt_guest(rt, t->w, t->h, &why);
+    if (!g) {
+        pass_guest_fallback(why);
+        return t;
+    }
+    g_pg_textures++;
+    return g;
+}
 static VkDescriptorSet stage_set_(GpuChannel* ch, int stage, VkSh* s, Surf** rt, Surf* zt, u32 n, int* zt_ro,
                                   u32* fb, u64* scaled, u64* aspect, TexRes* res, const VkDrawStorage* draw,
                                   DrawImages* images) {
@@ -1754,8 +1775,10 @@ static VkDescriptorSet stage_set_(GpuChannel* ch, int stage, VkSh* s, Surf** rt,
                 } else
                     LOG_LIMIT(1, "vulkan: a draw samples a target it renders to (read as empty)\n");
             }
-        } else
+        } else {
+            if (g_pg_draw && stage == 4) t = pass_guest_source(t);
             view = vk_tex_bind_view(t, want, x->tic, x->tsc, num);
+        }
         const Surf* sampled = view ? t : NULL; /* the texture whose own view is bound, for the sampler */
         if (scaled && sampled && (sampled->sw != sampled->w || sampled->sh != sampled->h))
             *scaled |= 1ull << i;
@@ -2782,9 +2805,20 @@ retry:
     u64 scaled = 0, aspect = 0;
     DrawImages images = {0};
     VkDescriptorSet vset = stage_set(ch, 0, vs, rt, zt, n, &zt_ro, NULL, NULL, NULL, NULL, &storage, &images);
+    /* SNX_ARCEUS_PASS_GUEST: a reduced pass reads the scaled color targets it samples through guest-size copies */
+    if (fs && g_pass_guest && pass_guest_on(g_vk_scale) > 0) {
+        u32 tw[8] = {0}, th[8] = {0};
+        for (u32 i = 0; i < n && i < 8; i++)
+            if (rt[i]) tw[i] = rt[i]->w, th[i] = rt[i]->h;
+        pass_guest_window(g_vk_present);
+        g_pg_draw = pass_guest_reduced(initial_count, instances, tw, th, n < 8 ? n : 8, g_pass_shown_w, g_pass_shown_h);
+        g_pg_textures = 0;
+    }
     VkDescriptorSet fset =
         fs ? stage_set(ch, 4, fs, rt, zt, n, &zt_ro, &fb, &scaled, &aspect, fres, &storage, &images)
            : VK_NULL_HANDLE;
+    if (g_pg_draw && g_pg_textures) pass_guest_served(fs->hash, g_pg_textures);
+    g_pg_draw = 0;
     /* the sets of the stages between, at their stage's index (shader_vk_set) */
     between[0] = tcs;
     between[1] = tes;

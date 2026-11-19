@@ -475,6 +475,7 @@ typedef struct Surf {
        (gpu/vk/texture.c rt_crop) */
     struct Surf* crop;
     u32 crop_gen;
+    u8 guest_copy; /* a copy at guest size (vk_rt_guest), refreshed by a blit, in padding: Surf stays its size */
     struct Surf* next;
     /* the recency list it is in (surface.c): textures, render targets (parked ones too), or none (copies, the CPU
        frame), with the device memory its image takes. A list runs from the least recently used to the most */
@@ -507,6 +508,10 @@ Surf* vk_rt_group_for(u64 gva, u64 stride, u32 layers, u32 w, u32 h, const VkFmt
 Surf* vk_zt_array(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, u32 layers, u64 layer_size);
 Surf* vk_rt_find(u64 gva);
 Surf* vk_rt_snapshot(Surf* rt);                  /* copy a target so a draw can sample its contents while writing it */
+/* SNX_ARCEUS_PASS_GUEST: the top-left w x h of a scaled color target at guest size, refreshed by a linear blit when
+   it was drawn to. NULL, with a PASS_GUEST_* reason in *why, for an integer format, one without linear blits, or no
+   memory (texture.c) */
+Surf* vk_rt_guest(Surf* rt, u32 w, u32 h, int* why);
 Surf* vk_rt_for_cpu(u64 cpu_addr, u32 w, u32 h); /* the render target the guest presents from that memory */
 /* a render target read where its guest memory is (a texture, a present): reload it if the GPU wrote its memory */
 void vk_rt_note_read(Surf* s);

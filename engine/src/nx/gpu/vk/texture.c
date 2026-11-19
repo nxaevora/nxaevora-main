@@ -12,6 +12,7 @@
 #include "nx/gpu/renderer.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/gpu/vk/vk.h"
+#include "nx/gpu/vk/pass_guest.h"
 #include "nx/memory/own.h"
 #include "nx/runtime/platform/tracy.h"
 
@@ -529,12 +530,14 @@ static Surf* tex_create(u64 gva, u32 w, u32 h, u32 layers, u32 d3, u32 levels, V
    when the frame being recorded is done, as descriptors may still name them */
 /* the target's top-left w x h copied out, in the target's format, or in as: another color format of the same texel
    size, the target's bytes read as that format (a bit copy, which vkCmdCopyImage makes between such formats) */
-static Surf* rt_crop(Surf* rt, u32 w, u32 h, const VkFmt* as) {
+/* guest (SNX_ARCEUS_PASS_GUEST): the top-left w x h at guest size instead, a linear blit of its scaled region. A
+   guest copy and a crop of one size and format are two entries: each kind is matched and refreshed only as itself */
+static Surf* rt_crop(Surf* rt, u32 w, u32 h, const VkFmt* as, int guest) {
     Surf* c = NULL;
     VkFmt f = as ? *as : rt->f;
     for (Surf** pp = &rt->crop; *pp;) {
         Surf* x = *pp;
-        if (x->w == w && x->h == h && x->f.vk == f.vk)
+        if (x->w == w && x->h == h && x->f.vk == f.vk && x->guest_copy == guest)
             c = x;
         else if ((i32)(g_vk_present - (u32)x->last_used) > 60) {
             *pp = x->next;
@@ -552,8 +555,9 @@ static Surf* rt_crop(Surf* rt, u32 w, u32 h, const VkFmt* as) {
         c->gva = rt->gva;
         c->w = w;
         c->h = h;
-        c->sw = vk_sc(w) < rt->sw ? vk_sc(w) : rt->sw; /* the same region of the scaled target */
-        c->sh = vk_sc(h) < rt->sh ? vk_sc(h) : rt->sh;
+        c->sw = guest ? w : vk_sc(w) < rt->sw ? vk_sc(w) : rt->sw; /* the same region of the scaled target */
+        c->sh = guest ? h : vk_sc(h) < rt->sh ? vk_sc(h) : rt->sh;
+        c->guest_copy = (u8)guest;
         c->layers = rt->layers;
         c->levels = c->depth3d = 1;
         c->f = f;
@@ -580,11 +584,33 @@ static Surf* rt_crop(Surf* rt, u32 w, u32 h, const VkFmt* as) {
         c->crop_gen = ~0u;
         c->next = rt->crop;
         rt->crop = c;
-        if (w != rt->w || h != rt->h)
+        if (!guest && (w != rt->w || h != rt->h))
             LOG_LIMIT(10, "vulkan: %ux%u texture reads the %ux%u render target at %llx: only that region is used\n", w,
                       h, rt->w, rt->h, (unsigned long long)rt->gva);
     }
     c->last_used = g_vk_present;
+    if (c->crop_gen != rt->wgen && guest) {
+        VkCommandBuffer cb = vk_cmd();
+        VkImageBlit b;
+        vk_surf_use(cb, rt, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
+                    VK_ACCESS_2_TRANSFER_READ_BIT);
+        vk_surf_use(cb, c, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        memset(&b, 0, sizeof b);
+        b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.srcSubresource.baseArrayLayer = rt->base_layer;
+        b.dstSubresource.baseArrayLayer = c->base_layer;
+        b.srcSubresource.layerCount = b.dstSubresource.layerCount = rt->layers;
+        b.srcOffsets[1].x = (i32)(vk_sc(w) < rt->sw ? vk_sc(w) : rt->sw);
+        b.srcOffsets[1].y = (i32)(vk_sc(h) < rt->sh ? vk_sc(h) : rt->sh);
+        b.srcOffsets[1].z = b.dstOffsets[1].z = 1;
+        b.dstOffsets[1].x = (i32)w;
+        b.dstOffsets[1].y = (i32)h;
+        rec_CmdBlitImage(cb, rt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, c->img,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+        c->crop_gen = rt->wgen;
+        pass_guest_blit();
+    }
     if (c->crop_gen != rt->wgen) {
         VkCommandBuffer cb = vk_cmd();
         VkImageCopy r[2];
@@ -616,7 +642,43 @@ static Surf* rt_crop(Surf* rt, u32 w, u32 h, const VkFmt* as) {
 
 Surf* vk_rt_snapshot(Surf* rt) {
     if (!rt || rt->layout == VK_IMAGE_LAYOUT_UNDEFINED) return rt;
-    return rt_crop(rt, rt->w, rt->h, NULL);
+    return rt_crop(rt, rt->w, rt->h, NULL, 0);
+}
+
+/* whether a color format can be the source and the destination of a linear blit, asked once a format */
+static int guest_blits(VkFormat f) {
+    static struct {
+        VkFormat f;
+        int ok;
+    } seen[32];
+    static u32 n;
+    for (u32 i = 0; i < n; i++)
+        if (seen[i].f == f) return seen[i].ok;
+    VkFormatProperties p;
+    memset(&p, 0, sizeof p);
+    vkGetPhysicalDeviceFormatProperties(g_vk.phys, f, &p);
+    VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    int ok = (p.optimalTilingFeatures & need) == need;
+    if (n < 32) seen[n++] = (typeof(seen[0])){f, ok};
+    return ok;
+}
+
+Surf* vk_rt_guest(Surf* rt, u32 w, u32 h, int* why) {
+    if (rt->f.is_int) {
+        *why = PASS_GUEST_INTEGER;
+        return NULL;
+    }
+    if (rt->f.depth || rt->f.stencil || !guest_blits(rt->f.vk)) {
+        *why = PASS_GUEST_FORMAT;
+        return NULL;
+    }
+    Surf* c = rt_crop(rt, w, h, NULL, 1);
+    if (c == rt) {
+        *why = PASS_GUEST_MEMORY;
+        return NULL;
+    }
+    return c;
 }
 
 /* texture header type -> what the image is created as */
@@ -826,8 +888,8 @@ static Surf* tex_from_tic(const u32* tic, int raw, int storage) {
                would convert its texels, so a copy in the texture's format holds them as they are. sRGB and linear
                twins are views of one image and need no copy */
             if (!f.depth && !rt->f.depth && vk_srgb_as(f.vk, 0) != vk_srgb_as(rt->f.vk, 0))
-                return rt_crop(rt, w, h, &f);
-            return rt->w == w && rt->h == h ? rt : rt_crop(rt, w, h, NULL);
+                return rt_crop(rt, w, h, &f, 0);
+            return rt->w == w && rt->h == h ? rt : rt_crop(rt, w, h, NULL, 0);
         }
         LOG_LIMIT(1,
                   "vulkan: a texture with %u-byte texels reads the render target at %llx, which has %u-byte pixels: it "

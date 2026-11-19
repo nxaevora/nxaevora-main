@@ -23,6 +23,7 @@
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/scale.h"
 #include "nx/gpu/vk/debug_stats.h"
+#include "nx/gpu/vk/pass_guest.h"
 #include "nx/gpu/nvn/diag/nvn_measure.h"
 #include "nx/memory/mem.h"
 #include "nx/memory/own.h"
@@ -685,6 +686,10 @@ static void vkr_present_buffer(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout
         }
     }
     if (src) { /* in its pixels: targets are scaled */
+        if (g_pass_guest > 0) { /* SNX_ARCEUS_PASS_GUEST's reduced passes are at most half this guest size */
+            g_pass_shown_w = x1 - x0;
+            g_pass_shown_h = y1 - y0;
+        }
         g_last = src;
         g_last_transform = transform;
         g_last_x = (u32)((u64)src->sw * x0 / src->w);
