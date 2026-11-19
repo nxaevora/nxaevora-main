@@ -16,7 +16,7 @@ Unset timing switches use the defaults below. `SNX_ARCEUS_TIMING_FIXES=0` turns 
 
 | Switch | Default | What `=0` does |
 | --- | --- | --- |
-| `SNX_ARCEUS_TIMING_FIXES` | on | Installs nothing and suppresses the traces, research probes and fixed-resolution hook too. |
+| `SNX_ARCEUS_TIMING_FIXES` | on | Installs nothing and suppresses the traces, research probes and fixed-resolution hook too. The throw owner guard is not part of the timing layer and stays on. |
 | `SNX_ARCEUS_TARGET_FPS` | runtime setting | Not a boolean: unset or empty keeps the runtime's `fps_limit` and does not write `g_opt_fps` (unless legacy `FPS60=1` is set). At game pace or 30 FPS and below, nothing installs and one reason line is logged. Above 30 FPS or at 0 (unlimited), clocks and defaults install. `game` is a test value that installs at the current runtime pace without changing the limit. This choice is made at startup. `60`, `120`, `unlocked` or `0` set the limit; other values are refused. |
 | `SNX_ARCEUS_FPS60` | off | Legacy alias; `=1` selects 60 FPS. |
 | `SNX_ARCEUS_WHOLE_STEP` | on | Reports a measured step near 1/30 second as measured, not as the game's own step. |
@@ -53,6 +53,7 @@ Unset timing switches use the defaults below. `SNX_ARCEUS_TIMING_FIXES=0` turns 
 | `SNX_ARCEUS_WAZA_SHOT_FIX` | 2 | Disables shot timing/blending. `1` runs at tick rate; `2` also blends between ticks. |
 | `SNX_ARCEUS_SCRIPT_TICK` | `0x4` | Not a boolean: a mask of state script classes that run 30 times a second. `0` leaves every script on every frame. Explicit masks are used as provided. |
 | `SNX_ARCEUS_SCRIPT_WINDOWS` | `0x1` | Not a boolean: a mask of script windows. Bit 0 is the throw window. `0` turns it off. |
+| `SNX_ARCEUS_THROW_OWNER_GUARD` | on | Lets the game make a throw whose owner is already gone, which crashes. Not a timing fix: it installs at every target rate and with `SNX_ARCEUS_TIMING_FIXES=0`. |
 | `SNX_ARCEUS_CLOCK_TRACE` | off | `=0` keeps the trace off; set to `1` to log clock calls. |
 | `SNX_ARCEUS_DIALOGUE_TRACE` | off | `=0` keeps the read-only trace off. |
 | `SNX_ARCEUS_CAMERA_TRACE` | off | `=0` keeps the read-only trace off. |
@@ -444,3 +445,20 @@ measured. Only the rotation that
 `main+25AB490` sets is blended. The throw wait is the only window, and other waits counted in script updates may
 exist. The kept release event is asked for again only while the same state object is updated on consecutive frames
 and the object's first word is unchanged. An earlier form that asked more queries crashed on a released object.
+
+## Throw owner guard
+
+`main+16E33EC` makes a throwable in heap 4 of the owner that its weak reference at `+88` names, and never checks
+that the owner still lives. The owner's controller (update `main+18756E4`) releases it on its own schedule, and the
+throw can come after that. The call then faults reading `+118` of a null owner at `main+16E34FC`. It was seen
+entering the arena of the Arceus fight, with every timing fix off, and only with the native NVN backend.
+
+The default-on `SNX_ARCEUS_THROW_OWNER_GUARD` wraps the function. When the reference is empty, its use count is 0 or
+its object is cleared, the call returns the empty handle the function starts from, and the throw is not made. Its
+only caller, `main+19D2368`, accepts an empty handle, which its own early exits also leave. Any other call, or one
+whose memory cannot be read or whose handle cannot be written, runs the game's code. The only caller is a direct
+call, so the guard changes `MOV X21,X0` at `main+16E3408` to the equivalent `ADD X21,X0,#0`. That marks the
+compiled function stale, and a stale function sends its entry through dispatch to the wrapper. It refuses unless
+one function of 0xA70 bytes starts there and three instruction words match. It logs its install, the first call
+that reaches it, and up to 16 guarded calls. In a native run at 30 FPS it guarded three calls, all with an empty
+reference, and the game did not crash.

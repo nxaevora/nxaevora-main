@@ -4,6 +4,7 @@
 #include "nx/runtime/arceus_clock.c"
 #include "arceus_steps_30.h"
 #include <assert.h>
+#include <stdarg.h>
 
 static u8 memory[4096];
 u8* g_mem = memory;
@@ -17,7 +18,17 @@ void pm_lock(PMutex* m) { (void)m; }
 void pm_unlock(PMutex* m) { (void)m; }
 static unsigned waza_dependency_warnings;
 static unsigned low_fps_skip_logs;
+static unsigned throw_guard_logged, throw_guard_warnings;
+static char throw_guard_last[512];
 void logf_(int level, const char* fmt, ...) {
+    if (strstr(fmt, "arceus-throw-guard:")) {
+        va_list args;
+        va_start(args, fmt);
+        vsnprintf(throw_guard_last, sizeof throw_guard_last, fmt, args);
+        va_end(args);
+        if (level == 0) throw_guard_warnings++;
+        else throw_guard_logged++;
+    }
     if (level == 0 && strstr(fmt, "arceus-waza-shot: enabled without WAZA_OBJECT_FIX"))
         waza_dependency_warnings++;
     if (level == 1 && strstr(fmt, "arceus-clock: timing layer skipped at fps_limit="))
@@ -37,8 +48,21 @@ int mem_map(u64 address, u64 size, u32 state, u32 perm) {
     (void)address; (void)size; (void)state; (void)perm;
     assert(0); return -1;
 }
-void jit_code_changed(u64 pc, u64 size) { (void)pc; (void)size; assert(0); }
-GuestFn jit_wait(u64 pc) { (void)pc; assert(0); return NULL; }
+/* Only the throw guard's install test lets the JIT be asked, and says what jit_wait answers. */
+static int jit_allowed;
+static unsigned jit_changes;
+static u64 jit_changed_at, jit_changed_size;
+static GuestFn jit_answer;
+void jit_code_changed(u64 pc, u64 size) {
+    assert(jit_allowed);
+    jit_changes++;
+    jit_changed_at = pc;
+    jit_changed_size = size;
+}
+GuestFn jit_wait(u64 pc) {
+    assert(jit_allowed && jit_changes && pc == jit_changed_at);
+    return jit_answer;
+}
 
 static unsigned calls, boundaries, calls_this_render, entered_whole;
 /* A command's end check as the game makes it: only in an update entered with the frame on
@@ -884,7 +908,17 @@ static void test_target(void) {
         main_base = 0;
         arceus_clock_init();
         assert(main_base == 0);
+        /* The throw guard's module is taken before the target is checked, and only from the 1.1.1 build. */
+        assert(throw_guard_mod == &main_mod);
     }
+    flag("SNX_ARCEUS_TIMING_FIXES", "0"); /* and before the master */
+    arceus_clock_init();
+    assert(throw_guard_mod == &main_mod);
+    unset_flag("SNX_ARCEUS_TIMING_FIXES");
+    main_mod.build_id[0] ^= 1;
+    arceus_clock_init();
+    assert(!throw_guard_mod);
+    main_mod.build_id[0] ^= 1;
     flag("SNX_ARCEUS_TARGET_FPS", "");
 }
 /* The climb fix's cell load: ADRP X9 to the frame-step cell's page from the patched word,
@@ -2390,7 +2424,176 @@ static void test_whole_step(void) {
     blink_ticks = 0, blink_remainder = 0;
     capture_fix_active = 0;
 }
+static unsigned throw_original_calls;
+static void throw_original(CPU* c, u64 entry) {
+    assert(entry == 0x16e33ec);
+    throw_original_calls++;
+    c->pc = c->x[30];
+}
+/* One call of the wrapper on Q=0x100, W=0x400 and the handle at out, prefilled so a write shows. */
+static void throw_call(u64 q, u64 out) {
+    CPU c = {0};
+    c.x[0] = q;
+    c.x[8] = out;
+    c.x[30] = 0x777;
+    if (out + 16 <= sizeof memory) gw64(out, 0x1111), gw64(out + 8, 0x2222);
+    throw_guard_update(&c, 0x16e33ec);
+    assert(c.pc == 0x777 && c.x[0] == q && c.x[8] == out);
+}
+static void throw_owner(u64 w, u32 use, u64 object) {
+    gw64(0x100 + 0x88, w);
+    if (w && w < sizeof memory) gw32(w + 0xc, use), gw64(w + 0x18, object);
+}
+static void test_throw_guard(void) {
+    memset(memory, 0, sizeof memory);
+    throw_guard_original = throw_original;
+    throw_original_calls = 0;
+    throw_guard_lines = throw_guard_reached = 0;
+    throw_guard_count = 0;
+    throw_guard_logged = 0;
+    /* Live: the original once, the handle untouched, one line that the wrapper is reached. */
+    throw_owner(0x400, 1, 0x450);
+    throw_call(0x100, 0x300);
+    assert(throw_original_calls == 1 && gr64(0x300) == 0x1111 && gr64(0x308) == 0x2222);
+    assert(throw_guard_logged == 1 && strstr(throw_guard_last, "owner live"));
+    throw_call(0x100, 0x300);
+    assert(throw_original_calls == 2 && throw_guard_logged == 1 && !throw_guard_count);
+    /* Each dead condition: {0,0} and no original. */
+    static const struct { u64 w; u32 use; u64 object; const char* why; } dead[] = {
+        {0, 0, 0, "(no reference)"}, {0x400, 0, 0x450, "(use count 0)"}, {0x400, 2, 0, "(object cleared)"},
+    };
+    for (unsigned k = 0; k < 3; k++) {
+        throw_owner(dead[k].w, dead[k].use, dead[k].object);
+        throw_call(0x100, 0x300);
+        assert(throw_original_calls == 2 && !gr64(0x300) && !gr64(0x308));
+        assert(throw_guard_count == k + 1 && throw_guard_logged == k + 2);
+        assert(strstr(throw_guard_last, dead[k].why) && strstr(throw_guard_last, "Q=100 "));
+    }
+    assert(strstr(throw_guard_last, "W=400 ") && strstr(throw_guard_last, "guarded=3 "));
+    /* Unreadable Q, unreadable W, and a handle that cannot be written: the game's own call. */
+    throw_call(sizeof memory + 0x100, 0x300);
+    assert(throw_original_calls == 3 && gr64(0x300) == 0x1111);
+    throw_owner(sizeof memory + 0x80, 0, 0);
+    throw_call(0x100, 0x300);
+    assert(throw_original_calls == 4 && gr64(0x300) == 0x1111);
+    throw_owner(0, 0, 0);
+    throw_call(0x100, sizeof memory + 0x40);
+    throw_call(0x100, sizeof memory - 8);
+    assert(throw_original_calls == 6 && throw_guard_count == 3 && throw_guard_logged == 4);
+    /* The lines stop at the limit, the count goes on. */
+    for (unsigned k = 0; k < THROW_GUARD_LINES + 4; k++) throw_call(0x100, 0x300);
+    assert(throw_guard_count == THROW_GUARD_LINES + 7 && throw_guard_logged == THROW_GUARD_LINES + 1);
+    assert(throw_original_calls == 6);
+    throw_guard_original = NULL;
+    memset(memory, 0, sizeof memory);
+}
+/* 16E33EC's guard words at a stand-in function of 0xA70 bytes at 0x200, installed from post_jit with the
+   timing layer off, as at a target of 30 or with SNX_ARCEUS_TIMING_FIXES=0. */
+static void throw_guard_words(u64 pc) {
+    gw32(pc + 0x1c, 0xaa0003f5);
+    gw32(pc + 0x20, 0xf9404400);
+    gw32(pc + 0x2c, 0xb5002040);
+}
+static void test_throw_guard_init(void) {
+    const u64 pc = 0x200;
+    SnxModInfo main_mod = {.name = "main", .base = pc - 0x16e33ec};
+    u64 fn_lo[2] = {pc, 0x100};
+    u32 fn_len[2] = {0xa70, 0x40};
+    u8 stale[2] = {0};
+    SnxModule module = {.nmods = 1, .mods = &main_mod, .nfns = 2, .fn_lo = fn_lo, .fn_len = fn_len, .stale = stale};
+    static GuestFn table[(0xc70 - 0x100) / 4];
+    GuestFn* const disp = g_disp;
+    const SnxModule* const mod = g_mod;
+    const u64 lo = g_code_lo, hi = g_code_hi;
+    g_mod = &module;
+    g_disp = table;
+    g_code_lo = 0x100;
+    g_code_hi = 0xc70;
+    const int timing = timing_enabled;
+    timing_enabled = clocks_installed = 0;
+    jit_answer = throw_original;
+    /* 0, or any value but 1: nothing read, nothing patched, nothing logged. Not the 1.1.1 build: the same. */
+    memset(memory, 0, sizeof memory);
+    throw_guard_words(pc);
+    throw_guard_mod = &main_mod;
+    throw_guard_warnings = throw_guard_logged = jit_changes = 0;
+    /* Not "": on Windows an empty value removes the variable, which is unset there. */
+    static const char* const off[] = {"0", "on"};
+    for (unsigned k = 0; k < 2; k++) {
+        flag("SNX_ARCEUS_THROW_OWNER_GUARD", off[k]);
+        arceus_clock_post_jit();
+    }
+    unset_flag("SNX_ARCEUS_THROW_OWNER_GUARD");
+    throw_guard_mod = NULL;
+    arceus_clock_post_jit();
+    assert(!throw_guard_warnings && !throw_guard_logged && gr32(pc + 0x1c) == 0xaa0003f5);
+    assert(!table[(pc - g_code_lo) / 4]);
+    /* Each refusal, with the switch unset: a WARN line and nothing patched. */
+    for (unsigned k = 0; k < 8; k++) {
+        throw_guard_words(pc);
+        throw_guard_mod = &main_mod;
+        fn_len[0] = 0xa70;
+        fn_lo[1] = 0x100;
+        g_code_hi = 0xc70;
+        module.stale = stale;
+        if (k == 0) module.stale = NULL; /* no function table */
+        if (k == 1) gw32(pc + 0x1c, 0x91000015);
+        if (k == 2) gw32(pc + 0x20, 0xf9404000);
+        if (k == 3) gw32(pc + 0x2c, 0xb5002060);
+        if (k == 4) fn_len[0] = 0xa6c;
+        if (k == 5) fn_lo[1] = pc; /* a second function from the same start */
+        if (k == 6) g_code_hi = 0xc6c;
+        if (k == 7) fn_len[0] = 0xa74;
+        const u32 word = gr32(pc + 0x1c);
+        throw_guard_warnings = 0;
+        arceus_clock_post_jit();
+        assert(throw_guard_warnings == 1 && !jit_changes && gr32(pc + 0x1c) == word && !throw_guard_original);
+        assert(!table[(pc - g_code_lo) / 4]);
+    }
+    /* Accepted unset with the timing layer off: the ADD in place of the MOV, the function marked changed, the wrapper
+       in dispatch, and the line naming the switch that turns it off. */
+    throw_guard_words(pc);
+    fn_len[0] = 0xa70;
+    throw_guard_logged = throw_guard_warnings = 0;
+    jit_allowed = 1;
+    arceus_clock_post_jit();
+    assert(!throw_guard_warnings && throw_guard_logged == 1 && strstr(throw_guard_last, "SNX_ARCEUS_THROW_OWNER_GUARD=0 turns it off") &&
+           !strstr(throw_guard_last, "EXPERIMENT"));
+    assert(gr32(pc + 0x1c) == 0x91000015 && gr32(pc + 0x20) == 0xf9404400 && gr32(pc + 0x2c) == 0xb5002040);
+    assert(jit_changes == 1 && jit_changed_at == pc && jit_changed_size == 0xa70);
+    assert(throw_guard_original == throw_original && table[(pc - g_code_lo) / 4] == throw_guard_update);
+    /* A second post_jit leaves it as it is. */
+    arceus_clock_post_jit();
+    assert(jit_changes == 1 && !throw_guard_warnings && throw_guard_logged == 1);
+    /* A failed compile: a WARN line and dispatch left to the game. */
+    table[(pc - g_code_lo) / 4] = NULL;
+    throw_guard_words(pc);
+    throw_guard_original = NULL;
+    jit_answer = NULL;
+    arceus_clock_post_jit();
+    assert(throw_guard_warnings == 1 && strstr(throw_guard_last, "compile failed") && !table[(pc - g_code_lo) / 4]);
+    /* Set to 1, as unset. */
+    throw_guard_words(pc);
+    jit_answer = throw_original;
+    flag("SNX_ARCEUS_THROW_OWNER_GUARD", "1");
+    arceus_clock_post_jit();
+    assert(gr32(pc + 0x1c) == 0x91000015 && table[(pc - g_code_lo) / 4] == throw_guard_update);
+    jit_allowed = 0;
+    jit_changes = 0;
+    jit_answer = NULL;
+    unset_flag("SNX_ARCEUS_THROW_OWNER_GUARD");
+    throw_guard_mod = NULL;
+    timing_enabled = timing;
+    g_disp = disp;
+    g_mod = mod;
+    g_code_lo = lo;
+    g_code_hi = hi;
+    memset(memory, 0, sizeof memory);
+}
+
 int main(void) {
+    test_throw_guard();
+    test_throw_guard_init();
     test_ride_swap();
     test_defaults_on();
     test_capped_fall_body();

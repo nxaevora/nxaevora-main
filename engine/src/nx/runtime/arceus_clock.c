@@ -241,6 +241,7 @@ static void message_view_probe(CPU* c, u64 entry) {
 
 /* The default probe only observes virtual calls. The optional experiment changes the four verified
    main-loop duration writes. Build and instruction guards precede both hooks and the 60 FPS pacing override. */
+static const SnxModInfo* throw_guard_mod;
 void arceus_clock_init(void) {
     static const u8 id[32] = {0xae,0xe8,0xf1,0x50,0xdd,0xa1,0xb5,0xa8,0x38,0x80,0x6e,0x1a,0x5e,0xa6,0x82,0x7a,
                               0xd9,0xf3,0xc5,0x1e,0,0,0,0,0,0,0,0,0,0,0,0};
@@ -250,6 +251,11 @@ void arceus_clock_init(void) {
     const ArceusClockConfig config = arceus_clock_config(__atomic_load_n(&g_opt_fps, __ATOMIC_RELAXED));
     timing_enabled = clocks_installed = experimental = tracing = 0;
     target_fps_explicit = config.write_fps;
+    /* The throw guard's module, taken before the master and the target are checked, which it does not depend on. */
+    throw_guard_mod = NULL;
+    for (u32 i = 0; g_mod && i < g_mod->nmods; i++)
+        if (!strcmp(g_mod->mods[i].name, "main") && !memcmp(g_mod->mods[i].build_id, id, sizeof id))
+            throw_guard_mod = &g_mod->mods[i];
     if (!config.master) return;
     if (config.invalid) {
         WARN("arceus-clock: refused unsupported target FPS (use 60, 120 or unlocked)\n");
@@ -4292,7 +4298,69 @@ static void waza_shot_init(void) {
         waza_shot_fix == 2 ? "between ticks" : "at the tick rate");
 }
 
+/* SNX_ARCEUS_THROW_OWNER_GUARD: 16E33EC makes a throwable in heap 4 of the owner its weak reference Q+0x88 names,
+   and never checks that the owner still lives. Its controller can release the owner before the throw is made, and the
+   call then faults at 16E34FC. A dead owner gets the empty handle the call starts from, which its caller accepts. */
+#define THROW_GUARD_LINES 16u
+static GuestFn throw_guard_original;
+static unsigned throw_guard_lines, throw_guard_reached;
+static u64 throw_guard_count;
+static void throw_guard_update(CPU* c, u64 entry) {
+    const u64 q = c->x[0], out = c->x[8];
+    const u64 w = readable(q + 0x88, 8) ? gr64(q + 0x88) : 0;
+    const int known = readable(q + 0x88, 8) && (!w || readable(w, 0x20));
+    const char* why = !known ? NULL : !w ? "no reference" : !gr32(w + 0xc) ? "use count 0" :
+                      !gr64(w + 0x18) ? "object cleared" : NULL;
+    if (!why || !writable(out, 16)) {
+        if (!__atomic_exchange_n(&throw_guard_reached, 1, __ATOMIC_RELAXED))
+            LOG("arceus-throw-guard: first call reached the wrapper, owner %s\n",
+                !known ? "unreadable" : why ? "dead, handle unwritable" : "live");
+        throw_guard_original(c, entry);
+        return;
+    }
+    gw64(out, 0);
+    gw64(out + 8, 0);
+    c->pc = c->x[30];
+    const u64 count = __atomic_add_fetch(&throw_guard_count, 1, __ATOMIC_RELAXED);
+    const unsigned line = __atomic_fetch_add(&throw_guard_lines, 1, __ATOMIC_RELAXED);
+    if (line < THROW_GUARD_LINES)
+        LOG("arceus-throw-guard: dead owner, throw not made Q=%llx W=%llx (%s) guarded=%llu t=%.3f s%s\n",
+            (unsigned long long)q, (unsigned long long)w, why, (unsigned long long)count, (double)plat_ns() / 1e9,
+            line + 1 == THROW_GUARD_LINES ? ", later ones not logged" : "");
+}
+/* On by default and on its own gates, not the master's or the target's: the crash comes with the timing layer off
+   too. The only caller is a direct BL at 19D2448: changing a line marks the AOT function stale, and a stale function
+   sends its entry through dispatch. */
+static void throw_guard_init(void) {
+    const SnxModInfo* mod = throw_guard_mod;
+    if (!mod || !arceus_switch_enabled("SNX_ARCEUS_THROW_OWNER_GUARD", 1)) return;
+    if (!g_disp || !g_mod->nfns || !g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale) {
+        WARN("arceus-throw-guard: refused, no function table\n");
+        return;
+    }
+    const u64 pc = mod->base + 0x16e33ec;
+    unsigned covered = 0;
+    for (u32 i = 0; i < g_mod->nfns; i++)
+        if (g_mod->fn_lo[i] == pc) covered += g_mod->fn_len[i] == 0xa70 ? 1 : 2;
+    if (pc >= g_code_lo && pc < g_code_hi && g_disp[(pc - g_code_lo) / 4] == throw_guard_update) return;
+    if (covered != 1 || pc < g_code_lo || pc + 0xa70 > g_code_hi || !readable(pc, 0xa70) ||
+        gr32(pc + 0x1c) != 0xaa0003f5 || gr32(pc + 0x20) != 0xf9404400 || gr32(pc + 0x2c) != 0xb5002040) {
+        WARN("arceus-throw-guard: refused instruction/function guard\n");
+        return;
+    }
+    /* Equivalent MOV X21,X0 -> ADD X21,X0,#0 selects an independent JIT body. */
+    gw32(pc + 0x1c, 0x91000015);
+    jit_code_changed(pc, 0xa70);
+    throw_guard_original = jit_wait(pc);
+    if (!throw_guard_original) {
+        WARN("arceus-throw-guard: compile failed\n");
+        return;
+    }
+    __atomic_store_n(&g_disp[(pc - g_code_lo) / 4], throw_guard_update, __ATOMIC_RELEASE);
+    LOG("arceus-throw-guard: a throw whose owner is gone is not made (SNX_ARCEUS_THROW_OWNER_GUARD=0 turns it off)\n");
+}
 void arceus_clock_post_jit(void) {
+    throw_guard_init();
     if (!timing_enabled || !clocks_installed) return;
     const char* probe = getenv("SNX_ARCEUS_CAMERA_TRACE");
     camera_trace_only = main_base && !target_fps_explicit && probe && !strcmp(probe, "1");
