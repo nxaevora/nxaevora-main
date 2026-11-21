@@ -42,6 +42,19 @@ void ini_open(const char* path);
 int options_debug(int flags, char* out, size_t n);
 /* the path ini_open read, "" before it */
 const char* ini_file(void);
+
+/* ---- the CLI's settings commands (settings_cli.c), with no window, no game start and no poll ---- */
+/* key's row in the game's .ini's sections (g_ini_sections), NULL for one they do not hold */
+const IniOpt* snx_setting_row(const char* key);
+/* path read with the runtime's reader into the store (ini_open's read: no overrides, no write, no poll): 1, 0 when
+   there is no file, -1 when it cannot be read (the system's reason in why) */
+int snx_settings_load(const char* path, char* why, size_t n);
+/* key's value as the store last read it, else the row's default; NULL for a row with no default the file lacks */
+const char* snx_settings_value(const IniOpt* o);
+/* key=value put in the store and the file ini_open read written back as ini_open writes it ("write": beside it,
+   "replace": over it): 0, 1 for a value the store cannot keep (why in out), or -1 with the stage, the path and the
+   system's reason in out */
+int snx_settings_save(const char* key, const char* value, char* out, size_t n);
 /* about once a second, from the main loop. final: at exit, where an edit still being saved is left for the next start
    unless the menu's changes need writing, which is then done over the file as it is */
 void ini_poll(int final);

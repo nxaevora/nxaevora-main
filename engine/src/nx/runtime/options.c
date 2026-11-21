@@ -151,6 +151,9 @@ static char g_path[1400];
 static int g_started; /* ini_open is done: the startup settings are kept from now on */
 static u64 g_hash;    /* the file as this run last read or wrote it */
 static u64 g_seen;    /* a changed file seen by the last poll, read once a second poll sees it unchanged */
+/* where the last write_file that failed stopped, and the system's reason: the CLI's settings set names the stage */
+static const char* g_write_stage;
+static char g_write_why[256];
 
 static u64 fnv1a(const unsigned char* p, size_t n) {
     u64 h = 0xCBF29CE484222325ull;
@@ -403,7 +406,7 @@ static int section_set(const IniSection* section) {
 }
 /* the store into the file: beside it, then moved over it, so the file is always whole. 0, or -1 (warned once) */
 static int write_file(void) {
-    char tmp[sizeof g_path + 8], why[256];
+    char tmp[sizeof g_path + 8];
     FILE* f;
     int s, t, i, other = 0, failed;
     unsigned char* text;
@@ -411,7 +414,9 @@ static int write_file(void) {
     snprintf(tmp, sizeof tmp, "%s.tmp", g_path);
     f = fopen(tmp, "wb");
     if (!f) {
-        WARN_LIMIT(1, "settings: could not write %s: %s\n", tmp, snx_os_error(why, sizeof why));
+        snx_os_error(g_write_why, sizeof g_write_why);
+        g_write_stage = "write";
+        WARN_LIMIT(1, "settings: could not write %s: %s\n", tmp, g_write_why);
         return -1;
     }
     put_header(f);
@@ -436,9 +441,11 @@ static int write_file(void) {
     failed = ferror(f);
     if (fclose(f)) failed = 1;
     if (failed || plat_replace_file(tmp, g_path)) {
-        snx_os_error(why, sizeof why); /* before remove's */
+        /* the stream's own failure is the write's; the move's is the replace's */
+        g_write_stage = failed ? "write" : "replace";
+        snx_os_error(g_write_why, sizeof g_write_why); /* before remove's */
         remove(tmp);
-        WARN_LIMIT(1, "settings: could not write %s (%s): this change is not saved\n", g_path, why);
+        WARN_LIMIT(1, "settings: could not write %s (%s): this change is not saved\n", g_path, g_write_why);
         return -1;
     }
     text = snx_read_file(g_path, &size);
@@ -504,6 +511,50 @@ void ini_open(const char* path) {
 }
 
 const char* ini_file(void) { return g_path; }
+
+/* ---- the CLI's settings commands (settings_cli.c): the store and the writer above, with no window and no poll ---- */
+
+const IniOpt* snx_setting_row(const char* key) { return find_row(key, NULL); }
+const char* snx_settings_value(const IniOpt* o) { return value_of(o); }
+
+int snx_settings_load(const char* path, char* why, size_t n) {
+    unsigned char* text;
+    size_t size;
+    snprintf(g_path, sizeof g_path, "%s", path);
+    text = snx_read_file(g_path, &size);
+    if (!text) {
+        if (snx_path_missing(g_path)) return 0;
+        snx_os_error(why, n);
+        return -1;
+    }
+    store_parse((char*)text);
+    free(text);
+    return 1;
+}
+
+/* 1 for a value that the .ini's reader does not give back as written: it splits the file at a '\n' or a '\r' and trims
+   the blanks and tabs of both ends (ini_lines.c), so a line break would become a key and the blanks would be lost */
+static int value_unreadable(const char* value) {
+    size_t n = strlen(value);
+    return strpbrk(value, "\r\n") != NULL ||
+           (n && (value[0] == ' ' || value[0] == '\t' || value[n - 1] == ' ' || value[n - 1] == '\t'));
+}
+
+int snx_settings_save(const char* key, const char* value, char* out, size_t n) {
+    if (value_unreadable(value)) {
+        snprintf(out, n, "%s: a line break or a blank at an end is not kept by the .ini file", key);
+        return 1;
+    }
+    if (strlen(key) >= KEY_MAX || strlen(value) >= VALUE_MAX) {
+        snprintf(out, n, "%s's value is longer than the %d bytes the file keeps", key, VALUE_MAX - 1);
+        return 1;
+    }
+    store_put(key, value);
+    g_write_stage = NULL;
+    if (!write_file()) return 0;
+    snprintf(out, n, "%s %s: %s", g_write_stage ? g_write_stage : "write", g_path, g_write_why);
+    return -1;
+}
 
 void ini_poll(int final) {
     Pending taken[PENDING_MAX];

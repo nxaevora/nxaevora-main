@@ -33,6 +33,11 @@ extern char g_addondir[1024], g_gamename[256];
 /* where its settings (config), its log and threads.txt (state) and its caches go: g_exedir, or for a game in an
    installed build's data folder the XDG folders of each kind */
 extern char g_confdir[1024], g_statedir[1024], g_cachedir[1024];
+/* The game's name and folders of the program path at program (snx_main's first steps, main.c): g_exedir and g_exename
+   from the path, then g_confdir and the others from the game's record or the environment. The CLI's settings commands
+   call both, with no game started, and make <g_confdir><g_exename>.ini, the file snx_main opens */
+void snx_game_locate(const char* program);
+void snx_game_folders(void);
 extern volatile int g_quit; /* set to leave the main loop, which saves and exits */
 extern int g_frames;        /* the frames shown so far, atomic: the presenting thread counts them */
 /* the crash handler's report (plat_posix.c, plat_win32.c): the faulting host pc, the address it touched (NULL when not

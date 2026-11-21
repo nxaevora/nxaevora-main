@@ -31,9 +31,28 @@ The first argument selects the command:
 | `recompile <game folder> [options] [--KEY=VALUE]` | Recompile the game. All recompile options stay | `-r` |
 | `run <game program> [--KEY=VALUE] [-- game arguments]` | Run the game | Play mode and `--game=PATH` |
 | `settings list [--scope=game\|recompile]` | Print the nine-field settings text | `--settings`, `--settings=recompile` |
+| `settings schema` | Print the settings definition as one JSON document on stdout | None |
+| `settings get KEY --game=PATH` | Print one value of the game's `.ini`, or its default | None |
+| `settings set KEY VALUE --game=PATH` | Write one value of the game's `.ini` | None |
+| `settings check KEY VALUE` | Check one value against the settings definition, with no file | None |
 
-`recompile --help` shows the recompile options. `run --help`, `settings --help` and `settings list --help` show the
-command's usage. `logs` and `cache` are reserved: they stop with exit 2 until their command exists.
+`recompile --help` shows the recompile options. `run --help`, `settings --help` and `settings <command> --help` show
+the command's usage. `--help` comes alone: any other argument with it is exit 2, for all five settings words. `logs`
+and `cache` are reserved: they stop with exit 2 until their command exists.
+
+`settings schema` needs no game. Its rows are the tables of `src/nx/runtime/settings.txt`, the game's own (in-game)
+rows included, and each row gives its `scope`: `startup`, `in-game`, `launcher` or `recompile`. The rows of LLVM
+Internals come from the LLVM the build uses, so their number follows that install.
+
+`settings get` and `settings set` read and write `<config>/<id>.ini` ([Folders](#folders)), the file that a run opens,
+and need no run. `PATH` is the game's program, as `run` takes it. The `.ini` must exist: without it the command is
+exit 3. A value the settings refuse is exit 7, and the file keeps its bytes. `set` writes beside the file and replaces
+it, so an unknown key stays. A `set` while the game runs can be lost when the game saves at the same time. `settings
+check` reads and writes no file and needs no `--game`.
+
+`settings check` takes every key that `settings schema` prints. `settings get` and `settings set` take the game's
+`.ini` keys only. `get` prints a number as the runtime keeps it: a float has 6 significant digits. `--game=` given
+twice: the last one wins.
 
 The old flags are aliases:
 
@@ -45,7 +64,7 @@ The old flags are aliases:
 | `--settings=recompile` | `settings list --scope=recompile` |
 | No argument | The old start GUI, until unit 5 |
 
-Later: `settings schema`, `settings get`, `settings set`, `settings check`, `logs export` and `cache clean`.
+Later: `logs export` and `cache clean`.
 
 ## Extract → AOT → run
 
@@ -312,7 +331,7 @@ reads the text on stderr.
 | 0 | Success, also a normal game end and a window close by the user |
 | 1 | Internal error: a bug or out of memory |
 | 2 | Wrong usage: an unknown option or command, a bad argument count |
-| 3 | Game files missing or wrong: the input folder, `exefs/main`, the NPDM or the RomFS |
+| 3 | Game files missing or wrong: the input folder, `exefs/main`, the NPDM or the RomFS, or the game's `.ini` that `settings get` and `settings set` read |
 | 4 | The recompile failed: compile, link, staging or build |
 | 5 | The start failed before the renderer runs: the settings file exists but cannot be read, or Vulkan or the renderer did not start |
 | 6 | A crash of the game: `fatal`, a crash report or an unhandled exception |

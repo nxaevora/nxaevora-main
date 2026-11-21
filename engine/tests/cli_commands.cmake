@@ -30,17 +30,19 @@ if(NOT new_scope_code EQUAL 0 OR NOT "${new_scope_err}" STREQUAL ""
    OR NOT "${new_scope_out}" STREQUAL "${old_scope_out}")
     message(FATAL_ERROR "settings list --scope=recompile is not --settings=recompile: exit ${new_scope_code}, stderr \"${new_scope_err}\"")
 endif()
-# a bad word is exit 2, and stderr names it
-foreach(case "settings list extra|extra" "settings list --scope=bogusscope|bogusscope" "settings|settings"
-             "settings schema|schema" "logs|logs" "cache|cache" "run|run" "run -x|-x")
+# a bad word is exit 2, and stderr has a part of that refusal: the bad word, or, where the word is the message's start,
+# the line's own words (a wrong line then fails here)
+foreach(case "settings list extra|extra" "settings list --scope=bogusscope|bogusscope" "settings|name a command"
+             "settings bogus|bogus" "logs|not available in this build" "cache|not available in this build"
+             "run|name a game program" "run -x|-x")
     string(REPLACE "|" ";" fields "${case}")
     list(GET fields 0 args)
-    list(GET fields 1 word)
+    list(GET fields 1 part)
     separate_arguments(args_list UNIX_COMMAND "${args}")
     engine(bad ${args_list})
-    string(FIND "${bad_err}" "${word}" at)
+    string(FIND "${bad_err}" "${part}" at)
     if(NOT bad_code EQUAL 2 OR at LESS 0)
-        message(FATAL_ERROR "nxaevora-engine ${args} ended with ${bad_code}, not 2, or did not name \"${word}\":\n${bad_err}")
+        message(FATAL_ERROR "nxaevora-engine ${args} ended with ${bad_code}, not 2, or stderr has no \"${part}\":\n${bad_err}")
     endif()
 endforeach()
 # a missing input is the game's files (exit_codes.h: SNX_EXIT_GAME_FILES 3), recompile and its alias -r alike

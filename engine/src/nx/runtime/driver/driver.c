@@ -31,7 +31,14 @@ static void usage(void) {
     puts("Usage: nxaevora-engine <command> [OPTIONS]\n"
          "  recompile INPUT        Recompile a decrypted game folder or an NRO, without playing\n"
          "  run PROGRAM            Run a recompiled game (its arguments go after --)\n"
-         "  settings list          List the settings, tab-separated (--scope=game|recompile)");
+         "  settings list          List the settings, tab-separated (--scope=game|recompile)\n"
+         "  settings schema        Print the settings definition as one JSON document\n"
+         "  settings get KEY --game=PROGRAM\n"
+         "                         Print one value of the game's .ini, or its default\n"
+         "  settings set KEY VALUE --game=PROGRAM\n"
+         "                         Write one value of the game's .ini\n"
+         "  settings check KEY VALUE\n"
+         "                         Check one value against the settings definition, with no file");
     puts("The old options are aliases:\n"
          "  INPUT                  A game made already, or an NRO; a decrypted game folder with -r\n"
          "  -r, --recompile        Recompile a decrypted game folder or an NRO, without playing\n"

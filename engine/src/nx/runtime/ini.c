@@ -213,10 +213,20 @@ static const char* repeated_help(const IniOpt* table, const IniOpt* o) {
     }
     return "";
 }
+const char* ini_help(const IniOpt* table, const IniOpt* o) {
+    const IniOpt* p;
+    const char* help = "";
+    for (p = table; p <= o; ++p) {
+        if (p->help)
+            help = p->help;
+        else if (repeated_help(table, p)[0])
+            help = repeated_help(table, p);
+    }
+    return help;
+}
 size_t ini_list_text(const IniSection* sections, int count, char* out, size_t size) {
     static const char* const types[] = {"int", "float", "text"};
     Listing l;
-    const char* help = "";
     int s, t;
     l.out = out;
     l.size = size;
@@ -226,18 +236,13 @@ size_t ini_list_text(const IniSection* sections, int count, char* out, size_t si
         for (t = 0; t < 3 && sections[s].table[t]; t++) {
             const IniOpt* o;
             for (o = sections[s].table[t]; o->key; o++) {
-                if (o->help)
-                    help = o->help;
-                else if (repeated_help(sections[s].table[t], o)[0]) /* a later instance: its first's */
-                    help = repeated_help(sections[s].table[t], o);
-                /* else none: the one before covers it */
                 if (o->flags & INI_IN_GAME) continue;
                 /* the range in its digits, which the launcher's Settings take and say as they read: %g's six cut
                    1048576 to 1.04858e+06 */
                 put(&l, "%s%s%s\t%s\t%s\t%s\t%.15g\t%.15g\t", sections[s].name, sections[s].page[t] ? "/" : "",
                     sections[s].page[t] ? sections[s].page[t] : "", o->key, o->def ? o->def : "", types[o->type], o->lo,
                     o->hi);
-                list_help(&l, help);
+                list_help(&l, ini_help(sections[s].table[t], o));
                 put(&l, "\t%s\t", o->name ? o->name : "");
                 list_values(&l, o);
                 put(&l, "\n");

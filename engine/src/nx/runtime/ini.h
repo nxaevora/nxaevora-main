@@ -72,6 +72,9 @@ int ini_step(const IniOpt* o, int v, int dir);
    [/page], key, default, int | float | text, lowest, highest, help, name, the values value=word between '|', tabs
    between. Into out, NUL-terminated as it fits; the length it needs, without the NUL */
 size_t ini_list_text(const IniSection* sections, int count, char* out, size_t size);
+/* o's help as ini_list_text writes it: its own, or the one of the repeat's first instance for a later one, or the row
+   before's (a row without one is covered by the one before it); "" for none */
+const char* ini_help(const IniOpt* table, const IniOpt* o);
 
 /* a key an older version used, which does nothing now (docs/DEPRECATIONS.md): what became of it, NULL for another */
 const char* ini_deprecated(const char* key);

@@ -122,8 +122,9 @@ static void drop_suffix(char* name, const char* suffix) {
 
 /* g_exedir and g_exename from the path of the game or of the runtime's copy named after it: a folder is the game of
    its own name in it (games/<id>/ is games/<id>/<id>), and the program's suffixes and the code module's are dropped,
-   so any of them names the same game */
-static void name_game(const char* from) {
+   so any of them names the same game. The CLI's settings commands call it for their --game, with no game started
+   (settings_cli.c) */
+void snx_game_locate(const char* from) {
     char path[1024], base[256];
     size_t n, cut;
     snprintf(path, sizeof path, "%s", from);
@@ -255,8 +256,8 @@ static void kind_dir(char* out, size_t cap, int kind, const char* what, const ch
 
 /* the game's folders of each kind: those its driver recorded in <name>.folders beside it (snx_record_folders), which
    the environment the game runs in may not name (an AppImage's copy, without its portable home or config), else its
-   environment's */
-static void game_dirs(void) {
+   environment's. The CLI's settings commands call it after snx_game_locate, before they open the game's .ini */
+void snx_game_folders(void) {
     static const char* const keys[] = {"config", "state", "cache"};
     char path[sizeof g_exedir + sizeof g_exename + 16], why[256], *text, *key, *value, *full;
     char* recorded[SNX_USER_CACHE + 1] = {NULL}; /* in text */
@@ -731,7 +732,7 @@ int snx_main(int argc, char** argv) {
     }
     game = game_option(argc, argv);
     refuse_dumps(argc, argv, game);
-    name_game(game ? game : program_path(argv[0]));
+    snx_game_locate(game ? game : program_path(argv[0]));
     snprintf(module, sizeof module, "%s%s%s", g_exedir, g_exename, MODULE_SUFFIX);
     if (argc == 1 && !snx_module_static && snx_menu && snx_launcher_name(g_exename) && !snx_is_file(module)) {
         status = open_menu(argv[0]);
@@ -749,7 +750,7 @@ int snx_main(int argc, char** argv) {
                          "recompile the game with this one",
                          (unsigned)mod->abi, (unsigned)SNX_ABI);
     }
-    game_dirs();
+    snx_game_folders();
     if (g_arm_mod) mem_layout32(g_arm_mod->aspace); /* before anything sizes or reads guest memory */
     if (mod->title_id) g_hle.kernel.title_id = mod->title_id;
     /* this run's settings: each --key=value before a "--" (-v is log=2); -f and --fullscreen=0|1 through startup.c's
