@@ -4331,6 +4331,287 @@ static void tt_frame(u64 ns) {
     step.step = ns;
     __atomic_add_fetch(&frame_step_frames, 1, __ATOMIC_RELEASE);
 }
+/* The waiting text's step (TEXT_TICK_END): a stand-in reveal with FBFBD0's loop as the game has it. Status 1 ends it,
+   another non-zero status loops uncounted, status 0 with answer 1 counts to +A4, status 0 with another answer ends it,
+   and the reveal answers the last answer. A step for a shown text (+A8 and +BC 0) answers tt_shown and writes no T */
+static u32 tt_shown;
+static unsigned tt_shown_steps;
+static void tt_step_shown(CPU* c, u64 entry) {
+    (void)entry;
+    gw32(c->x[1], 0);
+    c->x[0] = tt_shown;
+    c->x[30] = 0xdead; /* a body may leave X30 changed: the wrapper keeps the return it was called with */
+    tt_shown_steps++;
+}
+static void tt_reveal_game(CPU* c, u64 entry) {
+    const u64 t = c->x[0];
+    unsigned n = 0;
+    u64 answer;
+    for (;;) {
+        CPU s = {.x = {[0] = t, [1] = TT_STATUS, [30] = main_base + 0xfbfc24}, .pc = entry};
+        text_tick_step(&s, entry);
+        answer = s.x[0];
+        const u32 status = gr32(TT_STATUS);
+        if (status == 1) break;
+        if (status) continue;
+        if (answer != 1 || ++n >= *GP(t + 0xa4)) break;
+    }
+    c->x[0] = answer;
+    c->pc = c->x[30];
+}
+/* eight frames at 120 FPS of T's reveal: its answers, one digit a frame */
+static void tt_end_frames(char out[9]) {
+    for (unsigned k = 0; k < 8; k++) {
+        tt_frame(8333334);
+        CPU c = {.x = {[0] = TT_A, [30] = return_pc}, .pc = entry_pc};
+        text_tick_reveal(&c, entry_pc);
+        out[k] = (char)('0' + c.x[0]);
+    }
+    out[8] = 0;
+}
+static void test_text_tick_end(void) {
+    char seen[9];
+    memset(memory, 0, sizeof memory);
+    const u64 ns = step.step, frames = frame_step_frames, base = main_base;
+    main_base = 0x10000;
+    text_tick_original[0] = tt_reveal_game;
+    text_tick_original[1] = tt_step_shown;
+    /* the key: on when unset, off for 0 only, and the totals start at 0 */
+    const char* const values[7] = {NULL, "0", "1", "3", "", "2", "00"};
+    const int forms[7] = {3, 0, 3, 3, 3, 3, 3};
+    for (unsigned k = 0; k < 7; k++) {
+        if (values[k]) flag("SNX_ARCEUS_TEXT_TICK_END", values[k]);
+        else unset_flag("SNX_ARCEUS_TEXT_TICK_END");
+        text_tick_end_passed = text_tick_end_held = text_tick_end_kept_back = 9;
+        text_tick_end_read();
+        assert(text_tick_end == forms[k] && !text_tick_end_passed && !text_tick_end_held && !text_tick_end_kept_back);
+    }
+    unset_flag("SNX_ARCEUS_TEXT_TICK_END");
+    /* 0, a shown text waiting (the game answers 0): the skipped frames answer 1, the 0 and 1 of the stuck box */
+    tt_reset();
+    tt_shown = 0, tt_shown_steps = 0, text_tick_end = 0;
+    tt_end_frames(seen);
+    assert(!strcmp(seen, "01110111") && tt_shown_steps == 2);
+    /* 3: every wait runs the game's step on every frame, a revealing text is skipped as today */
+    text_tick_end = 3, text_tick_end_passed = 0;
+    const struct { u32 answer; const char* seen; unsigned steps; } waits[4] = {
+        {0, "00000000", 8}, /* the end-of-text wait (the save box) */
+        {2, "22222222", 8}, /* a page break */
+        {4, "44444444", 8}, /* closed */
+        {1, "11111111", 4}, /* revealing: the ticks only, two steps each (+A4 2) */
+    };
+    for (unsigned k = 0; k < 4; k++) {
+        tt_reset();
+        tt_shown = waits[k].answer, tt_shown_steps = 0;
+        tt_end_frames(seen);
+        assert(!strcmp(seen, waits[k].seen) && tt_shown_steps == waits[k].steps);
+    }
+    assert(text_tick_end_passed == 3 * 6);
+    /* 3, a wait that ends: once the step answers 1 again the frames after it are skipped */
+    tt_reset();
+    tt_shown = 2, tt_shown_steps = 0;
+    tt_frame(8333334);
+    CPU w = {.x = {[0] = TT_A, [30] = return_pc}, .pc = entry_pc};
+    text_tick_reveal(&w, entry_pc);
+    assert(w.x[0] == 2 && tt_shown_steps == 1);
+    tt_shown = 1; /* the press: the next real step goes on revealing */
+    tt_end_frames(seen);
+    assert(!strcmp(seen, "11111111") && tt_shown_steps == 1 + 1 + 2 * 2); /* that frame's step, then 2 ticks of 2 */
+    /* a real step after its reveal ended (no reveal running): its answer is not kept (the reviewer's N3), so a
+       revealing text's next skipped frame is still skipped */
+    tt_reset();
+    tt_shown = 1, tt_shown_steps = 0;
+    tt_frame(8333334);
+    CPU r0 = {.x = {[0] = TT_A, [30] = return_pc}, .pc = entry_pc};
+    text_tick_reveal(&r0, entry_pc);
+    assert(r0.x[0] == 1 && tt_shown_steps == 2);
+    tt_shown = 4;
+    CPU r = {.x = {[0] = TT_A, [1] = TT_STATUS, [30] = main_base + 0xfbfc24}, .pc = entry_pc};
+    text_tick_step(&r, entry_pc);
+    assert(r.x[0] == 4 && tt_shown_steps == 3);
+    tt_frame(8333334);
+    CPU r1 = {.x = {[0] = TT_A, [30] = return_pc}, .pc = entry_pc};
+    text_tick_reveal(&r1, entry_pc);
+    assert(r1.x[0] == 1 && tt_shown_steps == 3);
+    /* a skipped step of another T than the reveal's (A's state kept 0), or with no reveal running: 1 */
+    tt_shown = 0;
+    tt_reset();
+    tt_end_frames(seen);
+    TextTickState* a_state = NULL;
+    for (unsigned k = 0; k < TEXT_TICK_TEXTS; k++)
+        if (text_tick_states[k].text == TT_A) a_state = &text_tick_states[k];
+    assert(a_state && a_state->answered && a_state->answer == 0);
+    for (unsigned k = 0; k < 2; k++) {
+        text_tick_current = k ? NULL : a_state;
+        text_tick_skip = TT_B;
+        CPU o = {.x = {[0] = TT_B, [1] = TT_STATUS, [30] = main_base + 0xfbfc24}, .pc = entry_pc};
+        text_tick_step(&o, entry_pc);
+        assert(o.x[0] == 1 && o.pc == main_base + 0xfbfc24);
+    }
+    /* A's kept answer is A's own: a real step of a nested B, or of A from outside the reveal loop, keeps nothing */
+    text_tick_skip = 0, text_tick_current = a_state, tt_shown = 4;
+    const u64 from[2][2] = {{TT_B, main_base + 0xfbfc24}, {TT_A, main_base + 0xfbfc28}};
+    for (unsigned k = 0; k < 2; k++) {
+        CPU n = {.x = {[0] = from[k][0], [1] = TT_STATUS, [30] = from[k][1]}, .pc = entry_pc};
+        text_tick_step(&n, entry_pc);
+        assert(n.x[0] == 4 && a_state->answer == 0);
+    }
+    /* the step's own test leaves on a count past the threshold, also at 255 where the stored +1 would wrap */
+    assert(text_auto_completes((TextAuto){.count = 255, .threshold = 37}));
+    assert(!text_auto_completes((TextAuto){.count = 5, .threshold = 37}));
+    text_tick_skip = 0, text_tick_current = NULL;
+    text_tick_end = 0;
+    text_tick_original[0] = text_tick_original[1] = NULL;
+    memset(text_tick_states, 0, sizeof text_tick_states);
+    main_base = base, step.step = ns, frame_step_frames = frames;
+    memset(memory, 0, sizeof memory);
+}
+/* The hold: a step with the game's waits. A press (tt_press) leaves. In the end wait (+A8 0) modes 2 and 3 count +A3
+   toward +A2 as 2B31D44 does, or store tt_count when set. Leaving sets tt_left and answers 4, the end wait 0, a page
+   break (+A8 2) 2, and +BC set 0 with no count (2B31634). tt_mode, when set, goes to +90 with a count (a new setup).
+   The count leaves when +A3 > +A2, else it stores +A3 + 1 and leaves when +A2 is below that */
+static int tt_press, tt_left, tt_count = -1, tt_mode = -1;
+static void tt_step_auto(CPU* c, u64 entry) {
+    (void)entry;
+    const u64 t = c->x[0];
+    gw32(c->x[1], 0);
+    c->x[30] = 0xdead;
+    const u32 mode = gr32(t + 0x90), state = gr32(t + 0xa8);
+    int leave = tt_press;
+    if (!leave && !state && !gr32(t + 0xbc) && (mode == 2 || mode == 3)) {
+        const u8 count = *GP(t + 0xa3), threshold = *GP(t + 0xa2);
+        if (tt_count >= 0) *GP(t + 0xa3) = (u8)tt_count;
+        else if (tt_mode >= 0) *GP(t + 0xa3) = (u8)(count + 1), gw32(t + 0x90, (u32)tt_mode);
+        else if (count > threshold) leave = 1;
+        else {
+            *GP(t + 0xa3) = (u8)(count + 1);
+            leave = threshold < (u8)(count + 1);
+        }
+    }
+    if (leave) tt_left = 1, gw32(t + 0xa8, 9);
+    c->x[0] = leave ? 4 : state == 2 ? 2 : 0;
+}
+/* frames at 120 FPS of a waiting T until it leaves (at most n): the frame it left on, -1 if it did not, and +A3 after
+   each frame */
+static int tt_auto_run(int end, u32 mode, u8 threshold, u8 count, int press_at, unsigned n, u8* counts) {
+    tt_reset();
+    text_tick_end = end, tt_left = 0;
+    gw32(TT_A + 0x90, mode);
+    *GP(TT_A + 0xa2) = threshold, *GP(TT_A + 0xa3) = count;
+    for (unsigned k = 0; k < n; k++) {
+        tt_frame(8333334);
+        tt_press = (int)k == press_at;
+        CPU c = {.x = {[0] = TT_A, [30] = return_pc}, .pc = entry_pc};
+        text_tick_reveal(&c, entry_pc);
+        assert(c.pc == return_pc);
+        if (counts) counts[k] = *GP(TT_A + 0xa3);
+        if (tt_left) {
+            tt_press = 0;
+            return (int)k;
+        }
+    }
+    tt_press = 0;
+    return -1;
+}
+static void test_text_tick_hold(void) {
+    memset(memory, 0, sizeof memory);
+    const u64 ns = step.step, frames = frame_step_frames, base = main_base;
+    main_base = 0x10000;
+    text_tick_original[0] = tt_reveal_game;
+    text_tick_original[1] = tt_step_auto;
+    /* check (a): a mode 2 or 3 text leaves on the same frame with END=3 as with the tick alone, and +A3 is the same
+       after every frame. Thresholds 0, 1, 2, 5, 37 and 255 (a byte that wraps: never), counts from 0 and past */
+    const u8 thresholds[6] = {0, 1, 2, 5, 37, 255};
+    for (u32 mode = 2; mode <= 3; mode++)
+        for (unsigned k = 0; k < 6; k++)
+            for (unsigned past = 0; past < 2; past++) {
+                const u8 count = past ? (u8)(thresholds[k] == 255 ? 255 : thresholds[k] + 1) : 0;
+                static u8 alone[1100], hold[1100]; /* 255 runs past the byte's wrap (256 ticks, 1024 frames) */
+                const unsigned n = thresholds[k] == 255 ? 1100 : 200;
+                memset(alone, 0, sizeof alone), memset(hold, 0, sizeof hold);
+                const int a = tt_auto_run(0, mode, thresholds[k], count, -1, n, alone);
+                text_tick_end_held = text_tick_end_kept_back = 0;
+                const int h = tt_auto_run(3, mode, thresholds[k], count, -1, n, hold);
+                assert(a == h && !memcmp(alone, hold, sizeof alone));
+                const unsigned th = thresholds[k];
+                if (th == 255) assert(a == -1); /* the step's byte wraps from 255 to 0 */
+                else assert(a == (past ? 0 : 4 * (int)th)); /* the tick on frame 4 x +A2 leaves */
+                /* three extra frames a tick are held, and the three before the leaving tick are kept back: there the
+                   loop counts the skipped step's 1 up to +A4 (2), so 6 calls */
+                if (!past)
+                    assert(th == 255 ? text_tick_end_held == 825 && !text_tick_end_kept_back
+                                     : text_tick_end_held == (th ? 3 * (th - 1) : 0) &&
+                                           text_tick_end_kept_back == (th ? 6u : 0));
+            }
+    /* a press on any frame of the wait is seen on that frame with END=3: modes 0 and 1 (no count), and a counting
+       mode 2 far from its end. With the tick alone only on a tick frame (every fourth) */
+    const u32 modes[3] = {0, 1, 2};
+    for (unsigned m = 0; m < 3; m++)
+        for (int k = 1; k < 8; k++) {
+            assert(tt_auto_run(3, modes[m], 200, 0, k, 8, NULL) == k);
+            assert(tt_auto_run(0, modes[m], 200, 0, k, 8, NULL) == (k % 4 ? -1 : k));
+        }
+    /* a fresh count in the wait (the game writing +A3 itself, not +1) is kept, not put back */
+    tt_auto_run(3, 2, 200, 0, -1, 1, NULL);
+    tt_count = 9;
+    tt_frame(8333334);
+    CPU f = {.x = {[0] = TT_A, [30] = return_pc}, .pc = entry_pc};
+    text_tick_reveal(&f, entry_pc);
+    tt_count = -1;
+    assert(*GP(TT_A + 0xa3) == 9);
+    /* and a count of +1 that comes with another mode is not the same wait: kept too */
+    tt_auto_run(3, 2, 200, 0, -1, 1, NULL);
+    tt_mode = 3;
+    tt_frame(8333334);
+    CPU g = {.x = {[0] = TT_A, [30] = return_pc}, .pc = entry_pc};
+    text_tick_reveal(&g, entry_pc);
+    tt_mode = -1;
+    assert(*GP(TT_A + 0xa3) == 2 && gr32(TT_A + 0x90) == 3);
+    /* a page break (+A8 2) of a mode 2 text is no auto-advance wait: a press there is seen on any frame with END=3,
+       whatever +A3 and +A2 hold */
+    for (int k = 1; k < 8; k++) {
+        tt_reset();
+        text_tick_end = 3, tt_left = 0;
+        gw32(TT_A + 0x90, 2), gw32(TT_A + 0xa8, 2);
+        int left = -1;
+        for (int f8 = 0; f8 < 8 && left < 0; f8++) {
+            tt_frame(8333334);
+            tt_press = f8 == k;
+            CPU p = {.x = {[0] = TT_A, [30] = return_pc}, .pc = entry_pc};
+            text_tick_reveal(&p, entry_pc);
+            if (tt_left) left = f8;
+        }
+        tt_press = 0;
+        assert(left == k);
+    }
+    /* +BC set in a mode 2 text with a count that would complete: no auto-advance wait, so nothing is held or kept
+       back and a press on any frame is seen with END=3 */
+    for (int k = 1; k < 8; k++) {
+        tt_reset();
+        text_tick_end = 3, tt_left = 0, text_tick_end_held = text_tick_end_kept_back = 0;
+        gw32(TT_A + 0x90, 2), gw32(TT_A + 0xbc, 1);
+        int left = -1;
+        for (int f8 = 0; f8 < 8 && left < 0; f8++) {
+            tt_frame(8333334);
+            tt_press = f8 == k;
+            CPU b = {.x = {[0] = TT_A, [30] = return_pc}, .pc = entry_pc};
+            text_tick_reveal(&b, entry_pc);
+            if (tt_left) left = f8;
+        }
+        tt_press = 0;
+        assert(left == k && !text_tick_end_held && !text_tick_end_kept_back && !*GP(TT_A + 0xa3));
+    }
+    /* 0: +A3 is the game's own, counted on the ticks only, never written back */
+    u8 counts[8];
+    text_tick_end_held = 0;
+    tt_auto_run(0, 2, 200, 0, -1, 8, counts);
+    assert(!memcmp(counts, "\1\1\1\1\2\2\2\2", 8) && !text_tick_end_held);
+    text_tick_end = 0;
+    text_tick_original[0] = text_tick_original[1] = NULL;
+    memset(text_tick_states, 0, sizeof text_tick_states);
+    main_base = base, step.step = ns, frame_step_frames = frames;
+    memset(memory, 0, sizeof memory);
+}
 static void test_text_tick(void) {
     memset(memory, 0, sizeof memory);
     const u64 ns = step.step, frames = frame_step_frames, base = main_base;
@@ -4779,6 +5060,8 @@ int main(void) {
     test_text_probe_install();
     test_probe_compile_restore();
     test_text_tick();
+    test_text_tick_end();
+    test_text_tick_hold();
     test_ride_swap();
     test_defaults_on();
     test_fixed_resolution();

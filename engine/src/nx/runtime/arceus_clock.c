@@ -5667,12 +5667,25 @@ static void demo_tick_init(void) {
    do not run: each answers a counted step with no glyph, out-status 0, and nothing of T is written. A T's state is
    retired when the T was not seen in the previous frame. */
 #define TEXT_TICK_TEXTS 16
-typedef struct { u64 text, generation; ScriptTick tick; u64 last; int fresh; } TextTickState;
+typedef struct {
+    u64 text, generation;
+    ScriptTick tick;
+    u64 last, auto_ns;
+    int fresh, answered;
+    u32 answer;
+} TextTickState;
 static TextTickState text_tick_states[TEXT_TICK_TEXTS];
 static PMutex text_tick_lock = PMUTEX_INIT;
 static GuestFn text_tick_original[2];
 static int text_tick;
 static u64 text_tick_calls, text_tick_ticks, text_tick_skipped, text_tick_full, text_tick_ns, text_tick_logged[3];
+/* The waiting text's step (SNX_ARCEUS_TEXT_TICK_END, on by default, 0 off): on a step the tick would skip, the game's
+   step runs when T's last real answer was not 1. Every wait (end, page break, closed) asks its press test on every
+   frame, and only a revealing text is skipped. An auto-advance count is held to the tick (text_tick_step) */
+static int text_tick_end;
+static u64 text_tick_end_passed, text_tick_end_held, text_tick_end_kept_back;
+/* The state of the reveal running on this thread (not nested), to keep its step's answer in */
+static _Thread_local TextTickState* text_tick_current;
 static unsigned text_tick_seen;
 /* The text whose reveal runs on this thread in a frame that is not its tick, 0 for none */
 static _Thread_local u64 text_tick_skip;
@@ -5728,6 +5741,7 @@ static void text_tick_reveal(CPU* c, u64 entry) {
         u64 cut;
         tick = event_tick_decide(&st->tick, frame, ns, &cut); /* once a frame for T: cached */
     }
+    text_tick_current = st;
     const u64 full = st ? 0 : __atomic_add_fetch(&text_tick_full, 1, __ATOMIC_RELAXED);
     pm_unlock(&text_tick_lock);
     if (full == 1) /* the increment's own result (the reviewer's note on 9f2154e1) */
@@ -5738,6 +5752,7 @@ static void text_tick_reveal(CPU* c, u64 entry) {
     text_tick_original[0](c, entry);
     text_tick_depth--;
     text_tick_skip = 0;
+    text_tick_current = NULL;
     __atomic_add_fetch(&text_tick_calls, 1, __ATOMIC_RELAXED);
     if (tick) __atomic_add_fetch(&text_tick_ticks, 1, __ATOMIC_RELAXED);
     pm_lock(&text_tick_lock);
@@ -5754,6 +5769,11 @@ static void text_tick_reveal(CPU* c, u64 entry) {
             (double)(text_tick_ticks - text_tick_logged[1]) / seconds,
             (double)(text_tick_skipped - text_tick_logged[2]) / seconds, text_tick_seen,
             (unsigned long long)text_tick_full);
+        if (text_tick_end) /* the totals since the start, on a line of their own so the line above stays as it was */
+            LOG("arceus-text-tick: end=%d steps_run=%llu count_held=%llu kept_back=%llu\n", text_tick_end,
+                (unsigned long long)__atomic_load_n(&text_tick_end_passed, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&text_tick_end_held, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&text_tick_end_kept_back, __ATOMIC_RELAXED));
         text_tick_ns = now;
         text_tick_logged[0] = text_tick_calls;
         text_tick_logged[1] = text_tick_ticks;
@@ -5761,25 +5781,120 @@ static void text_tick_reveal(CPU* c, u64 entry) {
     }
     pm_unlock(&text_tick_lock);
 }
+/* The answer of a real step of the reveal running on this thread, kept for its T */
+static void text_tick_keep(u64 text, u64 lr, u64 answer) {
+    if (!text_tick_end || lr != main_base + 0xfbfc24) return;
+    pm_lock(&text_tick_lock);
+    TextTickState* st = text_tick_current;
+    if (st && st->text == text) st->answer = (u32)answer, st->answered = 1;
+    pm_unlock(&text_tick_lock);
+}
+/* T's auto-advance (claude 10:55): in the end wait (+A8 and +BC 0) of modes 2 and 3 (+90) the step at 2B31D44 counts
+   the byte +A3 toward the byte +A2. wait is 0 when T cannot be read or written there */
+typedef struct { int wait; u32 mode; u8 count, threshold; } TextAuto;
+static TextAuto text_auto_read(u64 text) {
+    TextAuto a = {0};
+    if (!readable(text + 0x90, 0x30) || !writable(text + 0xa3, 1)) return a;
+    a.mode = gr32(text + 0x90), a.count = *GP(text + 0xa3), a.threshold = *GP(text + 0xa2);
+    a.wait = !gr32(text + 0xa8) && !gr32(text + 0xbc) && (a.mode == 2 || a.mode == 3);
+    return a;
+}
+/* The step's own test: it leaves when +A3 > +A2, else it stores +A3 + 1 (a byte) and leaves when +A2 is below that */
+static int text_auto_completes(TextAuto a) { return a.count > a.threshold || a.threshold < (u8)(a.count + 1); }
+/* TEXT_PROBE: an auto-advance wait from the call that reaches it to the call that leaves it, one line a wait */
+static void text_auto_probe(u64 text, TextAuto before) {
+    if (!text_probe) return;
+    const TextAuto after = text_auto_read(text);
+    const int enter = !before.wait && after.wait, leave = before.wait && (!after.wait || after.mode != before.mode);
+    if (!enter && !leave) return;
+    const u64 now = plat_ns();
+    u64 since = 0;
+    pm_lock(&text_tick_lock);
+    TextTickState* st = text_tick_current;
+    if (st && st->text == text) {
+        since = leave && st->auto_ns ? st->auto_ns : 0;
+        st->auto_ns = enter ? now : 0;
+    }
+    pm_unlock(&text_tick_lock);
+    if (enter)
+        LOG("arceus-text-probe: auto-advance text %llx mode %u threshold %u count %u waits\n", (unsigned long long)text,
+            after.mode, after.threshold, after.count);
+    else if (since)
+        LOG("arceus-text-probe: auto-advance text %llx mode %u threshold %u left after %.1f ms by %s\n",
+            (unsigned long long)text, before.mode, before.threshold, (double)(now - since) / 1e6,
+            text_auto_completes(before) ? "its count" : "a press");
+}
+/* The game's step for T, with the auto-advance probe around it */
+static void text_tick_game_step(CPU* c, u64 entry, u64 text) {
+    const TextAuto before = text_probe ? text_auto_read(text) : (TextAuto){0};
+    text_tick_original[1](c, entry);
+    text_auto_probe(text, before);
+}
 /* The glyph step: skipped from the reveal loop of a T in a frame that is not its tick, unless T+A4 holds the fast
    finish's 100 or more (also the whole page's 255); anything else runs the game's */
 static void text_tick_step(CPU* c, u64 entry) {
-    const u64 text = c->x[0], status = c->x[1];
-    if (text_tick_skip && text == text_tick_skip && c->x[30] == main_base + 0xfbfc24 && readable(text + 0xa4, 1) &&
+    const u64 text = c->x[0], status = c->x[1], lr = c->x[30];
+    if (text_tick_skip && text == text_tick_skip && lr == main_base + 0xfbfc24 && readable(text + 0xa4, 1) &&
         *GP(text + 0xa4) < 100 && writable(status, 4)) {
+        u32 answer = 1;
+        if (text_tick_end) {
+            pm_lock(&text_tick_lock);
+            const TextTickState* st = text_tick_current;
+            if (st && st->text == text && st->answered) answer = st->answer;
+            pm_unlock(&text_tick_lock);
+        }
+        /* END3-HOLD (research 10:56, the reviewer's notes 10:57): an extra step never completes an auto-advance (that
+           frame is skipped as the tick alone skips it), and one that counted +A3 in the same wait gets its byte back */
+        const TextAuto wait = answer != 1 ? text_auto_read(text) : (TextAuto){0};
+        if (wait.wait && text_auto_completes(wait)) {
+            __atomic_add_fetch(&text_tick_end_kept_back, 1, __ATOMIC_RELAXED);
+            answer = 1;
+        } else if (answer != 1) {
+            __atomic_add_fetch(&text_tick_end_passed, 1, __ATOMIC_RELAXED);
+            text_tick_game_step(c, entry, text); /* waiting: the game's step, which reveals nothing more */
+            const TextAuto after = wait.wait ? text_auto_read(text) : (TextAuto){0};
+            if (after.wait && after.mode == wait.mode && after.count == (u8)(wait.count + 1)) {
+                *GP(text + 0xa3) = wait.count;
+                __atomic_add_fetch(&text_tick_end_held, 1, __ATOMIC_RELAXED);
+            }
+            text_tick_keep(text, lr, c->x[0]);
+            return;
+        }
         gw32(status, 0);
         c->x[0] = 1;
-        c->pc = c->x[30];
+        c->pc = lr;
         __atomic_add_fetch(&text_tick_skipped, 1, __ATOMIC_RELAXED);
         return;
     }
-    text_tick_original[1](c, entry);
+    text_tick_game_step(c, entry, text);
+    text_tick_keep(text, lr, c->x[0]);
 }
 static int text_tick_enabled(void) { return arceus_switch_enabled("SNX_ARCEUS_TEXT_TICK", 1); }
+/* The waiting text's step from its key, read before the wrappers are installed: on when unset, off only for 0. 1 and
+   3 (the experiment's value) keep it on, and any other value says so and keeps it on */
+static void text_tick_end_read(void) {
+    const char* value = getenv("SNX_ARCEUS_TEXT_TICK_END");
+    __atomic_store_n(&text_tick_end_passed, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&text_tick_end_held, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&text_tick_end_kept_back, 0, __ATOMIC_RELAXED);
+    text_tick_end = value && !strcmp(value, "0") ? 0 : 3;
+    if (value && strcmp(value, "0") && strcmp(value, "1") && strcmp(value, "3"))
+        WARN("arceus-text-tick: SNX_ARCEUS_TEXT_TICK_END=%s is not 0, 1 or 3: on\n", value);
+}
+/* and its line, once the tick is installed */
+static void text_tick_end_say(void) {
+    if (text_tick_end)
+        LOG("arceus-text-tick: end=3, a text whose last real answer was not 1 (a wait) runs the game's step on every "
+            "frame, an auto-advance count (+A3) held to the tick\n");
+    else
+        LOG("arceus-text-tick: end=0, a waiting text's step runs on its ticks only\n");
+}
 static void text_tick_init(void) {
+    text_tick_end = 0;
     if (!main_base || !text_tick_enabled()) return;
     if (!g_mod->nfns || !g_mod->fn_lo || !g_mod->fn_len || !g_mod->stale || !g_mod->entry_fn) return;
     if (!frame_step_cell_init("arceus-text-tick")) return;
+    text_tick_end_read();
     static const u32 offsets[2] = {0xfbfbd0, 0x2b315e8};
     if (text_probe_original[0] && text_probe_original[1]) {
         /* The reveal inside the probe's (it sees the whole call), the step outside it (it counts only real steps) */
@@ -5830,6 +5945,7 @@ static void text_tick_init(void) {
     text_tick = 1;
     LOG("arceus-text-tick: EXPERIMENT: each text reveals in 30 frames a second of elapsed time (FBFBD0, its glyph "
         "step 2B315E8 skipped on other frames; the fast finish and the whole page as today)\n");
+    text_tick_end_say();
 }
 /* Without the timing layer the tick runs on the clock read's own dispatch entry (no word changed), as the layer's
    wrapper there runs it */
